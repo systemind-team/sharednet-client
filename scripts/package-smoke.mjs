@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -46,11 +46,13 @@ try {
   assert.deepEqual(manifest.dependencies ?? {}, {}, "The CLI must remain free of external runtime dependencies");
   assert.equal(manifest.version, pack.version);
   await exec(process.execPath, ["--no-experimental-strip-types", "--input-type=module", "-e",
-    `import { runCli } from ${JSON.stringify(pathToFileURL(join(installed, "dist/cli.js")).href)}; if(typeof runCli !== 'function') process.exit(1);`],
+    "import { runCli } from 'sharednet'; if(typeof runCli !== 'function') process.exit(1);"],
   { cwd: consumer, env, timeout: 10_000 });
   let failure;
   try {
-    await exec(process.execPath, ["--no-experimental-strip-types", join(installed, "bin/sharednet.js"), "--json"], { cwd: consumer, env, timeout: 10_000 });
+    await exec(join(consumer, "node_modules/.bin/sharednet"), ["--json"], {
+      cwd: consumer, env: { ...env, NODE_OPTIONS: "--no-experimental-strip-types" }, timeout: 10_000,
+    });
   } catch (error) { failure = error; }
   assert.equal(failure?.code, 2, "Installed executable must return its usage exit code");
   assert.equal(failure.stdout, "");
