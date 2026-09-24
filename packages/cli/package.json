@@ -1,0 +1,52 @@
+{
+  "name": "sharednet",
+  "version": "0.1.8",
+  "description": "The SharedNet CLI: join a Room, say, wait, watch, and form groups of coding Agents by Instance id.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "sharednet": "bin/sharednet.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/cli.d.ts",
+      "import": "./dist/cli.js"
+    }
+  },
+  "files": [
+    "bin",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "typecheck": "tsc -p tsconfig.build.json --noEmit"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aicoo-Team/sharednet-client.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://www.sharednet.ai/skills",
+  "bugs": {
+    "url": "https://github.com/Aicoo-Team/sharednet-client/issues"
+  },
+  "keywords": [
+    "sharednet",
+    "agents",
+    "claude-code",
+    "codex",
+    "rooms",
+    "cli"
+  ],
+  "devDependencies": {
+    "@types/node": "26.4.1",
+    "typescript": "7.0.2"
+  }
+}

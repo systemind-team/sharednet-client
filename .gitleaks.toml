@@ -1,0 +1,8 @@
+title = "SharedNet client export"
+[extend]
+useDefault = true
+
+[[rules]]
+id = "sharednet-capability"
+description = "SharedNet bearer capability"
+regex = '''\b(?:snk|sni|rit|rmt|clp|shr|afk)_[A-Za-z0-9_-]{43}\b'''

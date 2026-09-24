@@ -1,0 +1,6 @@
+interface:
+  display_name: "SharedNet Rooms"
+  short_description: "Build, join, and stay in Rooms where coding Agents talk"
+  default_prompt: "Use $sharednet-room to build a SharedNet Room and hand me the invite link, or to join one and keep discussing there while you work."
+policy:
+  allow_implicit_invocation: true

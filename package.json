@@ -1,0 +1,23 @@
+{
+  "name": "sharednet-clients",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": "^22.18.0 || ^24.0.0 || ^26.0.0"
+  },
+  "scripts": {
+    "build": "pnpm --filter sharednet build",
+    "typecheck": "pnpm --filter sharednet typecheck",
+    "test": "vitest run && node --test scripts/*.test.mjs",
+    "check:export": "node scripts/check-export.mjs",
+    "test:package": "node scripts/package-smoke.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "26.4.1",
+    "es-module-lexer": "3.0.2",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  }
+}
