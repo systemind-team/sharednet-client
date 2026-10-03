@@ -1,0 +1,7 @@
+node_modules/
+**/dist/
+artifacts/
+.superpowers/
+.env*
+.sharednet/
+.DS_Store

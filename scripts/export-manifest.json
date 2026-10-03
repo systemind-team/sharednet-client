@@ -1,0 +1,217 @@
+{
+  "sourceCommit": "142ae999ddaf372a78fcb26a065b1dba675170fc",
+  "files": {
+    "packages/cli/src/cli.test.ts": {
+      "source": "packages/cli/src/cli.test.ts",
+      "sourceSha256": "930331cc2605b4666acc97eca8b31cc359ee19fe21f4ba37cf24056c6a2af498",
+      "changes": []
+    },
+    "packages/cli/src/guest.test.ts": {
+      "source": "packages/cli/src/guest.test.ts",
+      "sourceSha256": "9635b8ec33a7c7f59561629be410e9dd7a7c846583aeb996dc8c686d1bab682f",
+      "changes": [
+        "Remove private server imports; retain all pure client tests."
+      ]
+    },
+    "packages/cli/src/instance-computation.test.ts": {
+      "source": "packages/cli/src/instance-computation.test.ts",
+      "sourceSha256": "55a829e72340c03e1baa7cfcd18c1d46b5d07b468a5f3e4dfe3502d3d9033af5",
+      "changes": []
+    },
+    "packages/cli/src/login.test.ts": {
+      "source": "packages/cli/src/login.test.ts",
+      "sourceSha256": "a272e4cb8e1508ab9c716877b85c14e5a596699596f9a2b81527fab8fdf8dc00",
+      "changes": [
+        "Remove private server imports; retain all pure client tests."
+      ]
+    },
+    "packages/cli/src/runtime-detection.test.ts": {
+      "source": "packages/cli/src/runtime-detection.test.ts",
+      "sourceSha256": "ecc4a4ea6959bc3e1f33597f94fa177cbf3b75adb2ca9b0179199a1a33aed5f0",
+      "changes": [
+        "Spell the two existing NUL test characters as escaped \\0 for text diff review; runtime values unchanged."
+      ]
+    },
+    "packages/cli/src/storage.test.ts": {
+      "source": "packages/cli/src/storage.test.ts",
+      "sourceSha256": "0930c5e0161829227461a5da0a386f020061d74c25a26d340309c0465dc2d08b",
+      "changes": []
+    },
+    "packages/cli/src/api-client.ts": {
+      "source": "packages/cli/src/api-client.ts",
+      "sourceSha256": "840d37ed7e9099f3f08fcafec26a2ff48020a4226ed305f98f03c616d288f2f4",
+      "changes": []
+    },
+    "packages/cli/src/cli.ts": {
+      "source": "packages/cli/src/cli.ts",
+      "sourceSha256": "9062dc6877d203ad5aa23ac6568567d4d55efe8b8f1a5c25fc63b76557966ac2",
+      "changes": []
+    },
+    "packages/cli/src/errors.ts": {
+      "source": "packages/cli/src/errors.ts",
+      "sourceSha256": "07da5dc9e56dc18c0a3c57f332474ef26f6f294c1def7d5f157c5126d371ec9b",
+      "changes": []
+    },
+    "packages/cli/src/guest.ts": {
+      "source": "packages/cli/src/guest.ts",
+      "sourceSha256": "f25dff24e8aed7f076e931b18e3e09ceda0b10537304004e323fe76989c952b5",
+      "changes": []
+    },
+    "packages/cli/src/instance-computation.ts": {
+      "source": "packages/cli/src/instance-computation.ts",
+      "sourceSha256": "25bbb1363918629fbdf077257b945408fbdc57db551749e0cf1ebc3d1c9448df",
+      "changes": []
+    },
+    "packages/cli/src/login.ts": {
+      "source": "packages/cli/src/login.ts",
+      "sourceSha256": "8ebc443d345769f4f78a49cdc385e2532f6a5181f6834843a031523966499bbf",
+      "changes": []
+    },
+    "packages/cli/src/main.ts": {
+      "source": "packages/cli/src/main.ts",
+      "sourceSha256": "a16ed3c9e0c0aa6c7a1e41dbebda6ec1981476b38eeccf46b498b6d23c2e9585",
+      "changes": []
+    },
+    "packages/cli/src/runtime-detection.ts": {
+      "source": "packages/cli/src/runtime-detection.ts",
+      "sourceSha256": "0267e855166238ce125649f318d0a64a0f12cbdaecdeb8981753c1df50cb50e1",
+      "changes": []
+    },
+    "packages/cli/src/session.ts": {
+      "source": "packages/cli/src/session.ts",
+      "sourceSha256": "52098ed3b39fad34419cde7867d998ceb266264cca4b8cf908148fd899d8399d",
+      "changes": []
+    },
+    "packages/cli/src/storage.ts": {
+      "source": "packages/cli/src/storage.ts",
+      "sourceSha256": "963c046a4bfdf7fac66900321eb24282a38ad3d03534bc8c516066df09ca7031",
+      "changes": []
+    },
+    "packages/cli/bin/sharednet.js": {
+      "source": "packages/cli/bin/sharednet.js",
+      "sourceSha256": "022d65c9ac92157f2f20696cde6658b65b68eebc874d1fc98e08dc1dda1367a3",
+      "changes": []
+    },
+    "packages/cli/tsconfig.build.json": {
+      "source": "packages/cli/tsconfig.build.json",
+      "sourceSha256": "cc318149c173270a8951b879d9565bfa9ff8ace2f466e43a0db8f24e9336d1d5",
+      "changes": []
+    },
+    "packages/cli/package.json": {
+      "source": "packages/cli/package.json",
+      "sourceSha256": "d91fe24ce97732b81c0f4a9547f788da03f0d432ff2bd2ea5abfc002647e3f5d",
+      "changes": [
+        "Update source/issue URLs and add a typecheck script; retain version and runtime dependency policy."
+      ]
+    },
+    "packages/cli/README.md": {
+      "source": "packages/cli/README.md",
+      "sourceSha256": "ab8a773826d0bae882364d6b8581357b09957543df9f7ec3b70c2b5270713762",
+      "changes": []
+    },
+    "packages/cli/LICENSE": {
+      "source": "packages/cli/LICENSE",
+      "sourceSha256": "b00def07d3c6748465930e8216fb39d8cad160283e55b511f3c6402eb4a5ff77",
+      "changes": []
+    },
+    "skills/sharednet-room/SKILL.md": {
+      "source": ".agents/skills/sharednet-room/SKILL.md",
+      "sourceSha256": "273179952a1cc47e0ffa84a6721507db05ed93df141d70998325b73472a000de",
+      "changes": []
+    },
+    "skills/sharednet-room/agents/openai.yaml": {
+      "source": ".agents/skills/sharednet-room/agents/openai.yaml",
+      "sourceSha256": "b63666fbeb4cb1894b3ec419aacc18b41622617851f7847b7f397e64265a752f",
+      "changes": []
+    },
+    "skills/sharednet-room/evals/evals.json": {
+      "source": ".agents/skills/sharednet-room/evals/evals.json",
+      "sourceSha256": "a32dbe6534cb339c36ec69b4de365a916d6ec8838b0b19148206b93693f383ae",
+      "changes": []
+    },
+    "skills/sharednet-room/references/account-and-invites.md": {
+      "source": ".agents/skills/sharednet-room/references/account-and-invites.md",
+      "sourceSha256": "56f63029aa9a8b5c3cfbfb89b3c456632371efd1afd98e2df91e7f93249ef452",
+      "changes": []
+    },
+    "skills/sharednet-room/references/authority-and-limits.md": {
+      "source": ".agents/skills/sharednet-room/references/authority-and-limits.md",
+      "sourceSha256": "e7062827f6b6b89f068ec8dea5a2ffa12aa4bac139835153f4aa49606cfdd598",
+      "changes": []
+    },
+    "skills/sharednet-room/references/credits.md": {
+      "source": ".agents/skills/sharednet-room/references/credits.md",
+      "sourceSha256": "b0b07db184cde3507e64c89575ef93564ebd5956d18b8963391c01e3151e4d79",
+      "changes": []
+    },
+    "skills/sharednet-room/references/engagement.md": {
+      "source": ".agents/skills/sharednet-room/references/engagement.md",
+      "sourceSha256": "20b59aec9bf5b2a03f73c33565ac0a8a8be9f70e50a025b44333e2f63175c5c8",
+      "changes": []
+    },
+    "skills/sharednet-room/references/files.md": {
+      "source": ".agents/skills/sharednet-room/references/files.md",
+      "sourceSha256": "df2329c10b68edb40a4dfa4ddf418a9553246bdcfbd48d6f6b6740e294c398ce",
+      "changes": []
+    },
+    "skills/sharednet-room/references/join-and-talk.md": {
+      "source": ".agents/skills/sharednet-room/references/join-and-talk.md",
+      "sourceSha256": "2d86d44abe0874ff8f5428e3e46283a854f85a2d9456570e92ccbd90b973123d",
+      "changes": []
+    },
+    "skills/sharednet-room/references/retrieval.md": {
+      "source": ".agents/skills/sharednet-room/references/retrieval.md",
+      "sourceSha256": "bf647e2ec476859dd84e8524e9df7df87fddc67005cc6427573b39c365b7d777",
+      "changes": []
+    },
+    "LICENSE": {
+      "source": "packages/cli/LICENSE",
+      "sourceSha256": "b00def07d3c6748465930e8216fb39d8cad160283e55b511f3c6402eb4a5ff77",
+      "changes": []
+    }
+  },
+  "privateTestsRetainedAtSource": [
+    {
+      "file": "packages/cli/src/guest.test.ts",
+      "test": "runs a real shell command against the real server and says its output back"
+    },
+    {
+      "file": "packages/cli/src/guest.test.ts",
+      "test": "joins by invite, speaks, and hears the host reply, with the server the CLI actually ships"
+    },
+    {
+      "file": "packages/cli/src/login.test.ts",
+      "test": "logs in against the real handler, binding a seat this machine holds, and the key then registers Instances"
+    },
+    {
+      "file": "packages/cli/src/four-codex-chatroom.e2e.test.ts",
+      "test": "entire real-server suite"
+    }
+  ],
+  "repositoryFiles": [
+    ".gitignore",
+    ".gitleaks.toml",
+    ".nvmrc",
+    ".claude-plugin/plugin.json",
+    ".github/workflows/ci.yml",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/CODEOWNERS",
+    "AGENTS.md",
+    "README.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "package.json",
+    "pnpm-workspace.yaml",
+    "pnpm-lock.yaml",
+    "vitest.config.ts",
+    "docs/TESTING.md",
+    "docs/roadmap.md",
+    "docs/superpowers/plans/2026-09-25-client-foundation.md",
+    "scripts/export-manifest.json",
+    "scripts/check-export.mjs",
+    "scripts/check-export.test.mjs",
+    "scripts/package-smoke.mjs",
+    "tests/skill-commands.test.ts",
+    "docs/verification.md"
+  ]
+}

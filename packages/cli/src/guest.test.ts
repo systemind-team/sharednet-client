@@ -1,0 +1,1408 @@
+// @vitest-environment node
+
+import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { createHash } from "node:crypto";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { runCli } from "./cli.ts";
+import type { CommandRunner } from "./guest.ts";
+
+const cleanup: string[] = [];
+
+afterEach(async () => {
+  const { rm } = await import("node:fs/promises");
+  await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true })));
+});
+
+const INVITE_TOKEN = `rit_${"I".repeat(43)}`;
+const MEMBER_TOKEN = `sni_${"M".repeat(43)}`;
+const ROOM_ID = "rom_AbCdEfGhIj";
+const MEMBER_ID = "i_KlMnOpQrSt";
+
+const CLAIM = `clp_${"c".repeat(43)}`;
+
+const PASTED_INVITE = [
+  `Join SharedNet Room ${ROOM_ID} ("Launch review") as a guest.`,
+  `ROOM=${ROOM_ID}`,
+  `TOKEN=${INVITE_TOKEN}`,
+  "BASE=https://www.sharednet.ai",
+  "",
+  '1. Join, and read what was said so far. Keep member_token from the response and note the highest sequence in history.items:',
+  `   curl -s -X POST "$BASE/api/v1/rooms/$ROOM/join" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"name":"<your name, e.g. claude-code>"}'`,
+].join("\n");
+
+function message(sequence: number, content: string, name: string | null = "host") {
+  return {
+    id: `msg_${String(sequence).padStart(10, "0")}`,
+    room_id: ROOM_ID,
+    sequence,
+    type: "message",
+    content,
+    sender: { member_id: "i_HostHostHo", kind: "instance", name },
+    created_at: "2026-09-05T10:00:00.000Z",
+  };
+}
+
+function joined(items: ReturnType<typeof message>[] = []) {
+  return {
+    status: 200,
+    body: {
+      room: { id: ROOM_ID, name: "Launch review", state: "open" },
+      membership: { member_id: MEMBER_ID, kind: "guest", name: "claude-code", state: "active" },
+      member_token: MEMBER_TOKEN,
+      history: { items, next_cursor: items.length ? String(items.at(-1)!.sequence) : null, has_more: false },
+    },
+  };
+}
+
+/** The cursor of one seat in a directory's Room file, which holds one cursor per seat now. */
+async function cursorOf(space: { project: string }, memberId?: string): Promise<number | undefined> {
+  const room = JSON.parse(await readFile(join(space.project, ".sharednet", "room.json"), "utf8"));
+  const seats: Record<string, { last_sequence: number }> = room.seats ?? {};
+  const id = memberId ?? (seats[MEMBER_ID] ? MEMBER_ID : Object.keys(seats)[0]!);
+  return seats[id]?.last_sequence;
+}
+
+async function workspace() {
+  const root = await mkdtemp(join(tmpdir(), "sharednet-guest-"));
+  cleanup.push(root);
+  return {
+    root,
+    project: join(root, "project"),
+    env: {
+      HOME: root,
+      XDG_CONFIG_HOME: join(root, "config"),
+      XDG_STATE_HOME: join(root, "state"),
+      CLAUDE_SESSION_ID: "claude-session-stays-local",
+    } as Record<string, string>,
+  };
+}
+
+async function run(
+  argv: string[],
+  space: Awaited<ReturnType<typeof workspace>>,
+  responses: Array<{ status?: number; body?: unknown; error?: Error; raw?: Response }>,
+  environment: Record<string, string> = {},
+  overrides: { exec?: CommandRunner; now?: () => Date } = {},
+) {
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(space.project, { recursive: true });
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const requests: Array<{ url: string; init: RequestInit }> = [];
+  const fetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+    requests.push({ url: String(input), init });
+    const next = responses.shift();
+    if (!next) throw new Error("Unexpected fetch");
+    if (next.error) throw next.error;
+    // A byte route answers with its own Response, headers and all.
+    if (next.raw) return next.raw;
+    return new Response(next.body === undefined ? null : JSON.stringify(next.body), {
+      status: next.status ?? 200,
+      headers: next.body === undefined ? undefined : { "content-type": "application/json" },
+    });
+  });
+  const exitCode = await runCli(argv, {
+    env: { ...space.env, ...environment },
+    fetch,
+    cwd: space.project,
+    sleep: async () => undefined,
+    stdout: (value) => stdout.push(value),
+    stderr: (value) => stderr.push(value),
+    ...overrides,
+  });
+  return { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), requests };
+}
+
+function own(sequence: number, content: string) {
+  return { ...message(sequence, content, "claude-code"), sender: { member_id: MEMBER_ID, kind: "guest", name: "claude-code" } };
+}
+
+function page(items: ReturnType<typeof message>[]) {
+  return { status: 200, body: { items, next_cursor: null, has_more: false } };
+}
+
+/** A command runner that records what it was given and answers with a fixed result. */
+function recorder(result: { exitCode: number; stdout: string; stderr?: string }) {
+  const calls: Array<{ command: string; input: unknown; env: Record<string, string> }> = [];
+  const exec: CommandRunner = async (command, input, env) => {
+    calls.push({ command, input: JSON.parse(input), env });
+    return { stderr: "", ...result };
+  };
+  return { calls, exec };
+}
+
+function header(request: { init: RequestInit }, name: string): string | undefined {
+  return (request.init.headers as Record<string, string>)[name];
+}
+
+describe("sharednet join", () => {
+  it("joins from the pasted Web invite, keeps the tokens out of the project and out of stdout", async () => {
+    const space = await workspace();
+    const result = await run(["join", PASTED_INVITE], space, [
+      joined([message(1, "Welcome"), message(2, "Agenda is in the doc")]),
+    ]);
+    // The seat is anonymous; the join says so once, and how to make it yours.
+    expect(result.stderr).toContain("sharednet login");
+    expect(result.stderr).not.toContain("sni_");
+
+    expect(result.stderr).not.toMatch(/sni_|rit_|snk_/);
+    expect(result.exitCode).toBe(0);
+    expect(result.requests).toHaveLength(1);
+    const [request] = result.requests;
+    // The invite's BASE says where the Room lives; the invite token is the credential.
+    expect(request!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/join`);
+    expect(request!.init.method).toBe("POST");
+    expect(header(request!, "authorization")).toBe(`Bearer ${INVITE_TOKEN}`);
+    // The driver that is running names the seat and is reported as detected; its session id stays local.
+    expect(JSON.parse(String(request!.init.body))).toEqual({
+      name: "claude-code",
+      runtime: { kind: "claude-code", version: null, entrypoint: null, source: "detected" },
+    });
+    expect(String(request!.init.body)).not.toContain("claude-session-stays-local");
+
+    const output = JSON.parse(result.stdout);
+    expect(output).toEqual({
+      room: { id: ROOM_ID, name: "Launch review", state: "open" },
+      member_id: MEMBER_ID,
+      principal_id: null,
+      as: "anonymous",
+      name: "claude-code",
+      last_sequence: 2,
+      history: expect.objectContaining({ items: expect.any(Array) }),
+    });
+    expect(result.stdout).not.toContain("sni_");
+    expect(result.stdout).not.toContain("rit_");
+
+    // The member token lives owner-only under the config directory…
+    const credentialFile = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, `${MEMBER_ID}.json`);
+    expect((await stat(credentialFile)).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await readFile(credentialFile, "utf8"))).toMatchObject({
+      room_id: ROOM_ID,
+      member_id: MEMBER_ID,
+      member_token: MEMBER_TOKEN,
+    });
+    // …and the project holds only the cursor, in a directory that ignores itself.
+    const state = await readFile(join(space.project, ".sharednet", "room.json"), "utf8");
+    expect(JSON.parse(state)).toEqual({
+      schema_version: 2,
+      base_url: "https://www.sharednet.ai",
+      room_id: ROOM_ID,
+      // The seat is tied to this session by a key derived from its id, never the id itself.
+      seats: { [MEMBER_ID]: { last_sequence: 2, anchor_key: expect.stringMatching(/^[A-Za-z0-9_-]{20,}$/), joined_at: expect.any(String) } },
+    });
+    expect(state).not.toContain("sni_");
+    expect(state).not.toContain("claude-session-stays-local");
+    expect(await readFile(join(space.project, ".sharednet", ".gitignore"), "utf8")).toBe("*\n");
+  });
+
+  it("joins a bare Room id with the token from the environment, and takes --name", async () => {
+    const space = await workspace();
+    const result = await run(
+      ["join", ROOM_ID, "--name", "reviewer", "--json"],
+      space,
+      [joined()],
+      { SHAREDNET_INVITE_TOKEN: INVITE_TOKEN, SHAREDNET_BASE_URL: "http://127.0.0.1:3001" },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.requests[0]!.url).toBe(`http://127.0.0.1:3001/api/v1/rooms/${ROOM_ID}/join`);
+    expect(JSON.parse(String(result.requests[0]!.init.body))).toEqual({
+      name: "reviewer",
+      runtime: { kind: "claude-code", version: null, entrypoint: null, source: "detected" },
+    });
+    expect(JSON.parse(result.stdout).last_sequence).toBe(0);
+  });
+
+  it("reports no driver when none is recognised, and names the seat 'agent'", async () => {
+    const space = await workspace();
+    const result = await run(
+      ["join", PASTED_INVITE, "--json"],
+      { ...space, env: { HOME: space.env.HOME!, XDG_CONFIG_HOME: space.env.XDG_CONFIG_HOME!, XDG_STATE_HOME: space.env.XDG_STATE_HOME! } },
+      [joined()],
+    );
+
+    expect(result.exitCode).toBe(0);
+    const body = JSON.parse(String(result.requests[0]!.init.body));
+    expect(body).toEqual({ name: "agent" });
+  });
+
+  it("redeems a claim from the join page first, then joins as that account, with the key kept on disk", async () => {
+    const space = await workspace();
+    const CLAIM = `clp_${"c".repeat(43)}`;
+    const KEY = `snk_${"Q".repeat(43)}`;
+    const instance = {
+      id: "i_ClaimedSeat",
+      principal_id: "p_ClAiMeD001",
+      agent_id: null,
+      runtime_kind: "codex",
+      cli_version: "0.1.3",
+      status: "online",
+      display_name: null,
+      started_at: "2026-09-07T00:00:00.000Z",
+      last_seen_at: "2026-09-07T00:00:00.000Z",
+      lease_expires_at: "2099-09-07T00:01:30.000Z",
+      token_expires_at: null,
+      ended_at: null,
+      revoked_at: null,
+    };
+    const result = await run(["join", PASTED_INVITE, "--claim", CLAIM, "--json"], space, [
+      {
+        status: 200,
+        body: { state: "approved", login: { id: "cli_AbCdEfGhIj", bind_instance_ids: [] }, api_key: KEY, api_key_id: "key_AbCdEfGhIj", principal: { id: "p_ClAiMeD001", display_name: "Xisen" } },
+      },
+      { status: 201, body: { instance, token: `sni_${"C".repeat(43)}`, heartbeat_after_seconds: 30 } },
+      {
+        status: 200,
+        body: {
+          room: { id: ROOM_ID, name: "Launch review", state: "open" },
+          membership: { member_id: "i_ClaimedSeat", principal_id: "p_ClAiMeD001", kind: "instance", admitted_by: "invite", name: null, state: "active" },
+        },
+      },
+      { status: 200, body: { items: [message(1, "Welcome")], next_cursor: "1", has_more: false } },
+    ]);
+    expect(result.exitCode).toBe(0);
+    // The claim goes first, as the bearer, and nothing else; then the account door as usual.
+    expect(result.requests[0]!.url).toBe("https://www.sharednet.ai/api/v1/cli/claims/redeem");
+    expect(header(result.requests[0]!, "authorization")).toBe(`Bearer ${CLAIM}`);
+    expect(result.requests[1]!.url).toBe("https://www.sharednet.ai/api/v1/instances");
+    expect(header(result.requests[1]!, "authorization")).toBe(`Bearer ${KEY}`);
+    expect(JSON.parse(result.stdout)).toMatchObject({ as: "account", principal_id: "p_ClAiMeD001", member_id: "i_ClaimedSeat" });
+    expect(result.stderr).toContain("Claimed");
+    expect(result.stdout + result.stderr).not.toContain(KEY);
+    const credentialsFile = join(space.env.XDG_CONFIG_HOME!, "sharednet", "credentials.json");
+    expect((await stat(credentialsFile)).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await readFile(credentialsFile, "utf8"))).toMatchObject({ api_key: KEY, principal_id: "p_ClAiMeD001" });
+
+    const malformed = await run(["join", PASTED_INVITE, "--claim", "nope", "--json"], space, []);
+    expect(malformed.exitCode).not.toBe(0);
+    expect(malformed.requests).toHaveLength(0);
+  });
+
+  it("joins as the account when a credential is present: registers an Instance, joins with the invite, reads history", async () => {
+    const space = await workspace();
+    const instance = {
+      id: "i_AccountSeat1",
+      principal_id: "p_AcCoUnT0001",
+      agent_id: null,
+      runtime_kind: "claude-code",
+      cli_version: "0.1.3",
+      status: "online",
+      display_name: null,
+      started_at: "2026-09-06T00:00:00.000Z",
+      last_seen_at: "2026-09-06T00:00:00.000Z",
+      lease_expires_at: "2099-09-06T00:01:30.000Z",
+      token_expires_at: "2099-09-07T00:00:00.000Z",
+      ended_at: null,
+      revoked_at: null,
+    };
+    const result = await run(
+      ["join", PASTED_INVITE, "--json"],
+      space,
+      [
+        { status: 201, body: { instance, token: `sni_${"A".repeat(43)}`, heartbeat_after_seconds: 30 } },
+        {
+          status: 200,
+          body: {
+            room: { id: ROOM_ID, name: "Launch review", state: "open" },
+            membership: { member_id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: null, state: "active" },
+          },
+        },
+        { status: 200, body: { items: [message(1, "Welcome")], next_cursor: "1", has_more: false } },
+      ],
+      { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` },
+    );
+
+    // The only thing on stderr is the seat this session got, never a token.
+    expect(result.stderr).toContain("Seat i_AccountSeat1 in rom_AbCdEfGhIj");
+    expect(result.stderr).not.toMatch(/sni_|rit_|snk_|clp_/);
+    expect(result.exitCode).toBe(0);
+    expect(result.requests.map((request) => `${request.init.method ?? "GET"} ${request.url}`)).toEqual([
+      "POST https://www.sharednet.ai/api/v1/instances",
+      `POST https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/join`,
+      `GET https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages?after=0&limit=100`,
+    ]);
+    expect(header(result.requests[0]!, "authorization")).toBe(`Bearer snk_${"K".repeat(43)}`);
+    expect(header(result.requests[1]!, "authorization")).toBe(`Bearer sni_${"A".repeat(43)}`);
+    // The invite admits the Instance; the runtime went with the registration, not the join.
+    expect(JSON.parse(String(result.requests[1]!.init.body))).toEqual({ invite: INVITE_TOKEN });
+    expect(JSON.parse(String(result.requests[0]!.init.body)).runtime_kind).toBe("claude-code");
+    expect(header(result.requests[1]!, "idempotency-key")).toMatch(/^[0-9a-f-]{36}$/);
+
+    const output = JSON.parse(result.stdout);
+    expect(output).toMatchObject({ as: "account", member_id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", last_sequence: 1 });
+    expect(result.stdout).not.toContain("sni_");
+    expect(result.stdout).not.toContain("snk_");
+    const state = JSON.parse(await readFile(join(space.project, ".sharednet", "room.json"), "utf8"));
+    expect(state).toMatchObject({ room_id: ROOM_ID, seats: { i_AccountSeat1: { last_sequence: 1 } } });
+    // Both the seat file and the session file exist; say/wait use the session's token.
+    await stat(join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, "i_AccountSeat1.json"));
+    await stat(join(space.env.XDG_STATE_HOME!, "sharednet", "sessions", "i_AccountSeat1.json"));
+
+    const said = await run(["say", "as the account", "--json"], space, [
+      { status: 201, body: { message: message(2, "as the account", null) } },
+    ], { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` });
+    expect(said.exitCode).toBe(0);
+    expect(header(said.requests[0]!, "authorization")).toBe(`Bearer sni_${"A".repeat(43)}`);
+  });
+
+  it("refuses to join without an invite token, before any request is sent", async () => {
+    const space = await workspace();
+    const result = await run(["join", ROOM_ID, "--json"], space, []);
+
+    expect(result.exitCode).toBe(2);
+    expect(result.requests).toHaveLength(0);
+    expect(JSON.parse(result.stderr).error.code).toBe("invite_token_required");
+  });
+
+  it("keeps two seats in one Room apart when two Agents share one machine", async () => {
+    // Found by the two-Agent demo: Codex and Claude Code on one machine joined
+    // the same Room, and the second join used to overwrite the first's file.
+    const space = await workspace();
+    const first = await run(["join", PASTED_INVITE, "--name", "claude-code"], space, [joined()]);
+    expect(first.exitCode).toBe(0);
+    const secondProject = join(space.root, "second-project");
+    const secondSeat = { ...joined(), body: { ...joined().body, membership: { ...joined().body.membership, member_id: "i_SecondSeat1", name: "codex" }, member_token: `sni_${"S".repeat(43)}` } };
+    const second = await run(["join", PASTED_INVITE, "--name", "codex"], { ...space, project: secondProject }, [secondSeat]);
+    expect(second.exitCode).toBe(0);
+
+    // Each project still speaks with its own token.
+    const firstSay = await run(["say", "from the first seat", "--json"], space, [
+      { status: 201, body: { message: message(2, "from the first seat", "claude-code") } },
+    ]);
+    expect(firstSay.exitCode).toBe(0);
+    expect(header(firstSay.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+    const secondSay = await run(["say", "from the second seat", "--json"], { ...space, project: secondProject }, [
+      { status: 201, body: { message: message(3, "from the second seat", "codex") } },
+    ]);
+    expect(secondSay.exitCode).toBe(0);
+    expect(header(secondSay.requests[0]!, "authorization")).toBe(`Bearer sni_${"S".repeat(43)}`);
+  });
+
+  it("does not treat a stored API key or --session as a way in", async () => {
+    const space = await workspace();
+    const result = await run(["join", PASTED_INVITE, "--session", "i_HostHostHo"], space, []);
+
+    expect(result.exitCode).toBe(2);
+    expect(result.requests).toHaveLength(0);
+    expect(result.stderr).toContain("invalid_option");
+  });
+});
+
+describe("sharednet say and wait", () => {
+  async function joinedSpace() {
+    const space = await workspace();
+    const result = await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])]);
+    expect(result.exitCode).toBe(0);
+    return space;
+  }
+
+  it("says with the stored member token and never moves the cursor", async () => {
+    const space = await joinedSpace();
+    const result = await run(["say", "Build is green.", "--json"], space, [
+      { status: 201, body: { message: { ...message(2, "Build is green.", "claude-code"), sender: { member_id: MEMBER_ID, kind: "guest", name: "claude-code" } } } },
+    ]);
+
+    expect(result.stderr).not.toMatch(/sni_|rit_|snk_/);
+    expect(result.exitCode).toBe(0);
+    const [request] = result.requests;
+    expect(request!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages`);
+    expect(header(request!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+    expect(JSON.parse(String(request!.init.body))).toEqual({ content: "Build is green." });
+    expect(JSON.parse(result.stdout).message.sequence).toBe(2);
+    // A message of one's own is not "seen": anything said before it still arrives.
+    expect(await cursorOf(space)).toBe(1);
+  });
+
+  it("threads a reply with --reply-to and refuses anything that is not a message id", async () => {
+    const space = await joinedSpace();
+    const result = await run(["say", "Yes, on it.", "--reply-to", "msg_AbCdEfGhIj", "--json"], space, [
+      { status: 201, body: { message: { ...message(2, "Yes, on it.", "claude-code"), reply_to_message_id: "msg_AbCdEfGhIj" } } },
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(String(result.requests[0]!.init.body))).toEqual({
+      content: "Yes, on it.",
+      reply_to_message_id: "msg_AbCdEfGhIj",
+    });
+
+    const refused = await run(["say", "Yes, on it.", "--reply-to", "2", "--json"], space, []);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.requests).toHaveLength(0);
+    expect(refused.stderr).toContain("--reply-to must be a message id");
+  });
+
+  it("joins as a private seat when asked, so strangers with the id must ask first", async () => {
+    const space = await workspace();
+    const result = await run(["join", PASTED_INVITE, "--private", "--json"], space, [joined([message(1, "Welcome")])]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(String(result.requests[0]!.init.body))).toMatchObject({ reach: "private" });
+  });
+
+  it("seats more Instances by id from the current seat, and lists the Rooms it sits in", async () => {
+    const space = await joinedSpace();
+    const added = await run(["add", "i_AbCdEfGhIj", "i_KlMnOpQrSt", "--json"], space, [
+      { status: 200, body: { admissions: [{ instance_id: "i_AbCdEfGhIj", status: "member", decision_id: null }, { instance_id: "i_KlMnOpQrSt", status: "pending", decision_id: "dec_AbCdEfGhIj" }] } },
+    ]);
+    expect(added.exitCode).toBe(0);
+    expect(added.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/members`);
+    expect(header(added.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+    expect(JSON.parse(String(added.requests[0]!.init.body))).toEqual({ with: ["i_AbCdEfGhIj", "i_KlMnOpQrSt"] });
+    expect(JSON.parse(added.stdout).admissions[1].status).toBe("pending");
+
+    const malformed = await run(["add", "not-an-id", "--json"], space, []);
+    expect(malformed.exitCode).not.toBe(0);
+    expect(malformed.requests).toHaveLength(0);
+
+    const listed = await run(["rooms", "--json"], space, [{ status: 200, body: { items: [{ id: ROOM_ID }] } }]);
+    expect(listed.exitCode).toBe(0);
+    expect(listed.requests[0]!.url).toBe("https://www.sharednet.ai/api/v1/rooms");
+    expect(listed.requests[0]!.init.method ?? "GET").toBe("GET");
+  });
+
+  it("shows the requests waiting on the seat and answers one for itself", async () => {
+    const space = await joinedSpace();
+    const pending = await run(["requests", "--json"], space, [
+      { status: 200, body: { decisions: [{ id: "dec_AbCdEfGhIj", status: "pending", room_id: "rom_KlMnOpQrSt" }] } },
+    ]);
+    expect(pending.exitCode).toBe(0);
+    expect(pending.requests[0]!.url).toBe("https://www.sharednet.ai/api/v1/decisions?status=pending");
+
+    const accepted = await run(["accept", "dec_AbCdEfGhIj", "--json"], space, [
+      { status: 200, body: { decision: { id: "dec_AbCdEfGhIj", status: "approved" }, membership: { room_id: "rom_KlMnOpQrSt", admitted_by: "accepted" } } },
+    ]);
+    expect(accepted.exitCode).toBe(0);
+    expect(accepted.requests[0]!.url).toBe("https://www.sharednet.ai/api/v1/decisions/dec_AbCdEfGhIj/resolve");
+    expect(JSON.parse(String(accepted.requests[0]!.init.body))).toEqual({ resolution: "approved" });
+
+    const denied = await run(["deny", "dec_AbCdEfGhIj", "--json"], space, [
+      { status: 200, body: { decision: { id: "dec_AbCdEfGhIj", status: "denied" }, membership: null } },
+    ]);
+    expect(JSON.parse(String(denied.requests[0]!.init.body))).toEqual({ resolution: "denied" });
+
+    const refused = await run(["accept", "2", "--json"], space, []);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.requests).toHaveLength(0);
+  });
+
+  it("enters another Room by id as the seat this machine holds, and needs --as when it holds several", async () => {
+    const space = await joinedSpace();
+    const OTHER_ROOM = "rom_OtHeRrOoM1";
+    const elsewhere = { ...space, project: join(space.root, "elsewhere") };
+    const entered = await run(["join", OTHER_ROOM, "--json"], elsewhere, [
+      { status: 200, body: { room: { id: OTHER_ROOM, name: "Reach test", state: "open" }, membership: { member_id: MEMBER_ID, admitted_by: "added", state: "active" } } },
+      page([{ ...message(1, "welcome to the other room"), room_id: OTHER_ROOM }, { ...message(2, "second"), room_id: OTHER_ROOM }]),
+    ]);
+    expect(entered.stderr).toBe("");
+    expect(entered.exitCode).toBe(0);
+    // No invite: the seat's own token joins by Room id, idempotently.
+    expect(entered.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${OTHER_ROOM}/join`);
+    expect(header(entered.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+    expect(header(entered.requests[0]!, "idempotency-key")).toMatch(/^[0-9a-f-]{36}$/);
+    expect(entered.requests[1]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${OTHER_ROOM}/messages?after=0&limit=100`);
+    const output = JSON.parse(entered.stdout);
+    expect(output).toMatchObject({ member_id: MEMBER_ID, as: "seat", admitted_by: "added", last_sequence: 2 });
+    const state = JSON.parse(await readFile(join(elsewhere.project, ".sharednet", "room.json"), "utf8"));
+    expect(state).toMatchObject({ room_id: OTHER_ROOM, seats: { [MEMBER_ID]: { last_sequence: 2 } } });
+    // The seat now has a credential for the new Room too, and say works from there.
+    const said = await run(["say", "hello from the other room", "--json"], elsewhere, [
+      { status: 201, body: { message: message(3, "hello from the other room") } },
+    ]);
+    expect(said.exitCode).toBe(0);
+    expect(said.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${OTHER_ROOM}/messages`);
+
+    // A second seat on the machine makes the choice explicit.
+    const secondProject = join(space.root, "second");
+    await run(["join", `ROOM=rom_SeCoNdRoOm TOKEN=${INVITE_TOKEN}`, "--name", "other-seat", "--json"], { ...space, project: secondProject }, [
+      { status: 200, body: { room: { id: "rom_SeCoNdRoOm", name: "Second" }, membership: { member_id: "i_SeCoNdSeAt", kind: "guest", name: "other-seat" }, member_token: `sni_${"z".repeat(43)}`, history: { items: [], next_cursor: null, has_more: false } } },
+    ]);
+    const ambiguous = await run(["join", OTHER_ROOM, "--json"], { ...space, project: join(space.root, "third") }, []);
+    expect(ambiguous.exitCode).not.toBe(0);
+    expect(ambiguous.requests).toHaveLength(0);
+    expect(ambiguous.stderr).toContain("--as");
+    const unknown = await run(["join", OTHER_ROOM, "--as", "i_NoSuchSeat", "--json"], { ...space, project: join(space.root, "third") }, []);
+    expect(unknown.exitCode).not.toBe(0);
+    expect(unknown.requests).toHaveLength(0);
+  });
+
+  it("flips the seat's reach after joining", async () => {
+    const space = await joinedSpace();
+    const flipped = await run(["reach", "private", "--json"], space, [
+      { status: 200, body: { instance: { id: MEMBER_ID, reach: "private" } } },
+    ]);
+    expect(flipped.exitCode).toBe(0);
+    expect(flipped.requests[0]!.url).toBe("https://www.sharednet.ai/api/v1/instances/current");
+    expect(flipped.requests[0]!.init.method).toBe("PATCH");
+    expect(JSON.parse(String(flipped.requests[0]!.init.body))).toEqual({ reach: "private" });
+    const bad = await run(["reach", "secret", "--json"], space, []);
+    expect(bad.exitCode).not.toBe(0);
+    expect(bad.requests).toHaveLength(0);
+  });
+
+  it("waits for at least --min messages across pages before returning", async () => {
+    const space = await joinedSpace();
+    const result = await run(["wait", "--min", "2", "--json"], space, [
+      page([message(2, "one")]),
+      page([]),
+      page([message(3, "two")]),
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).items.map((item: any) => item.sequence)).toEqual([2, 3]);
+    expect(result.requests.map((request) => new URL(request.url).searchParams.get("after"))).toEqual(["1", "2", "2"]);
+    expect(await cursorOf(space)).toBe(3);
+  });
+
+  describe("sharednet watch", () => {
+    it("wakes the command on a message, hands it the batch, says the answer back, and never wakes on its own words", async () => {
+      const space = await joinedSpace();
+      const { calls, exec } = recorder({ exitCode: 0, stdout: "On it.\n" });
+      const result = await run(
+        ["watch", "--on", "message", "--run", "agent-turn", "--reply", "--max-runs", "1", "--json"],
+        space,
+        [
+          page([own(2, "what I said earlier")]),
+          page([]),
+          page([message(3, "please review the PR"), own(4, "typing…")]),
+          { status: 201, body: { message: { ...own(5, "On it."), id: "msg_reply00001" } } },
+        ],
+        {},
+        { exec },
+      );
+      expect(result.stderr).not.toContain("snk_");
+      expect(result.exitCode).toBe(0);
+      // The seat's own message at #2 did not wake it; #3 from the host did, with #4 (own) filtered out.
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.command).toBe("agent-turn");
+      expect(calls[0]!.input).toMatchObject({ room_id: ROOM_ID, member_id: MEMBER_ID, trigger: "message" });
+      expect((calls[0]!.input as any).messages.map((item: any) => item.sequence)).toEqual([3]);
+      expect(calls[0]!.env).toMatchObject({ SHAREDNET_ROOM_ID: ROOM_ID, SHAREDNET_MEMBER_ID: MEMBER_ID, SHAREDNET_MESSAGE_COUNT: "1", SHAREDNET_LAST_SEQUENCE: "4" });
+      const reply = result.requests.at(-1)!;
+      expect(reply.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages`);
+      expect(JSON.parse(String(reply.init.body))).toEqual({ content: "On it." });
+      const summary = JSON.parse(result.stdout);
+      expect(summary.runs).toEqual([
+        { run: 1, trigger: "message", messages: 1, status: "ok", exit_code: 0, reply_message_id: "msg_reply00001", last_sequence: 4 },
+      ]);
+      expect(await cursorOf(space)).toBe(4);
+    });
+
+    it("waits for --on count N before waking; a failed command consumes nothing, and the watch says so when it stops", async () => {
+      const space = await joinedSpace();
+      const { calls, exec } = recorder({ exitCode: 3, stdout: "half an answer", stderr: "boom" });
+      const result = await run(
+        ["watch", "--on", "count", "2", "--run", "agent-turn", "--reply", "--max-runs", "1", "--json"],
+        space,
+        [
+          page([message(2, "first")]),
+          page([message(3, "second")]),
+        ],
+        {},
+        { exec },
+      );
+      expect(calls).toHaveLength(1);
+      expect((calls[0]!.input as any).messages.map((item: any) => item.sequence)).toEqual([2, 3]);
+      // Two polls, and no reply posted; a seat that carries its Instance id asks nobody who it is.
+      expect(result.requests).toHaveLength(2);
+      expect(result.requests.some((request) => request.init.method === "POST")).toBe(false);
+      expect(result.stderr).toContain("boom");
+      // The batch was not handled: the cursor stays before it, and the exit says so.
+      expect(result.exitCode).toBe(4);
+      expect(JSON.parse(result.stderr.split("\n").filter((line) => line.startsWith("{")).at(-1)!).error).toMatchObject({ code: "watch_failed" });
+      expect(await cursorOf(space)).toBe(1);
+    });
+
+    it("offers a failed batch again on the next wake, together with what arrived since, and moves the cursor only once it is handled", async () => {
+      const space = await joinedSpace();
+      let attempt = 0;
+      const calls: unknown[] = [];
+      const exec = async (_command: string, input: string) => {
+        calls.push(JSON.parse(input));
+        attempt += 1;
+        return attempt === 1 ? { exitCode: 7, stdout: "", stderr: "crashed" } : { exitCode: 0, stdout: "Handled both.\n", stderr: "" };
+      };
+      const result = await run(
+        ["watch", "--on", "message", "--run", "agent-turn", "--reply", "--max-runs", "2", "--json"],
+        space,
+        [
+          page([message(2, "first")]),
+          page([message(3, "second")]),
+          { status: 201, body: { message: { ...own(4, "Handled both."), id: "msg_reply00002" } } },
+        ],
+        {},
+        { exec },
+      );
+      expect(result.exitCode).toBe(0);
+      expect((calls[0] as any).messages.map((item: any) => item.sequence)).toEqual([2]);
+      // The second wake carries the unhandled message and the new one.
+      expect((calls[1] as any).messages.map((item: any) => item.sequence)).toEqual([2, 3]);
+      const runs = JSON.parse(result.stdout).runs;
+      expect(runs.map((r: any) => [r.status, r.messages, r.last_sequence])).toEqual([["failed", 1, 1], ["ok", 2, 3]]);
+      expect(await cursorOf(space)).toBe(3);
+    });
+
+    it("keeps a reply the Room did not take and posts it again with the same idempotency key, without rerunning the command", async () => {
+      const space = await joinedSpace();
+      const { calls, exec } = recorder({ exitCode: 0, stdout: "Got it.\n" });
+      const result = await run(
+        ["watch", "--on", "message", "--run", "agent-turn", "--reply", "--max-runs", "2", "--json"],
+        space,
+        [
+          page([message(2, "first")]),
+          { status: 503, body: { error: { code: "service_unavailable", message: "x" } } },
+          page([]),
+          { status: 201, body: { message: { ...own(3, "Got it."), id: "msg_reply00003" } } },
+        ],
+        {},
+        { exec },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(calls).toHaveLength(1);
+      const posts = result.requests.filter((request) => request.init.method === "POST");
+      expect(posts).toHaveLength(2);
+      expect(header(posts[0]!, "idempotency-key")).toBe(header(posts[1]!, "idempotency-key"));
+      const runs = JSON.parse(result.stdout).runs;
+      expect(runs.map((r: any) => [r.status, r.reply_message_id, r.last_sequence])).toEqual([["reply_failed", null, 1], ["ok", "msg_reply00003", 2]]);
+      expect(await cursorOf(space)).toBe(2);
+    });
+
+    it("wakes every interval even when the Room is quiet, and after idle once it has gone quiet", async () => {
+      const space = await joinedSpace();
+      let clock = Date.parse("2026-09-06T12:00:00Z");
+      const now = () => new Date(clock);
+      const ticking = recorder({ exitCode: 0, stdout: "" });
+      const every = await run(
+        ["watch", "--on", "every 10m", "--run", "tick", "--max-runs", "1", "--json"],
+        space,
+        [
+          { status: 200, body: { items: [], next_cursor: null, has_more: false } },
+          { status: 200, body: { items: [], next_cursor: null, has_more: false } },
+        ],
+        {},
+        { exec: async (...call) => { clock += 5 * 60_000; return ticking.exec(...call); }, now: () => { clock += 5 * 60_000; return new Date(clock); } },
+      );
+      expect(every.exitCode).toBe(0);
+      expect(ticking.calls).toHaveLength(1);
+      expect((ticking.calls[0]!.input as any).messages).toEqual([]);
+
+      clock = Date.parse("2026-09-06T13:00:00Z");
+      const idle = recorder({ exitCode: 0, stdout: "" });
+      let polls = 0;
+      const quiet = await run(
+        ["watch", "--on", "idle 30s", "--run", "digest", "--max-runs", "1", "--json"],
+        space,
+        [
+          page([message(2, "a")]),
+          page([message(3, "b")]),
+          page([]),
+        ],
+        {},
+        {
+          exec: idle.exec,
+          now: () => {
+            // Time passes only once the Room has gone quiet: the third poll comes back empty after 30 s.
+            polls += 1;
+            if (polls > 6) clock += 31_000;
+            return new Date(clock);
+          },
+        },
+      );
+      expect(quiet.exitCode).toBe(0);
+      expect(idle.calls).toHaveLength(1);
+      expect((idle.calls[0]!.input as any).messages.map((item: any) => item.sequence)).toEqual([2, 3]);
+      expect(JSON.parse(quiet.stdout).runs[0]).toMatchObject({ trigger: "idle 30s", messages: 2 });
+      void now;
+    });
+
+    it("refuses a trigger it does not know, before touching the network", async () => {
+      const space = await joinedSpace();
+      const result = await run(["watch", "--on", "sometimes", "--run", "x", "--json"], space, []);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.requests).toHaveLength(0);
+      const noCommand = await run(["watch", "--on", "message", "--json"], space, []);
+      expect(noCommand.exitCode).not.toBe(0);
+    });
+  });
+
+  it("waits from the last sequence seen, loops past an empty page, and advances the cursor", async () => {
+    const space = await joinedSpace();
+    const result = await run(["wait", "--json"], space, [
+      { status: 200, body: { items: [], next_cursor: null, has_more: false } },
+      {
+        status: 200,
+        body: {
+          items: [message(2, "Any objections?"), message(3, "None here", "codex")],
+          next_cursor: "3",
+          has_more: false,
+        },
+      },
+    ]);
+
+    expect(result.stderr).toBe("");
+    expect(result.exitCode).toBe(0);
+    expect(result.requests.map((request) => request.url)).toEqual([
+      `https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/wait?after=1&timeout=25`,
+      `https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/wait?after=1&timeout=25`,
+    ]);
+    expect(header(result.requests[1]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+    expect(JSON.parse(result.stdout).items.map((item: { sequence: number }) => item.sequence)).toEqual([2, 3]);
+    expect(await cursorOf(space)).toBe(3);
+  });
+
+  it("never hands a seat its own words: a page of only them is consumed and the sit goes on", async () => {
+    const space = await joinedSpace();
+    const result = await run(["wait", "--json"], space, [
+      page([own(2, "what I just said")]),
+      page([]),
+      page([own(3, "and again"), message(4, "Reply from the host")]),
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).items.map((item: any) => [item.sequence, item.content])).toEqual([[4, "Reply from the host"]]);
+    // The cursor moved over its own messages too, so nothing is read twice.
+    expect(result.requests.map((request) => new URL(request.url).searchParams.get("after"))).toEqual(["1", "2", "2"]);
+    expect(await cursorOf(space)).toBe(4);
+
+    // With a deadline, a sit that heard only itself returns empty, cursor advanced.
+    const quiet = await run(["wait", "--timeout", "0", "--json"], space, [page([own(5, "me again")])]);
+    expect(JSON.parse(quiet.stdout).items).toEqual([]);
+    expect(await cursorOf(space)).toBe(5);
+  });
+
+  it("treats the apex and www hosts as one SharedNet: a login under either matches an invite from the other", async () => {
+    const space = await workspace();
+    const { getStoragePaths, writeStoredApiCredential } = await import("./storage.ts");
+    // A credential an older CLI wrote under the apex host.
+    await writeStoredApiCredential(getStoragePaths(space.env), {
+      schema_version: 1, base_url: "https://sharednet.ai", principal_id: "p_AcCoUnT0001", api_key_id: "key_AbCdEfGhIj",
+      api_key: `snk_${"K".repeat(43)}`, installation_secret: Buffer.alloc(32, 7).toString("base64url"), created_at: "2026-09-08T00:00:00.000Z", expires_at: null,
+    });
+    const instance = {
+      id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", agent_id: null, runtime_kind: "claude-code", cli_version: "0.1.3",
+      runtime_metadata: {}, reach: "public", status: "online", display_name: null,
+      started_at: "2026-09-08T00:00:00.000Z", last_seen_at: "2026-09-08T00:00:00.000Z", lease_expires_at: "2026-09-08T00:01:00.000Z",
+      token_expires_at: null, ended_at: null, revoked_at: null,
+    };
+    // The invite names www; the machine must still join as the account, and every request must go to www directly.
+    const result = await run(
+      ["join", PASTED_INVITE, "--json"],
+      space,
+      [
+        { status: 201, body: { instance, token: `sni_${"A".repeat(43)}`, heartbeat_after_seconds: 30 } },
+        { status: 200, body: { room: { id: ROOM_ID, name: "Launch review", state: "open" }, membership: { member_id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: null, state: "active" } } },
+        { status: 200, body: { items: [], next_cursor: null, has_more: false } },
+      ],
+    );
+    expect(result.stderr).toContain("Seat i_AccountSeat1 in rom_AbCdEfGhIj");
+    expect(result.stderr).not.toMatch(/sni_|rit_|snk_|clp_/);
+    expect(JSON.parse(result.stdout)).toMatchObject({ as: "account", principal_id: "p_AcCoUnT0001" });
+    expect(result.requests.every((request) => request.url.startsWith("https://www.sharednet.ai/"))).toBe(true);
+
+    // whoami reports the seat this directory holds, and the account, on the one origin.
+    const who = await run(["whoami", "--json"], space, []);
+    expect(JSON.parse(who.stdout)).toMatchObject({
+      base_url: "https://www.sharednet.ai",
+      account: { principal_id: "p_AcCoUnT0001" },
+      seat: { room_id: ROOM_ID, member_id: "i_AccountSeat1", base_url: "https://www.sharednet.ai" },
+    });
+  });
+
+  it("registers a fresh Instance on every account join, never folding two sessions with one session id into one", async () => {
+    const space = await workspace();
+    const registration = (id: string) => ({
+      status: 201,
+      body: {
+        instance: {
+          id, principal_id: "p_AcCoUnT0001", agent_id: null, runtime_kind: "claude-code", cli_version: "0.1.3", runtime_metadata: {}, reach: "public", status: "online",
+          display_name: null, started_at: "2026-09-08T00:00:00.000Z", last_seen_at: "2026-09-08T00:00:00.000Z", lease_expires_at: "2026-09-08T00:01:00.000Z", token_expires_at: null, ended_at: null, revoked_at: null,
+        },
+        token: `sni_${id.slice(2).padEnd(43, "x")}`,
+        heartbeat_after_seconds: 30,
+      },
+    });
+    const joined = (id: string) => ({ status: 200, body: { room: { id: ROOM_ID, name: "Launch review", state: "open" }, membership: { member_id: id, principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: null, state: "active" } } });
+    const history = { status: 200, body: { items: [], next_cursor: null, has_more: false } };
+    // Two windows that report the same driver session id (one host, one id), same machine, same credential.
+    const env = { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}`, CLAUDE_CODE_SESSION_ID: "same-id-for-every-window" };
+    const first = await run(["join", PASTED_INVITE, "--json"], space, [registration("i_WindowOne1"), joined("i_WindowOne1"), history], env);
+    const second = await run(["join", PASTED_INVITE, "--json"], space, [registration("i_WindowTwo2"), joined("i_WindowTwo2"), history], env);
+    expect(first.exitCode).toBe(0);
+    expect(second.exitCode).toBe(0);
+    // Neither registration names a local session key, so the server cannot hand the second window the first one's Instance.
+    for (const result of [first, second]) {
+      const body = JSON.parse(String(result.requests[0]!.init.body));
+      expect(body).not.toHaveProperty("local_instance_key");
+    }
+    expect(JSON.parse(first.stdout).member_id).toBe("i_WindowOne1");
+    expect(JSON.parse(second.stdout).member_id).toBe("i_WindowTwo2");
+    // Both seats are held in this directory; a third command here must say which.
+    const room = JSON.parse(await readFile(join(space.project, ".sharednet", "room.json"), "utf8"));
+    expect(Object.keys(room.seats).sort()).toEqual(["i_WindowOne1", "i_WindowTwo2"]);
+  });
+
+  it("lets one invite command run in session after session: a spent claim is not an error where the machine is already the account", async () => {
+    const space = await workspace();
+    const { getStoragePaths, writeStoredApiCredential } = await import("./storage.ts");
+    // The first session already redeemed this claim and bound the machine.
+    await writeStoredApiCredential(getStoragePaths(space.env), {
+      schema_version: 1, base_url: "https://www.sharednet.ai", principal_id: "p_AcCoUnT0001", api_key_id: "key_AbCdEfGhIj",
+      api_key: `snk_${"K".repeat(43)}`, installation_secret: Buffer.alloc(32, 7).toString("base64url"), created_at: "2026-09-09T00:00:00.000Z", expires_at: null,
+    });
+    const instance = {
+      id: "i_SecondSess", principal_id: "p_AcCoUnT0001", agent_id: null, runtime_kind: "claude-code", cli_version: "0.1.0",
+      runtime_metadata: {}, reach: "public", status: "online", display_name: null,
+      started_at: "2026-09-09T00:00:00.000Z", last_seen_at: "2026-09-09T00:00:00.000Z", lease_expires_at: "2026-09-09T00:01:00.000Z",
+      token_expires_at: null, ended_at: null, revoked_at: null,
+    };
+    const result = await run(
+      ["join", PASTED_INVITE, "--claim", CLAIM, "--json"],
+      space,
+      [
+        { status: 410, body: { error: { code: "login_consumed", message: "CLI login was already used." } } },
+        { status: 201, body: { instance, token: `sni_${"S".repeat(43)}`, heartbeat_after_seconds: 30 } },
+        { status: 200, body: { room: { id: ROOM_ID, name: "Launch review", state: "open" }, membership: { member_id: "i_SecondSess", principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: null, state: "active" } } },
+        { status: 200, body: { items: [], next_cursor: null, has_more: false } },
+      ],
+    );
+
+    expect(result.exitCode).toBe(0);
+    const output = JSON.parse(result.stdout);
+    expect(output).toMatchObject({ as: "account", member_id: "i_SecondSess", principal_id: "p_AcCoUnT0001" });
+    // It says what happened, names the account, and hands this session the verbs that address its own seat.
+    expect(result.stderr).toContain("already used");
+    expect(result.stderr).toContain("p_AcCoUnT0001");
+    expect(output.next.say).toBe('npx -y sharednet@latest say "…" --as i_SecondSess');
+    expect(output.next.wait).toBe("npx -y sharednet@latest wait --as i_SecondSess");
+    expect(result.stderr).not.toContain(CLAIM);
+  });
+
+  it("refuses a spent claim on a machine with no account, and says how to get a fresh one", async () => {
+    const result = await run(
+      ["join", PASTED_INVITE, "--claim", CLAIM, "--json"],
+      await workspace(),
+      [{ status: 410, body: { error: { code: "login_consumed", message: "CLI login was already used." } } }],
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    // One request: nothing was joined as anybody.
+    expect(result.requests).toHaveLength(1);
+    const error = JSON.parse(result.stderr).error;
+    expect(error.code).toBe("claim_spent");
+    expect(error.message).toContain("Open the join link again");
+  });
+
+  it("groups an account's seat under a tag with --agent, and refuses the flag for a machine that acts as nobody", async () => {
+    const space = await workspace();
+    const instance = {
+      id: "i_TaggedSeat1", principal_id: "p_AcCoUnT0001", agent_id: "a_ReViEwEr01", runtime_kind: "claude-code", cli_version: "0.1.3",
+      runtime_metadata: {}, reach: "public", status: "online", display_name: null,
+      started_at: "2026-09-08T00:00:00.000Z", last_seen_at: "2026-09-08T00:00:00.000Z", lease_expires_at: "2026-09-08T00:01:00.000Z",
+      token_expires_at: null, ended_at: null, revoked_at: null,
+    };
+    const result = await run(
+      ["join", PASTED_INVITE, "--agent", "Reviewer", "--json"],
+      space,
+      [
+        { status: 201, body: { agent: { id: "a_ReViEwEr01", handle: "reviewer", principal_id: "p_AcCoUnT0001" } } },
+        { status: 201, body: { instance, token: `sni_${"A".repeat(43)}`, heartbeat_after_seconds: 30 } },
+        { status: 200, body: { room: { id: ROOM_ID, name: "Launch review", state: "open" }, membership: { member_id: "i_TaggedSeat1", principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: null, state: "active" } } },
+        { status: 200, body: { items: [], next_cursor: null, has_more: false } },
+      ],
+      { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` },
+    );
+    expect(result.stderr).toContain("Seat i_TaggedSeat1 in rom_AbCdEfGhIj");
+    expect(result.stderr).not.toMatch(/sni_|rit_|snk_|clp_/);
+    expect(result.exitCode).toBe(0);
+    // The handle is created (or found) first, then the registration names the tag.
+    expect(result.requests.map((request) => `${request.init.method ?? "GET"} ${request.url}`).slice(0, 2)).toEqual([
+      "POST https://www.sharednet.ai/api/v1/agents",
+      "POST https://www.sharednet.ai/api/v1/instances",
+    ]);
+    expect(JSON.parse(String(result.requests[0]!.init.body))).toEqual({ handle: "reviewer" });
+    expect(JSON.parse(String(result.requests[1]!.init.body)).agent_id).toBe("a_ReViEwEr01");
+    expect(JSON.parse(result.stdout)).toMatchObject({ as: "account", agent_id: "a_ReViEwEr01", member_id: "i_TaggedSeat1" });
+
+    const nobody = await run(["join", PASTED_INVITE, "--agent", "reviewer", "--json"], await workspace(), []);
+    expect(nobody.exitCode).not.toBe(0);
+    expect(nobody.requests).toHaveLength(0);
+    expect(JSON.parse(nobody.stderr).error.code).toBe("account_required");
+  });
+
+  it("keeps two sessions in one directory as two seats: each says and waits as its own, and a stranger must say which", async () => {
+    const space = await workspace();
+    const sessionA = { CLAUDE_SESSION_ID: "session-a" };
+    const sessionB = { CLAUDE_SESSION_ID: "session-b" };
+    const joinedAs = (memberId: string, sequence: number) => ({
+      status: 200,
+      body: {
+        room: { id: ROOM_ID, name: "Launch review", state: "open" },
+        membership: { member_id: memberId, kind: "guest", name: "claude-code", state: "active" },
+        member_token: `sni_${memberId.slice(2).padEnd(43, "x")}`,
+        history: { items: [message(1, "Welcome")].slice(0, sequence), next_cursor: null, has_more: false },
+      },
+    });
+    const a = await run(["join", PASTED_INVITE, "--json"], space, [joinedAs("i_SeatAaaaaa", 1)], sessionA);
+    const b = await run(["join", PASTED_INVITE, "--json"], space, [joinedAs("i_SeatBbbbbb", 1)], sessionB);
+    expect(a.exitCode).toBe(0);
+    expect(b.exitCode).toBe(0);
+    const room = JSON.parse(await readFile(join(space.project, ".sharednet", "room.json"), "utf8"));
+    expect(Object.keys(room.seats).sort()).toEqual(["i_SeatAaaaaa", "i_SeatBbbbbb"]);
+
+    // A says as A: the request carries A's token, not the seat that joined last.
+    const said = await run(["say", "from A", "--json"], space, [{ status: 201, body: { message: message(2, "from A") } }], sessionA);
+    expect(said.exitCode).toBe(0);
+    expect(header(said.requests[0]!, "authorization")).toBe(`Bearer sni_${"SeatAaaaaa".padEnd(43, "x")}`);
+    // B waits as B, and only B's cursor moves.
+    const waited = await run(["wait", "--timeout", "0", "--json"], space, [page([message(2, "from A")])], sessionB);
+    expect(header(waited.requests[0]!, "authorization")).toBe(`Bearer sni_${"SeatBbbbbb".padEnd(43, "x")}`);
+    expect(await cursorOf(space, "i_SeatBbbbbb")).toBe(2);
+    expect(await cursorOf(space, "i_SeatAaaaaa")).toBe(1);
+
+    // A session that is neither must say which seat it means.
+    const stranger = await run(["say", "who am I", "--json"], space, [], { CLAUDE_SESSION_ID: "session-c" });
+    expect(stranger.exitCode).not.toBe(0);
+    expect(stranger.requests).toHaveLength(0);
+    expect(JSON.parse(stranger.stderr).error.code).toBe("seat_selection_required");
+    const chosen = await run(["say", "as B", "--as", "i_SeatBbbbbb", "--json"], space, [{ status: 201, body: { message: message(3, "as B") } }], { CLAUDE_SESSION_ID: "session-c" });
+    expect(header(chosen.requests[0]!, "authorization")).toBe(`Bearer sni_${"SeatBbbbbb".padEnd(43, "x")}`);
+    const byEnv = await run(["say", "as A", "--json"], space, [{ status: 201, body: { message: message(4, "as A") } }], { CLAUDE_SESSION_ID: "session-c", SHAREDNET_SEAT: "i_SeatAaaaaa" });
+    expect(header(byEnv.requests[0]!, "authorization")).toBe(`Bearer sni_${"SeatAaaaaa".padEnd(43, "x")}`);
+    // whoami lists both seats and marks the session's own.
+    const who = await run(["whoami", "--json"], space, [], sessionB);
+    expect(JSON.parse(who.stdout).seat).toMatchObject({
+      member_id: "i_SeatBbbbbb",
+      seats: [
+        { member_id: "i_SeatAaaaaa", this_session: false },
+        { member_id: "i_SeatBbbbbb", this_session: true },
+      ],
+    });
+  });
+
+  it("reads a Room file from before seats were separated as one seat with no session tie", async () => {
+    const space = await joinedSpace();
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    await mkdir(join(space.project, ".sharednet"), { recursive: true });
+    await writeFile(
+      join(space.project, ".sharednet", "room.json"),
+      JSON.stringify({ schema_version: 1, base_url: "https://www.sharednet.ai", room_id: ROOM_ID, member_id: MEMBER_ID, last_sequence: 1 }),
+    );
+    const result = await run(["wait", "--timeout", "0", "--json"], space, [page([message(2, "still here")])]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).items.map((item: any) => item.sequence)).toEqual([2]);
+    expect(await cursorOf(space)).toBe(2);
+  });
+
+  it("reads the Room as filter, order, window without touching the cursor: grep, sender, tag, last K oldest-first", async () => {
+    const space = await joinedSpace();
+    const page2 = { status: 200, body: { items: [message(5, "deploy is go"), message(3, "Deploy moved")], next_cursor: "3", has_more: false } };
+    const last = await run(["read", "--last", "2", "--grep", "deploy", "--json"], space, [page2]);
+    expect(last.exitCode).toBe(0);
+    const url = new URL(last.requests[0]!.url);
+    expect(url.pathname).toBe(`/api/v1/rooms/${ROOM_ID}/messages`);
+    expect(Object.fromEntries(url.searchParams)).toEqual({ order: "desc", limit: "2", q: "deploy" });
+    // Asked newest-first, shown oldest-first, and the cursor stays where it was.
+    expect(JSON.parse(last.stdout).items.map((item: any) => item.sequence)).toEqual([3, 5]);
+    expect(await cursorOf(space)).toBe(1);
+
+    const who = await run(["read", "--from-instance", "i_HostAbcdef", "--from-agent", "default", "--after", "10", "--limit", "5", "--json"], space, [page([])]);
+    expect(Object.fromEntries(new URL(who.requests[0]!.url).searchParams)).toEqual({ after: "10", limit: "5", sender_instance_id: "i_HostAbcdef", sender_agent_id: "default" });
+
+    const clash = await run(["read", "--last", "3", "--after", "2", "--json"], space, []);
+    expect(clash.exitCode).not.toBe(0);
+    expect(clash.requests).toHaveLength(0);
+    const badTag = await run(["read", "--from-agent", "reviewer", "--json"], space, []);
+    expect(JSON.parse(badTag.stderr).error.code).toBe("invalid_arguments");
+  });
+
+  it("says who this machine acts as and which seat this directory holds, and never a secret", async () => {
+    const nobody = await run(["whoami", "--json"], await workspace(), []);
+    expect(nobody.exitCode).toBe(0);
+    expect(JSON.parse(nobody.stdout)).toMatchObject({ base_url: "https://www.sharednet.ai", account: null, seat: null });
+    expect(JSON.parse(nobody.stdout).next).toContain("sharednet login");
+
+    const space = await joinedSpace();
+    const seated = await run(["whoami", "--json"], space, []);
+    expect(seated.requests).toHaveLength(0);
+    expect(JSON.parse(seated.stdout)).toMatchObject({
+      account: null,
+      seat: { room_id: ROOM_ID, member_id: MEMBER_ID, last_sequence: 1, credential_present: true },
+    });
+    expect(seated.stdout).not.toContain("sni_");
+    expect(seated.stdout).not.toContain("rit_");
+  });
+
+  it("returns after --timeout 0 with an empty page instead of sitting", async () => {
+    const space = await joinedSpace();
+    const result = await run(["wait", "--timeout", "0", "--json"], space, [
+      { status: 200, body: { items: [], next_cursor: null, has_more: false } },
+    ]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.requests).toHaveLength(1);
+    expect(result.requests[0]!.url).toContain("after=1&timeout=0");
+    expect(JSON.parse(result.stdout).items).toEqual([]);
+  });
+
+  it("prints plain lines for a hook, and nothing when the Room was quiet", async () => {
+    const space = await joinedSpace();
+    const quiet = await run(["wait", "--hook"], space, [
+      { status: 200, body: { items: [], next_cursor: null, has_more: false } },
+    ]);
+    expect(quiet.exitCode).toBe(0);
+    expect(quiet.stdout).toBe("");
+    expect(quiet.requests[0]!.url).toContain("timeout=0");
+
+    const spoken = await run(["wait", "--hook"], space, [
+      { status: 200, body: { items: [message(2, "Ship it")], next_cursor: "2", has_more: false } },
+    ]);
+    expect(spoken.exitCode).toBe(0);
+    expect(spoken.stdout).toBe("#2 host: Ship it\n");
+  });
+
+  it("tells a directory that never joined what to run", async () => {
+    const space = await workspace();
+    const result = await run(["say", "hello", "--json"], space, []);
+
+    expect(result.exitCode).toBe(2);
+    expect(result.requests).toHaveLength(0);
+    expect(JSON.parse(result.stderr).error.code).toBe("not_in_a_room");
+  });
+});
+
+describe("sharednet credits", () => {
+  const PURSE = { principal_id: "p_AbCdEfGhIj", balance: 100, granted: 100, sent: 0, received: 0 };
+  const PAYEE = "i_PayeePayee";
+
+  /** A directory holding one seat, the way `join` leaves it. */
+  async function seated() {
+    const space = await workspace();
+    await run(["join", PASTED_INVITE], space, [joined()]);
+    return space;
+  }
+
+  it("reads the purse through the seat this directory holds", async () => {
+    const space = await seated();
+
+    const result = await run(["balance", "--json"], space, [{ body: { credits: PURSE } }]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.requests[0]!.url).toBe("https://www.sharednet.ai/api/v1/credits");
+    expect(header(result.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+    expect(JSON.parse(result.stdout)).toMatchObject({ balance: 100, as: "seat", seat: { room_id: ROOM_ID, member_id: MEMBER_ID } });
+  });
+
+  it("redeems a code as typed, and reports a repeat as nothing granted rather than an error", async () => {
+    const space = await seated();
+
+    const result = await run(["redeem", "hack-2026", "--json"], space, [
+      { body: { credits: PURSE, granted: 100, transfer: { id: "txn_AbCdEfGhIj" } } },
+    ]);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(String(result.requests[0]!.init.body))).toEqual({ code: "hack-2026" });
+    expect(JSON.parse(result.stdout).granted).toBe(100);
+
+    const repeat = await run(["redeem", "HACK-2026", "--json"], space, [{ body: { credits: PURSE, granted: 0, transfer: null } }]);
+    expect(repeat.exitCode).toBe(0);
+    expect(JSON.parse(repeat.stdout).granted).toBe(0);
+  });
+
+  it("pays with a fresh idempotency key, and posts a receipt into the Room only when asked", async () => {
+    const space = await seated();
+    const transfer = { id: "txn_AbCdEfGhIj", amount: 25, to_principal_id: "p_OtherOther" };
+
+    const quiet = await run(["pay", PAYEE, "25", "--memo", "map tiles", "--json"], space, [
+      { status: 201, body: { transfer, credits: { ...PURSE, balance: 75, sent: 25 } } },
+    ]);
+    expect([quiet.exitCode, quiet.stderr]).toEqual([0, ""]);
+    expect(quiet.requests).toHaveLength(1);
+    expect(quiet.requests[0]!.url).toBe("https://www.sharednet.ai/api/v1/credits/transfers");
+    expect(JSON.parse(String(quiet.requests[0]!.init.body))).toEqual({ to: PAYEE, amount: 25, memo: "map tiles" });
+    expect(header(quiet.requests[0]!, "idempotency-key")).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(JSON.parse(quiet.stdout).receipt).toBeNull();
+
+    const announced = await run(["pay", PAYEE, "25", "--room", "--json"], space, [
+      { status: 201, body: { transfer, credits: { ...PURSE, balance: 50, sent: 50 } } },
+      { status: 201, body: { message: { id: "msg_AbCdEfGhIj", sequence: 4 } } },
+    ]);
+    expect(announced.exitCode).toBe(0);
+    expect(JSON.parse(String(announced.requests[0]!.init.body))).toMatchObject({ room_id: ROOM_ID });
+    expect(announced.requests[1]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages`);
+    expect(JSON.parse(String(announced.requests[1]!.init.body)).content).toBe(`Paid 25 credits to ${PAYEE} (txn_AbCdEfGhIj)`);
+    // The two writes carry different keys: the payment and the receipt are separate acts.
+    expect(header(announced.requests[0]!, "idempotency-key")).not.toBe(header(announced.requests[1]!, "idempotency-key"));
+  });
+
+  it.each([
+    { failure: "a closed Room", response: { status: 409, body: { error: { code: "room_closed" } } } },
+    { failure: "a lost connection", response: { error: new Error("Network unavailable") } },
+  ])("keeps a completed payment successful when its receipt fails because of $failure", async ({ response }) => {
+    const space = await seated();
+    const transfer = {
+      id: "txn_AbCdEfGhIj",
+      from_principal_id: PURSE.principal_id,
+      to_principal_id: "p_OtherOther",
+      amount: 25,
+      memo: null,
+      room_id: ROOM_ID,
+      by_instance_id: MEMBER_ID,
+      addressed_to: PAYEE,
+      code: null,
+      created_at: "2026-09-12T10:00:00.000Z",
+    };
+    const result = await run(["pay", PAYEE, "25", "--room", "--json"], space, [
+      { status: 201, body: { transfer, credits: { ...PURSE, balance: 75, sent: 25 } } },
+      response,
+    ]);
+
+    expect([result.exitCode, result.stderr]).toEqual([0, ""]);
+    const paid = JSON.parse(result.stdout);
+    expect(paid.transfer.id).toBe("txn_AbCdEfGhIj");
+    expect(paid.credits).toMatchObject({ balance: 75, sent: 25 });
+    expect(paid.receipt).toBeNull();
+    expect(paid.warning.code).toBe("receipt_not_confirmed");
+    expect(paid.warning.message).toMatch(/payment succeeded/i);
+    expect(paid.warning.message).toMatch(/do not repeat/i);
+    expect(result.requests.map(({ url }) => new URL(url).pathname)).toEqual([
+      "/api/v1/credits/transfers",
+      `/api/v1/rooms/${ROOM_ID}/messages`,
+    ]);
+  });
+
+  it("reports a refused payment as a failure without trying to post a receipt", async () => {
+    const space = await seated();
+    const result = await run(["pay", PAYEE, "101", "--room", "--json"], space, [
+      { status: 409, body: { error: { code: "insufficient_credits" } } },
+    ]);
+
+    expect(result.exitCode).toBe(4);
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr).error.code).toBe("insufficient_credits");
+    expect(result.requests.map(({ url }) => new URL(url).pathname)).toEqual(["/api/v1/credits/transfers"]);
+  });
+
+  it("refuses a malformed payee, amount or cursor before any request leaves the machine", async () => {
+    const space = await seated();
+
+    for (const argv of [
+      ["pay", "rom_AbCdEfGhIj", "25"],
+      ["pay", PAYEE, "0"],
+      ["pay", PAYEE, "2.5"],
+      ["pay", PAYEE, "-5"],
+      ["pay", PAYEE],
+      ["ledger", "--last", "0"],
+      ["ledger", "--before", "msg_AbCdEfGhIj"],
+      ["redeem"],
+    ]) {
+      const result = await run(argv, space, []);
+      expect(result.exitCode).toBe(2);
+      expect(result.requests).toHaveLength(0);
+    }
+  });
+
+  it("pages the ledger newest first, and says so when the machine is neither seated nor logged in", async () => {
+    const space = await seated();
+
+    const result = await run(["ledger", "--last", "2", "--before", "txn_AbCdEfGhIj", "--json"], space, [
+      { body: { items: [], next_cursor: null, has_more: false } },
+    ]);
+    expect(result.requests[0]!.url).toBe("https://www.sharednet.ai/api/v1/credits/transfers?limit=2&before=txn_AbCdEfGhIj");
+
+    const bare = await workspace();
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(bare.project, { recursive: true });
+    const nowhere = await run(["balance"], bare, []);
+    expect(nowhere.exitCode).toBe(2);
+    expect(nowhere.stderr).toContain("not_logged_in");
+    expect(nowhere.requests).toHaveLength(0);
+  });
+});
+
+describe("sharednet files", () => {
+  const ARTIFACT_ID = "art_AbCdEfGhIj";
+  const LINK_KEY = `afk_${"k".repeat(43)}`;
+
+  async function seated() {
+    const space = await workspace();
+    await run(["join", PASTED_INVITE], space, [joined()]);
+    return space;
+  }
+
+  function artifact(overrides: Record<string, unknown> = {}) {
+    return {
+      id: ARTIFACT_ID,
+      principal_id: "p_AbCdEfGhIj",
+      uploaded_by_instance_id: MEMBER_ID,
+      room_id: ROOM_ID,
+      filename: "fix.patch",
+      content_type: "text/plain",
+      size_bytes: 4,
+      sha256: "a".repeat(64),
+      created_at: "2026-09-12T10:00:00.000Z",
+      ...overrides,
+    };
+  }
+
+  /** A response carrying bytes, the way the content route answers. */
+  function bytes(body: string, filename = "fix.patch") {
+    return {
+      status: 200,
+      raw: new Response(body, {
+        headers: {
+          "content-type": "text/plain",
+          "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+          "x-sharednet-sha256": createHash("sha256").update(body).digest("hex"),
+        },
+      }),
+    };
+  }
+
+  it("uploads bytes with the name in a header, addressed to this directory's Room, and hands back the link", async () => {
+    const space = await seated();
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(space.project, "fix.patch"), "diff");
+
+    const result = await run(["upload", "fix.patch", "--json"], space, [
+      { status: 201, body: { artifact: artifact(), link_key: LINK_KEY, url: `https://www.sharednet.ai/f/${ARTIFACT_ID}?k=${LINK_KEY}` } },
+    ]);
+
+    expect([result.exitCode, result.stderr]).toEqual([0, ""]);
+    const request = result.requests[0]!;
+    expect(request.url).toBe("https://www.sharednet.ai/api/v1/artifacts");
+    expect(header(request, "x-sharednet-filename")).toBe("fix.patch");
+    expect(header(request, "x-sharednet-room")).toBe(ROOM_ID);
+    expect(header(request, "content-type")).toBe("text/plain");
+    expect(header(request, "idempotency-key")).toMatch(/^[0-9a-f-]{36}$/);
+    // The bytes go up as bytes, not as JSON or base64.
+    expect(Buffer.from(request.init.body as Uint8Array).toString()).toBe("diff");
+    // One kind of file: there is always a link to hand over.
+    expect(JSON.parse(result.stdout)).toMatchObject({ url: `https://www.sharednet.ai/f/${ARTIFACT_ID}?k=${LINK_KEY}` });
+  });
+
+  it("uploads from a directory that is in no Room: the file is addressed to nobody and still has a link", async () => {
+    const space = await workspace();
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    await mkdir(space.project, { recursive: true });
+    await writeFile(join(space.project, "rows.csv"), "a,b\n");
+
+    const result = await run(
+      ["upload", "rows.csv", "--json"],
+      space,
+      [{ status: 201, body: { artifact: artifact({ room_id: null, filename: "rows.csv" }), link_key: LINK_KEY, url: `https://www.sharednet.ai/f/${ARTIFACT_ID}?k=${LINK_KEY}` } }],
+      { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` },
+    );
+
+    expect([result.exitCode, result.stderr]).toEqual([0, ""]);
+    expect(header(result.requests[0]!, "x-sharednet-room")).toBeUndefined();
+    expect(JSON.parse(result.stdout).url).toContain(`/f/${ARTIFACT_ID}?k=`);
+  });
+
+  it("encodes a Unicode filename into an ASCII HTTP header", async () => {
+    const space = await seated();
+    const { writeFile } = await import("node:fs/promises");
+    const filename = "研究报告.md";
+    await writeFile(join(space.project, filename), "diff");
+    const result = await run(["upload", filename], space, [{ status: 201, body: { artifact: artifact({ filename }) } }]);
+    expect(result.exitCode).toBe(0);
+    const request = result.requests[0]!;
+    expect(() => new Request(request.url, request.init)).not.toThrow();
+    expect(header(request, "x-sharednet-filename*")).toBe(`UTF-8''${encodeURIComponent(filename)}`);
+    expect(header(request, "x-sharednet-filename")).toBeUndefined();
+  });
+
+  it("refuses an existing dangling symlink without creating its target", async () => {
+    const space = await seated();
+    const { symlink, lstat } = await import("node:fs/promises");
+    const target = join(space.project, "absent-target.patch");
+    const destination = join(space.project, "fix.patch");
+    await symlink(target, destination);
+    const result = await run(["download", ARTIFACT_ID], space, [{ body: { artifact: artifact() } }, bytes("diff")]);
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("file_exists");
+    expect((await lstat(destination)).isSymbolicLink()).toBe(true);
+    await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("writes a downloaded file here, checks the digest, and refuses to overwrite without being told", async () => {
+    const space = await seated();
+    const { readFile } = await import("node:fs/promises");
+
+    const first = await run(["download", ARTIFACT_ID, "--json"], space, [
+      { body: { artifact: artifact() } },
+      bytes("diff"),
+    ]);
+    expect([first.exitCode, first.stderr]).toEqual([0, ""]);
+    expect(await readFile(join(space.project, "fix.patch"), "utf8")).toBe("diff");
+    const report = JSON.parse(first.stdout);
+    expect(report).toMatchObject({ artifact_id: ARTIFACT_ID, size_bytes: 4, verified: true });
+    expect(report.path).toBe(join(space.project, "fix.patch"));
+
+    // A second download would clobber it, so it stops and says how to proceed.
+    const again = await run(["download", ARTIFACT_ID], space, [{ body: { artifact: artifact() } }, bytes("diff")]);
+    expect(again.exitCode).toBe(2);
+    expect(again.stderr).toContain("file_exists");
+    const forced = await run(["download", ARTIFACT_ID, "--force", "--json"], space, [
+      { body: { artifact: artifact() } },
+      bytes("newer"),
+    ]);
+    expect(forced.exitCode).toBe(0);
+    expect(await readFile(join(space.project, "fix.patch"), "utf8")).toBe("newer");
+  });
+
+  it("opens a link with no credential of its own, and never writes outside the directory it was given", async () => {
+    const space = await seated();
+    const { readFile } = await import("node:fs/promises");
+
+    const result = await run(
+      ["download", `https://www.sharednet.ai/f/${ARTIFACT_ID}?k=${LINK_KEY}`, "--json"],
+      space,
+      [bytes("a,b\n", "rows.csv")],
+    );
+    expect([result.exitCode, result.stderr]).toEqual([0, ""]);
+    // One request, no metadata call, and no Authorization header at all.
+    expect(result.requests).toHaveLength(1);
+    expect(result.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/artifacts/${ARTIFACT_ID}/content?k=${LINK_KEY}`);
+    expect(header(result.requests[0]!, "authorization")).toBeUndefined();
+    expect(await readFile(join(space.project, "rows.csv"), "utf8")).toBe("a,b\n");
+
+    // A server-supplied name that tries to escape is reduced to its last segment.
+    const hostile = await run(["download", `https://www.sharednet.ai/f/${ARTIFACT_ID}?k=${LINK_KEY}`, "--json"], space, [
+      bytes("owned", "../../../../tmp/escaped.txt"),
+    ]);
+    expect(hostile.exitCode).toBe(0);
+    expect(JSON.parse(hostile.stdout).path).toBe(join(space.project, "escaped.txt"));
+  });
+
+  it("refuses a malformed id, link or option before anything leaves the machine", async () => {
+    const space = await seated();
+
+    for (const argv of [
+      ["download", "rom_AbCdEfGhIj"],
+      ["download", "https://www.sharednet.ai/f/art_AbCdEfGhIj"],
+      ["download", "https://www.sharednet.ai/nope?k=afk_x"],
+      ["upload", "missing.txt"],
+      ["upload"],
+      ["files", "--last", "0"],
+      ["files", "--before", "msg_AbCdEfGhIj"],
+    ]) {
+      const result = await run(argv, space, []);
+      expect(result.exitCode).toBe(2);
+      expect(result.requests).toHaveLength(0);
+    }
+  });
+
+  it("lists this Room's files when asked, and the account's otherwise", async () => {
+    const space = await seated();
+
+    const room = await run(["files", "--room", "--last", "5", "--json"], space, [
+      { body: { items: [artifact()], next_cursor: null, has_more: false } },
+    ]);
+    expect(room.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/artifacts?limit=5&room_id=${ROOM_ID}`);
+
+    const all = await run(["files", "--json"], space, [{ body: { items: [], next_cursor: null, has_more: false } }]);
+    expect(all.requests[0]!.url).toBe("https://www.sharednet.ai/api/v1/artifacts?limit=20");
+  });
+});
