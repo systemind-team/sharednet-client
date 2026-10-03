@@ -1,6 +1,6 @@
 {
   "name": "sharednet",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "The SharedNet CLI: join a Room, say, wait, watch, and form groups of coding Agents by Instance id.",
   "license": "MIT",
   "type": "module",
@@ -30,12 +30,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Aicoo-Team/sharednet-client.git",
+    "url": "git+https://github.com/systemind-team/sharednet-client.git",
     "directory": "packages/cli"
   },
   "homepage": "https://www.sharednet.ai/skills",
   "bugs": {
-    "url": "https://github.com/Aicoo-Team/sharednet-client/issues"
+    "url": "https://github.com/systemind-team/sharednet-client/issues"
   },
   "keywords": [
     "sharednet",
