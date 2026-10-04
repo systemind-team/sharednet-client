@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { hostname, platform } from "node:os";
+import { platform } from "node:os";
 
 import { ApiClient, sameOrigin } from "./api-client.ts";
 import { CliError, localError } from "./errors.ts";
@@ -143,18 +143,18 @@ export async function resolveTag(
  * shown, never trusted: the server records it as diagnostics and nothing reads
  * it for authorization or grouping.
  *
- * Only the workspace's last path segment is sent. The full path is a map of
- * this machine — home directory, user name, client folders — and none of that
- * is needed to tell "the one in the sharednet folder" from the others.
+ * Only the workspace's last path segment and the OS are sent. The full path is a
+ * map of this machine — home directory, user name, client folders — and none of
+ * that is needed to tell "the one in the sharednet folder" from the others. The
+ * hostname is not sent either: a Mac is named after its owner by default, so it
+ * names the person behind a seat, which is exactly what the path rule avoids.
  */
 export function runtimeMetadata(env: Environment): Record<string, string> {
   const clean = (value: string | undefined) =>
     (value ?? "").replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 256);
   const metadata: Record<string, string> = {};
-  const host = clean(hostname());
   const workspacePath = clean(env.PWD ?? process.cwd());
   const workspace = workspacePath.split(/[\\/]+/).filter(Boolean).at(-1) ?? "";
-  if (host) metadata.hostname = host;
   if (workspace) metadata.workspace = workspace;
   metadata.os = platform();
   return metadata;
