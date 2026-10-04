@@ -909,19 +909,33 @@ function parseTimeout(value: string | undefined): number | null {
  */
 async function wait(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["timeout", "hook", "min", "as"]);
+  assertOnlyOptions(parsed, ["timeout", "hook", "min", "as", "from-instance"]);
   if (parsed.positionals.length !== 0) {
-    throw localError("invalid_arguments", "Usage: sharednet wait [--timeout <seconds>] [--min <count>] [--hook] [--as <member_id>]");
+    throw localError("invalid_arguments", "Usage: sharednet wait [--from-instance <i_…>] [--timeout <seconds>] [--min <count>] [--hook] [--as <member_id>]");
+  }
+  const fromInstance = stringOption(parsed, "from-instance");
+  if (fromInstance !== undefined && !/^i_[A-Za-z0-9]{10}$/.test(fromInstance)) {
+    throw localError("invalid_instance", "--from-instance takes an Instance id such as i_AbCdEfGhIj, not a display name.");
   }
   const hook = parsed.options.get("hook") === true;
   const totalSeconds = hook ? 0 : parseTimeout(stringOption(parsed, "timeout"));
   const minimum = parseCount(stringOption(parsed, "min"), "--min") ?? 1;
-  const { client, state, credential } = await currentSeat(dependencies, stringOption(parsed, "as"));
+  const deadline = totalSeconds === null ? null : dependencies.now().getTime() + totalSeconds * 1000;
+  let requestSignal: AbortSignal | undefined;
+  // Every HTTP request in this invocation is bounded, including a lease
+  // refresh or legacy-seat identity lookup before the first long-poll.
+  const boundedFetch: typeof globalThis.fetch = (input, init) => {
+    const requestMs = totalSeconds === 0 ? 5000 : deadline === null
+      ? (WAIT_MAX_SECONDS + 5) * 1000
+      : Math.max(1, Math.min((WAIT_MAX_SECONDS + 5) * 1000, deadline - dependencies.now().getTime()));
+    const timeoutSignal = AbortSignal.timeout(requestMs);
+    requestSignal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+    return dependencies.fetch(input, { ...init, signal: requestSignal });
+  };
+  const { client, state, credential } = await currentSeat({ ...dependencies, fetch: boundedFetch }, stringOption(parsed, "as"));
   const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const me = await whoAmI(client, state, credential);
 
-  const deadline =
-    totalSeconds === null ? null : dependencies.now().getTime() + totalSeconds * 1000;
   // The Room log is raw and includes what this seat said; the cursor moves
   // over all of it, but only other members' words wake the caller, count
   // toward --min, or come back. A page of nothing but one's own words is
@@ -929,15 +943,24 @@ async function wait(args: string[], dependencies: GuestDependencies): Promise<un
   const items: MessageShape[] = [];
   let cursor = state.last_sequence;
   for (;;) {
+    if (totalSeconds !== null && totalSeconds > 0 && dependencies.now().getTime() >= deadline!) break;
     const remaining =
       deadline === null
         ? WAIT_MAX_SECONDS
         : Math.max(0, Math.ceil((deadline - dependencies.now().getTime()) / 1000));
     const timeout = Math.min(WAIT_MAX_SECONDS, remaining);
-    const page = await waitPage(client, state.room_id, credential.member_token, cursor, timeout);
-    const advanced = highestSequence(page.items, cursor) > cursor;
-    cursor = highestSequence(page.items, cursor);
-    items.push(...page.items.filter((item) => !isOwn(item, me, state.member_id)));
+    let page: PageShape;
+    try {
+      page = await waitPage(client, state.room_id, credential.member_token, cursor, timeout);
+    } catch (error) {
+      if (requestSignal?.aborted && totalSeconds !== null && totalSeconds > 0 && dependencies.now().getTime() >= deadline!) break;
+      throw error;
+    }
+    const fresh = page.items.filter((item) => Number.isSafeInteger(item.sequence) && item.sequence > cursor);
+    const advanced = highestSequence(fresh, cursor) > cursor;
+    cursor = highestSequence(fresh, cursor);
+    items.push(...fresh.filter((item) => !isOwn(item, me, state.member_id) &&
+      (fromInstance === undefined || item.sender?.member_id === fromInstance)));
     if (items.length >= minimum) break;
     if (deadline !== null && dependencies.now().getTime() >= deadline) break;
     // The server answered at its cap, or with only our own words; ask again.

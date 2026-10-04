@@ -555,6 +555,54 @@ describe("sharednet say and wait", () => {
     expect(await cursorOf(space)).toBe(3);
   });
 
+  it("waits for the selected instance, skipping unrelated, own and already-seen messages", async () => {
+    const space = await joinedSpace();
+    const result = await run(["wait", "--from-instance", "i_HostHostHo", "--min", "2", "--json"], space, [
+      page([message(1, "already seen"), own(2, "self"), { ...message(3, "other"), sender: { member_id: "i_OtherOther", kind: "instance", name: "host" } }]),
+      page([message(4, "target one")]),
+      page([message(4, "duplicate"), message(5, "target two")]),
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).items.map((item: any) => item.sequence)).toEqual([4, 5]);
+    expect(result.requests.map((request) => new URL(request.url).searchParams.get("after"))).toEqual(["1", "3", "4"]);
+    expect(await cursorOf(space)).toBe(5);
+  });
+
+  it("rejects ambiguous sender names before making a request", async () => {
+    const space = await joinedSpace();
+    const result = await run(["wait", "--from-instance", "host", "--json"], space, []);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("invalid_instance");
+    expect(result.requests).toHaveLength(0);
+  });
+
+  it("a disconnected wait leaves its saved cursor available for a later retry", async () => {
+    const space = await joinedSpace();
+    const failed = await run(["wait", "--from-instance", "i_HostHostHo", "--json"], space, [
+      page([own(2, "self")]), { error: new Error("connection dropped") },
+    ]);
+    expect(failed.exitCode).toBe(5);
+    expect(await cursorOf(space)).toBe(1);
+    const retried = await run(["wait", "--from-instance", "i_HostHostHo", "--json"], space, [page([own(2, "self"), message(3, "target")])]);
+    expect(retried.exitCode).toBe(0);
+    expect(JSON.parse(retried.stdout).items.map((item: any) => item.sequence)).toEqual([3]);
+    expect(await cursorOf(space)).toBe(3);
+  });
+
+  it("a filtered immediate check returns partial matches and consumes excluded messages", async () => {
+    const space = await joinedSpace();
+    const result = await run(["wait", "--from-instance", "i_HostHostHo", "--min", "2", "--timeout", "0", "--json"], space, [
+      page([message(2, "target"), own(3, "self"), { ...message(4, "other"), sender: { member_id: "i_OtherOther", kind: "instance", name: "host" } }]),
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).items.map((item: any) => item.sequence)).toEqual([2]);
+    expect(await cursorOf(space)).toBe(4);
+    const quiet = await run(["wait", "--from-instance", "i_HostHostHo", "--timeout", "0", "--json"], space, [page([])]);
+    expect(quiet.exitCode).toBe(0);
+    expect(JSON.parse(quiet.stdout).items).toEqual([]);
+    expect(await cursorOf(space)).toBe(4);
+  });
+
   describe("sharednet watch", () => {
     it("wakes the command on a message, hands it the batch, says the answer back, and never wakes on its own words", async () => {
       const space = await joinedSpace();

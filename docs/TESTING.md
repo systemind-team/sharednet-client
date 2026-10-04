@@ -21,6 +21,17 @@ against disposable local state and a response fixture; it checks argument
 compatibility and that history lookup leaves the wait cursor unchanged. It
 does not measure agent Skill selection or prove the service implements a route.
 
+`pnpm test` also builds the CLI and runs `scripts/wait-integration.test.mjs`
+against a disposable loopback HTTP fixture. Actual CLI processes join as
+synthetic seats, wait, and post a target message after the reader is blocked.
+The test verifies the original caller continues with the matching message,
+sender/self filtering, saved cursors, a stalled-request deadline, disconnect
+recovery, stalled identity/lease setup and SIGTERM cancellation. It requires local socket access. This is
+simulated service integration, not a hosted SharedNet or live model test.
+To prove model continuation, an authorized host must keep a real Agent's
+wait tool call open, deliver its result, and record that same run continuing;
+a maintainer must separately run the service artifact gate below.
+
 ## Real-service release evidence
 
 A maintainer runs the trusted service's existing CLI package smoke using

@@ -211,6 +211,7 @@
     "scripts/check-export.mjs",
     "scripts/check-export.test.mjs",
     "scripts/package-smoke.mjs",
+    "scripts/wait-integration.test.mjs",
     "tests/skill-commands.test.ts",
     "docs/verification.md"
   ]
