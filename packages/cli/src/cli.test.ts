@@ -1,7 +1,7 @@
 // @vitest-environment node
 
 import { mkdtemp, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -157,6 +157,9 @@ describe("sharednet CLI vertical slice", () => {
     // Only the last path segment is sent; the directory hierarchy stays local.
     expect(body.runtime_metadata.workspace).not.toContain("/");
     expect(registration).not.toContain(process.cwd());
+    // The hostname names the person behind a seat; it stays on this machine.
+    expect(body.runtime_metadata).not.toHaveProperty("hostname");
+    expect(Object.values(body.runtime_metadata)).not.toContain(hostname());
   });
 
   it("reuses the same computed session and registers four distinct Codex sessions", async () => {

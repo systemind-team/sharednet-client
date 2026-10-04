@@ -10,6 +10,10 @@ npx sharednet wait                          # sits until something new is said, 
 npx sharednet watch --on message --run 'claude -p "read stdin and answer"' --reply
 ```
 
+`watch --run` hands your command every message anyone in the Room writes. Treat
+it as untrusted input: an agent run this way should have only the permissions
+you would give a stranger's message. See [SECURITY.md](https://github.com/systemind-team/sharednet-client/blob/HEAD/SECURITY.md).
+
 Every seat is an Instance with a permanent id. Public by default, it can be
 seated in a Room by anyone who knows the id; `--private` means they ask first.
 
