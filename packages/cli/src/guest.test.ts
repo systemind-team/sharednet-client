@@ -85,7 +85,7 @@ async function workspace() {
 async function run(
   argv: string[],
   space: Awaited<ReturnType<typeof workspace>>,
-  responses: Array<{ status?: number; body?: unknown; error?: Error; raw?: Response }>,
+  responses: Array<{ status?: number; body?: unknown; error?: Error; raw?: Response; hang?: true }>,
   environment: Record<string, string> = {},
   overrides: { exec?: CommandRunner; now?: () => Date } = {},
 ) {
@@ -99,6 +99,12 @@ async function run(
     const next = responses.shift();
     if (!next) throw new Error("Unexpected fetch");
     if (next.error) throw next.error;
+    // A server that takes the request and never answers: only the caller's own signal ends it.
+    if (next.hang) {
+      return new Promise<Response>((_, reject) => {
+        init.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+      });
+    }
     // A byte route answers with its own Response, headers and all.
     if (next.raw) return next.raw;
     return new Response(next.body === undefined ? null : JSON.stringify(next.body), {
@@ -122,8 +128,24 @@ function own(sequence: number, content: string) {
   return { ...message(sequence, content, "claude-code"), sender: { member_id: MEMBER_ID, kind: "guest", name: "claude-code" } };
 }
 
+/** A refusal, which is how a connector loop is meant to end: the service said no, not "later". */
+function revoked() {
+  return { status: 401, body: { error: { code: "invalid_credentials", message: "Credentials are invalid." } } };
+}
+
 function page(items: ReturnType<typeof message>[]) {
   return { status: 200, body: { items, next_cursor: null, has_more: false } };
+}
+
+/** The Room as a member reads it: its state, and the seats in it with their names. */
+function roomState(state: "open" | "closed") {
+  return {
+    status: 200,
+    body: {
+      room: { id: ROOM_ID, name: "Launch review", state },
+      memberships: [{ member_id: MEMBER_ID, kind: "guest", name: "claude-code", state: "active" }],
+    },
+  };
 }
 
 /** A command runner that records what it was given and answers with a fixed result. */
@@ -401,6 +423,36 @@ describe("sharednet say and wait", () => {
     return space;
   }
 
+  /** The connector's own cursor for one seat, as a previous run would have left it. */
+  async function seatCursor(space: Awaited<ReturnType<typeof workspace>>, roomId: string, memberId: string, cursor: number) {
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const dir = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", roomId);
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await writeFile(join(dir, `${memberId}.serve-cursor`), `${cursor}\n`, { mode: 0o600 });
+  }
+
+  /** A second seat on disk, as a join into another Room would have left it. */
+  async function seatIn(space: Awaited<ReturnType<typeof workspace>>, roomId: string, memberId: string) {
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const dir = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", roomId);
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(dir, `${memberId}.json`),
+      JSON.stringify({
+        schema_version: 1,
+        base_url: "https://www.sharednet.ai",
+        room_id: roomId,
+        member_id: memberId,
+        name: "claude-code",
+        member_token: MEMBER_TOKEN,
+        joined_at: "2026-09-06T00:00:00.000Z",
+      }),
+      { mode: 0o600 },
+    );
+  }
+
   it("says with the stored member token and never moves the cursor", async () => {
     const space = await joinedSpace();
     const result = await run(["say", "Build is green.", "--json"], space, [
@@ -584,7 +636,17 @@ describe("sharednet say and wait", () => {
       expect(JSON.parse(String(reply.init.body))).toEqual({ content: "On it." });
       const summary = JSON.parse(result.stdout);
       expect(summary.runs).toEqual([
-        { run: 1, trigger: "message", messages: 1, status: "ok", exit_code: 0, reply_message_id: "msg_reply00001", last_sequence: 4 },
+        {
+          run: 1,
+          trigger: "message",
+          fired: ["message"],
+          wake_id: expect.stringMatching(/^wk_[A-Za-z0-9_-]{16}$/),
+          messages: 1,
+          status: "ok",
+          exit_code: 0,
+          reply_message_id: "msg_reply00001",
+          last_sequence: 4,
+        },
       ]);
       expect(await cursorOf(space)).toBe(4);
     });
@@ -726,6 +788,194 @@ describe("sharednet say and wait", () => {
     });
   });
 
+  describe("sharednet wait --on", () => {
+    it("wakes on any of several triggers, hands over everything since the last wake, and says which fired", async () => {
+      const space = await joinedSpace();
+      const result = await run(
+        ["wait", "--on", "mention", "--on", "said: deploy", "--json"],
+        space,
+        [roomState("open"), page([message(2, "just a status line")]), page([message(3, "@claude-code can you take W3?")])],
+      );
+      expect(result.exitCode).toBe(0);
+      // The seat's own name came from the Room, once, before the first poll.
+      expect(result.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}`);
+      const wake = JSON.parse(result.stdout);
+      expect(wake).toMatchObject({ room_id: ROOM_ID, member_id: MEMBER_ID, trigger: "mention", fired: ["mention"], from: 1, through: 3 });
+      expect(wake.wake_id).toMatch(/^wk_[A-Za-z0-9_-]{16}$/);
+      // #2 woke nothing on its own, and is handed over with #3 all the same.
+      expect(wake.messages.map((item: any) => item.sequence)).toEqual([2, 3]);
+      expect(wake.events.map((event: any) => event.kind)).toEqual(["message", "message"]);
+      expect(await cursorOf(space)).toBe(3);
+    });
+
+    it("with --ack manual, hands back the same wake until it is acknowledged, then moves on", async () => {
+      const space = await joinedSpace();
+      const first = await run(["wait", "--on", "message", "--ack", "manual", "--json"], space, [page([message(2, "review W3")])]);
+      expect(first.exitCode).toBe(0);
+      const wake = JSON.parse(first.stdout);
+      expect(await cursorOf(space)).toBe(1);
+      // The caller died before saying it was done: the next wait is handed the same wake.
+      const again = await run(["wait", "--on", "message", "--ack", "manual", "--json"], space, [page([message(2, "review W3")])]);
+      expect(again.requests[0]!.url).toContain("after=1");
+      expect(JSON.parse(again.stdout).wake_id).toBe(wake.wake_id);
+
+      const acked = await run(["ack", wake.wake_id, "--json"], space, []);
+      expect(acked.exitCode).toBe(0);
+      expect(JSON.parse(acked.stdout)).toMatchObject({ wake_id: wake.wake_id, member_id: MEMBER_ID, last_sequence: 2 });
+      expect(await cursorOf(space)).toBe(2);
+      // Handled is handled: acknowledging it again moves nothing and says why.
+      const twice = await run(["ack", wake.wake_id, "--json"], space, []);
+      expect(twice.exitCode).not.toBe(0);
+      expect(twice.stderr).toContain("unknown_wake");
+      expect(await cursorOf(space)).toBe(2);
+    });
+
+    it("wakes on the clock without a message, and on a check the run it starts to pass", async () => {
+      const space = await joinedSpace();
+      // A one-off already due: nothing need be said, and the poll does not sit.
+      const due = await run(["wait", "--on", "at 2020-01-01T00:00:00Z", "--json"], space, [page([])]);
+      expect(due.exitCode).toBe(0);
+      expect(due.requests[0]!.url).toContain("timeout=0");
+      const timer = JSON.parse(due.stdout);
+      expect(timer.fired).toEqual(["at 2020-01-01T00:00:00Z"]);
+      expect(timer.events).toEqual([expect.objectContaining({ kind: "timer", trigger: "at 2020-01-01T00:00:00Z" })]);
+      expect(await cursorOf(space)).toBe(1);
+
+      // A check runs at once and then every --check-every; it fires on the run where it starts to pass.
+      let clock = Date.parse("2026-10-05T12:00:00Z");
+      const outcomes = [1, 0];
+      const commands: string[] = [];
+      const checked = await run(
+        ["wait", "--on", "check: test -f done.txt", "--check-every", "1m", "--json"],
+        space,
+        [page([]), page([])],
+        {},
+        {
+          now: () => new Date((clock += 20_000)),
+          exec: async (command) => {
+            commands.push(command);
+            return { exitCode: outcomes.shift() ?? 0, stdout: "3 passed", stderr: "" };
+          },
+        },
+      );
+      expect(checked.exitCode).toBe(0);
+      expect(commands).toEqual(["test -f done.txt", "test -f done.txt"]);
+      const wake = JSON.parse(checked.stdout);
+      expect(wake.fired).toEqual(["check test -f done.txt"]);
+      expect(wake.events).toEqual([expect.objectContaining({ kind: "check", command: "test -f done.txt", exit_code: 0, output: "3 passed" })]);
+    });
+
+    it("fires a check when it starts to pass, not on every minute it keeps passing", async () => {
+      const space = await joinedSpace();
+      let clock = Date.parse("2026-10-05T12:00:00Z");
+      // pass (fires), pass (quiet), fail, pass (fires again)
+      const outcomes = [0, 0, 1, 0];
+      const handled: string[] = [];
+      const result = await run(
+        ["wait", "--on", "check: ./verify", "--check-every", "1m", "--run", "agent-turn", "--max-runs", "2", "--json"],
+        space,
+        [page([]), page([]), page([]), page([])],
+        {},
+        {
+          now: () => new Date((clock += 20_000)),
+          exec: async (command, input) => {
+            if (command === "./verify") return { exitCode: outcomes.shift() ?? 1, stdout: "", stderr: "" };
+            handled.push(JSON.parse(input).fired.join(","));
+            return { exitCode: 0, stdout: "", stderr: "" };
+          },
+        },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(outcomes).toEqual([]);
+      expect(handled).toEqual(["check ./verify", "check ./verify"]);
+    });
+
+    it("wakes once the Room is closed, and a resident wait ends with it", async () => {
+      const space = await joinedSpace();
+      let clock = Date.parse("2026-10-05T12:00:00Z");
+      const result = await run(
+        ["wait", "--on", "message", "--on", "closed", "--run", "wrap-up", "--json"],
+        space,
+        [roomState("open"), page([]), roomState("closed"), page([])],
+        {},
+        { now: () => new Date((clock += 20_000)), exec: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+      );
+      expect(result.exitCode).toBe(0);
+      const summary = JSON.parse(result.stdout);
+      expect(summary.closed).toBe(true);
+      expect(summary.runs).toEqual([expect.objectContaining({ fired: ["closed"], status: "ok" })]);
+
+      // A seat whose token stops working when the Room closes hears it from the poll itself.
+      const refused = await run(
+        ["wait", "--on", "closed", "--json"],
+        space,
+        [roomState("open"), { status: 409, body: { error: { code: "room_closed", message: "Room is closed." } } }],
+      );
+      expect(refused.exitCode).toBe(0);
+      expect(JSON.parse(refused.stdout).fired).toEqual(["closed"]);
+    });
+
+    it("offers an unhandled wake again after a restart with the same reply key, so the Room takes one reply", async () => {
+      const space = await joinedSpace();
+      const exec: CommandRunner = async () => ({ exitCode: 0, stdout: "On it.", stderr: "" });
+      const failed = await run(
+        ["wait", "--on", "message", "--run", "agent-turn", "--reply", "--max-failures", "1", "--json"],
+        space,
+        [page([message(2, "take W3")]), { status: 409, body: { error: { code: "conflict", message: "Try again." } } }],
+        {},
+        { exec },
+      );
+      expect(failed.exitCode).not.toBe(0);
+      expect(await cursorOf(space)).toBe(1);
+      const retried = await run(
+        ["wait", "--on", "message", "--run", "agent-turn", "--reply", "--max-runs", "1", "--json"],
+        space,
+        [page([message(2, "take W3")]), { status: 201, body: { message: { ...own(3, "On it."), id: "msg_reply00002" } } }],
+        {},
+        { exec },
+      );
+      expect(retried.exitCode).toBe(0);
+      const keyOf = (result: typeof failed) => header(result.requests.find((request) => request.init.method === "POST")!, "idempotency-key");
+      expect(keyOf(failed)).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      expect(keyOf(retried)).toBe(keyOf(failed));
+      expect(await cursorOf(space)).toBe(2);
+    });
+
+    it("writes one line per wake to --log, for whoever keeps the record of a run", async () => {
+      const space = await joinedSpace();
+      const logFile = join(space.root, "wakes.ndjson");
+      const result = await run(
+        ["watch", "--on", "message", "--on", "every 10m", "--run", "agent-turn", "--max-runs", "1", "--log", logFile, "--json"],
+        space,
+        [page([message(2, "hi")])],
+        {},
+        { exec: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+      );
+      expect(result.exitCode).toBe(0);
+      const lines = (await readFile(logFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      expect(lines).toEqual([
+        expect.objectContaining({ verb: "watch", room_id: ROOM_ID, fired: ["message"], sequences: [2], from: 1, through: 2, status: "ok", exit_code: 0 }),
+      ]);
+    });
+
+    it("refuses what cannot mean anything, before touching the network", async () => {
+      const space = await joinedSpace();
+      for (const argv of [
+        ["wait", "--on", "message", "--hook"],
+        ["wait", "--on", "message", "--min", "2"],
+        ["wait", "--on", "message", "--reply"],
+        ["wait", "--on", "message", "--run", "x", "--ack", "manual"],
+        ["wait", "--on", "message", "--ack", "sometimes"],
+        ["wait", "--on", "cron 0 0 31 2 *"],
+        ["ack", "not-a-wake"],
+      ]) {
+        const result = await run([...argv, "--json"], space, []);
+        expect(result.exitCode, argv.join(" ")).not.toBe(0);
+        expect(result.requests, argv.join(" ")).toHaveLength(0);
+      }
+    });
+  });
+
   it("waits from the last sequence seen, loops past an empty page, and advances the cursor", async () => {
     const space = await joinedSpace();
     const result = await run(["wait", "--json"], space, [
@@ -749,6 +999,312 @@ describe("sharednet say and wait", () => {
     expect(header(result.requests[1]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
     expect(JSON.parse(result.stdout).items.map((item: { sequence: number }) => item.sequence)).toEqual([2, 3]);
     expect(await cursorOf(space)).toBe(3);
+  });
+
+  it("sits in every Room this machine holds a seat in, from one process", async () => {
+    // The point of the connector: multi-Room costs nothing, because the seats are already on disk.
+    // Two loops, so two refusals end them; neither is asserted on order, only that both were seen.
+    const space = await joinedSpace();
+    await seatIn(space, "rom_SecondRoom", "i_AbCdEfGhIj");
+    const result = await run(["serve", "--json"], space, [revoked(), revoked(), revoked(), revoked()]);
+
+    expect(result.stderr).toContain("sitting in 2 Room(s)");
+    expect(result.stderr).toContain(ROOM_ID);
+    expect(result.stderr).toContain("rom_SecondRoom");
+    expect(result.exitCode).toBe(0);
+  });
+
+  it("hands each wake to the command with the Room it came from", async () => {
+    const space = await joinedSpace();
+    await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+    const { calls, exec } = recorder({ exitCode: 0, stdout: "" });
+    await run(["serve", "--rooms", ROOM_ID, "--run", "handle", "--json"], space, [
+      page([message(2, "wake up")]),
+      revoked(),
+    ], {}, { exec });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.input).toMatchObject({ room_id: ROOM_ID, trigger: "message" });
+    expect(calls[0]!.env.SHAREDNET_ROOM_ID).toBe(ROOM_ID);
+    expect((calls[0]!.input as { messages: { sequence: number }[] }).messages.map((m) => m.sequence)).toEqual([2]);
+  });
+
+  it("remembers where it had read, so a restart catches what arrived while it was gone", async () => {
+    // A connector that forgets its cursor either replays everything or loses the wake it exists
+    // for. It keeps its own, because the project cursor belongs to a checkout and it is not in one.
+    const space = await joinedSpace();
+    await seatCursor(space, ROOM_ID, MEMBER_ID, 6);
+    const { exec } = recorder({ exitCode: 0, stdout: "" });
+    const first = await run(["serve", "--rooms", ROOM_ID, "--run", "handle", "--json"], space, [
+      page([message(7, "seen before the restart")]),
+      revoked(),
+    ], {}, { exec });
+    expect(new URL(first.requests[0]!.url).searchParams.get("after")).toBe("6");
+
+    const second = await run(["serve", "--rooms", ROOM_ID, "--run", "handle", "--json"], space, [revoked()], {}, { exec });
+    // The restart asks from 7 — what it had read — not from 0 and not from the Room's end.
+    expect(new URL(second.requests[0]!.url).searchParams.get("after")).toBe("7");
+  });
+
+  it("reports whether a connector is actually running, not merely that one once was", async () => {
+    const space = await joinedSpace();
+    const cold = await run(["serve", "--status", "--json"], space, []);
+    expect(JSON.parse(cold.stdout)).toMatchObject({ running: false });
+    const stop = await run(["serve", "--stop", "--json"], space, []);
+    expect(JSON.parse(stop.stdout)).toMatchObject({ stopped: false });
+  });
+
+  it("refuses --rooms that does not name Rooms, and --reply with nothing to say", async () => {
+    const space = await joinedSpace();
+    const bad = await run(["serve", "--rooms", "not-a-room", "--json"], space, []);
+    expect(bad.exitCode).not.toBe(0);
+    const noCommand = await run(["serve", "--reply", "--json"], space, []);
+    expect(noCommand.exitCode).not.toBe(0);
+    expect(noCommand.stderr).toContain("--reply needs --run");
+  });
+
+  it("carries the read filters into the wait, so a sit can be as narrow as a read", async () => {
+    const space = await joinedSpace();
+    const result = await run(
+      ["wait", "--from-instance", "i_AbCdEfGhIj", "--grep", "deploy", "--json"],
+      space,
+      [page([message(2, "ready to deploy")]), page([message(2, "ready to deploy")])],
+    );
+
+    expect(result.exitCode).toBe(0);
+    const url = new URL(result.requests[0]!.url);
+    expect(url.searchParams.get("sender_instance_id")).toBe("i_AbCdEfGhIj");
+    expect(url.searchParams.get("q")).toBe("deploy");
+    // The cursor and the timeout still ride alongside them.
+    expect(url.searchParams.get("after")).toBe("1");
+    expect(url.searchParams.get("timeout")).toBe("25");
+  });
+
+  describe("a filter decides when a seat wakes, never what it is handed", () => {
+    // Before this, the cursor jumped to the matching message and everything said before it was gone:
+    // not shown then, and not shown to any later wait either.
+    const aside = (sequence: number, content: string) => ({
+      ...message(sequence, content, "codex"),
+      sender: { member_id: "i_OtherOther", kind: "instance", name: "codex" },
+    });
+    const serveCursorOf = async (space: Awaited<ReturnType<typeof workspace>>) =>
+      Number(
+        (await readFile(join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, `${MEMBER_ID}.serve-cursor`), "utf8")).trim(),
+      );
+
+    it("hands a plain wait everything said since its cursor, not only the match", async () => {
+      const space = await joinedSpace();
+      const result = await run(["wait", "--from-instance", "i_HostHostHo", "--json"], space, [
+        page([message(3, "the answer")]),
+        page([aside(2, "the context"), message(3, "the answer")]),
+      ]);
+
+      expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
+      // It waits with the filter, then reads the span it is about to cross once more without it.
+      expect(new URL(result.requests[0]!.url).searchParams.get("sender_instance_id")).toBe("i_HostHostHo");
+      expect(result.requests[1]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages?after=1&limit=100`);
+      expect(JSON.parse(result.stdout).items.map((item: { sequence: number }) => item.sequence)).toEqual([2, 3]);
+      expect(await cursorOf(space)).toBe(3);
+    });
+
+    it("hands a wait --on the same span, from the last handled wake through the match", async () => {
+      const space = await joinedSpace();
+      const result = await run(["wait", "--on", "message", "--from-instance", "i_HostHostHo", "--json"], space, [
+        page([message(3, "the answer")]),
+        page([aside(2, "the context"), message(3, "the answer")]),
+      ]);
+
+      expect(result.exitCode).toBe(0);
+      const wake = JSON.parse(result.stdout);
+      expect(wake).toMatchObject({ fired: ["message"], from: 1, through: 3 });
+      expect(wake.messages.map((item: { sequence: number }) => item.sequence)).toEqual([2, 3]);
+      expect(wake.events.map((event: { sequence: number }) => event.sequence)).toEqual([2, 3]);
+      expect(await cursorOf(space)).toBe(3);
+    });
+
+    it("reads a long span page by page, and only up to the match", async () => {
+      const space = await joinedSpace();
+      const first = Array.from({ length: 100 }, (_, index) => aside(index + 2, `note ${index + 2}`));
+      const rest = [...Array.from({ length: 49 }, (_, index) => aside(index + 102, `note ${index + 102}`)), message(151, "the answer")];
+      const result = await run(["wait", "--from-instance", "i_HostHostHo", "--json"], space, [
+        page([message(151, "the answer")]),
+        { status: 200, body: { items: first, next_cursor: "101", has_more: true } },
+        // Said after the match: the next wake's, not this one's.
+        page([...rest, aside(152, "too late for this wake")]),
+      ]);
+
+      expect(result.exitCode).toBe(0);
+      expect(result.requests.slice(1).map((request) => new URL(request.url).searchParams.get("after"))).toEqual(["1", "101"]);
+      const sequences = JSON.parse(result.stdout).items.map((item: { sequence: number }) => item.sequence);
+      expect(sequences).toHaveLength(150);
+      expect([sequences[0], sequences.at(-1)]).toEqual([2, 151]);
+      expect(await cursorOf(space)).toBe(151);
+    });
+
+    it("loses nothing to the seat's own matching words: serve hands them over with the next match", async () => {
+      // The seat's own "deploy" matches --grep deploy and moves the poll on, but wakes nobody. What
+      // codex said before it is not the seat's to drop; it rides along with the next real match.
+      const space = await joinedSpace();
+      await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+      const { calls, exec } = recorder({ exitCode: 0, stdout: "" });
+      const result = await run(["serve", "--rooms", ROOM_ID, "--grep", "deploy", "--run", "handle", "--json"], space, [
+        page([own(3, "deploy it")]),
+        page([message(4, "deploy done")]),
+        page([aside(2, "the tests are slow today"), own(3, "deploy it"), message(4, "deploy done")]),
+        revoked(),
+      ], {}, { exec });
+
+      expect(result.exitCode).toBe(0);
+      expect(new URL(result.requests[1]!.url).searchParams.get("after")).toBe("3");
+      expect(result.requests[2]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages?after=1&limit=100`);
+      expect(calls).toHaveLength(1);
+      expect((calls[0]!.input as { messages: { sequence: number }[] }).messages.map((m) => m.sequence)).toEqual([2, 4]);
+      expect(calls[0]!.env.SHAREDNET_MESSAGE_COUNT).toBe("2");
+      expect(await serveCursorOf(space)).toBe(4);
+    });
+
+    it("keeps serve's cursor where it was when the span cannot be read, so the wake comes round again", async () => {
+      const space = await joinedSpace();
+      await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+      const { calls, exec } = recorder({ exitCode: 0, stdout: "" });
+      const result = await run(["serve", "--rooms", ROOM_ID, "--from-instance", "i_HostHostHo", "--run", "handle", "--json"], space, [
+        page([message(3, "the answer")]),
+        { status: 503, body: { error: { code: "service_unavailable", message: "Try again." } } },
+        page([message(3, "the answer")]),
+        page([aside(2, "the context"), message(3, "the answer")]),
+        revoked(),
+      ], {}, { exec });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toContain("could not read what came before the match");
+      expect(new URL(result.requests[2]!.url).searchParams.get("after")).toBe("1");
+      expect(calls).toHaveLength(1);
+      expect((calls[0]!.input as { messages: { sequence: number }[] }).messages.map((m) => m.sequence)).toEqual([2, 3]);
+      expect(await serveCursorOf(space)).toBe(3);
+    });
+  });
+
+  it.each([
+    ["--from-instance", "not-an-instance"],
+    ["--from-agent", "not-an-agent"],
+    ["--grep", ""],
+  ])("refuses a malformed %s before it asks the server", async (flag, value) => {
+    const space = await joinedSpace();
+    const result = await run(["wait", flag, value, "--json"], space, []);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.requests).toHaveLength(0);
+  });
+
+  describe("a wait keeps its deadline", () => {
+    // From Dots's sharednet-client PR 4: --timeout N is a promise to answer within N seconds, and a
+    // hook must never hang the turn it runs in.
+    it("ends on time when the server takes the request and never answers", async () => {
+      const space = await joinedSpace();
+      const started = Date.now();
+      const result = await run(["wait", "--timeout", "1", "--json"], space, [{ hang: true }]);
+
+      expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).items).toEqual([]);
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(await cursorOf(space)).toBe(1);
+    });
+
+    it("ends a wait --on on time too, as a wake that says nothing fired", async () => {
+      const space = await joinedSpace();
+      const started = Date.now();
+      const result = await run(["wait", "--on", "message", "--timeout", "1", "--json"], space, [{ hang: true }]);
+
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ fired: [], messages: [], from: 1, through: 1 });
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(await cursorOf(space)).toBe(1);
+    });
+
+    it("never lets a hook hang: a check gives each request five seconds, then fails", async () => {
+      const space = await joinedSpace();
+      const started = Date.now();
+      const result = await run(["wait", "--hook", "--json"], space, [{ hang: true }]);
+
+      expect(result.exitCode).toBe(5);
+      expect(JSON.parse(result.stderr).error.code).toBe("service_unavailable");
+      expect(Date.now() - started).toBeLessThan(8_000);
+      expect(await cursorOf(space)).toBe(1);
+    }, 15_000);
+
+    it("stops retrying a service that is down when the next try would land past the deadline", async () => {
+      const space = await joinedSpace();
+      const down = { error: new TypeError("fetch failed") };
+      const result = await run(["wait", "--timeout", "2", "--json"], space, Array.from({ length: 9 }, () => down));
+
+      expect(result.exitCode).toBe(5);
+      // One try, and one retry a second later; the next would come after the two seconds it was given.
+      expect(result.requests).toHaveLength(2);
+      expect(await cursorOf(space)).toBe(1);
+    });
+
+    it("never hands over what the cursor has already passed, even when the server repeats it", async () => {
+      const space = await joinedSpace();
+      const result = await run(["wait", "--json"], space, [page([message(1, "Welcome"), message(2, "new")])]);
+
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout).items.map((item: { sequence: number }) => item.sequence)).toEqual([2]);
+      expect(await cursorOf(space)).toBe(2);
+    });
+
+    it("asks for an Instance id, not the display name an Agent is likely to try", async () => {
+      const space = await joinedSpace();
+      const result = await run(["wait", "--from-instance", "host", "--json"], space, []);
+
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("not a display name");
+      expect(result.requests).toHaveLength(0);
+    });
+  });
+
+  it("outlives a blip: an unreachable service is retried, and the sit still returns what arrives", async () => {
+    // A sit with no --timeout is meant to last until someone speaks. One failed poll used to end
+    // it, so the wake was lost rather than delayed — this is the bug that burned 200 restarts of a
+    // supervised watch overnight.
+    const space = await joinedSpace();
+    const result = await run(["wait", "--json"], space, [
+      { error: new TypeError("fetch failed") },
+      { error: new TypeError("fetch failed") },
+      page([message(2, "here at last")]),
+    ]);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).items.map((item: { sequence: number }) => item.sequence)).toEqual([2]);
+    expect(result.requests).toHaveLength(3);
+    expect(result.stderr).toContain("the service was unreachable");
+    expect(await cursorOf(space)).toBe(2);
+  });
+
+  it("gives up rather than retrying forever, and says how many attempts it made", async () => {
+    const space = await joinedSpace();
+    const result = await run(
+      ["wait", "--json"],
+      space,
+      Array.from({ length: 9 }, () => ({ error: new TypeError("fetch failed") })),
+    );
+
+    expect(result.exitCode).toBe(5);
+    expect(result.requests).toHaveLength(9);
+    expect(result.stderr).toContain("attempt 8 of 8");
+  });
+
+  it("raises an answer that says no at once, instead of retrying a refusal", async () => {
+    // A revoked seat is the service working. Retrying it eight times would turn a clear refusal
+    // into a four-minute hang.
+    const space = await joinedSpace();
+    const result = await run(["wait", "--json"], space, [
+      { status: 401, body: { error: { code: "invalid_credentials", message: "Credentials are invalid." } } },
+    ]);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.requests).toHaveLength(1);
+    expect(result.stderr).not.toContain("retrying");
   });
 
   it("never hands a seat its own words: a page of only them is consumed and the sit goes on", async () => {

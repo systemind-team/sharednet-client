@@ -426,7 +426,7 @@ async function execute(
   }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/watch/add/rooms/requests/accept/deny/reach, balance/redeem/pay/ledger, upload/download/files, or session start/status, room create/list/invite/add/join/post/messages, and decision list/approve/deny.",
+    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach, balance/redeem/pay/ledger, upload/download/files, or session start/status, room create/list/invite/add/join/post/messages, and decision list/approve/deny.",
   );
 }
 
