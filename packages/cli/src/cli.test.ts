@@ -326,6 +326,55 @@ describe("reach: forming a group from the account CLI", () => {
     expect(sentBody(open.requests[0]!)).not.toHaveProperty("reach");
   });
 
+  it("opens a goal Room: the Room with the session, then the goal as the owner, and nothing at all for a goal with no bound", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sharednet-goal-file-"));
+    cleanup.push(dir);
+    const goalFile = join(dir, "TASK.md");
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(goalFile, "Make tests/hidden pass.\n");
+    const room = { id: "rom_AbCdEfGhIj" };
+    const created = await harnessAfterStart(
+      ["room", "create", "--name", "Parser", "--goal", goalFile, "--until", "check: pytest -q", "--until", "after 2h", "--json"],
+      [
+        { status: 201, body: { room, membership: {}, admissions: [] } },
+        { status: 201, body: { room: { ...room, goal: { until: ["check pytest -q", "after 2h"] } }, message: { id: "msg_goal000001", sequence: 1 } } },
+      ],
+    );
+    expect(created.exitCode).toBe(0);
+    expect(created.requests.map((request) => request.url)).toEqual([
+      "http://127.0.0.1:3001/api/v1/rooms",
+      "http://127.0.0.1:3001/api/v1/rooms/rom_AbCdEfGhIj/goal",
+    ]);
+    // The Room is the session's; the goal is the account's, said as its owner.
+    expect((created.requests[0]!.init.headers as Record<string, string>).authorization).toBe("Bearer sni_i_seat00001");
+    expect((created.requests[1]!.init.headers as Record<string, string>).authorization).toBe("Bearer snk_never-send-in-json");
+    expect(sentBody(created.requests[1]!)).toEqual({ content: "Make tests/hidden pass.\n", until: ["check pytest -q", "after 2h"] });
+    expect(JSON.parse(created.stdout.join(""))).toMatchObject({ message: { sequence: 1 } });
+
+    // A key with no account behind it: the Room exists, so the refusal names it.
+    const keyless = await harnessAfterStart(
+      ["room", "create", "--name", "Parser", "--goal", goalFile, "--until", "after 2h", "--json"],
+      [
+        { status: 201, body: { room, membership: {}, admissions: [] } },
+        { status: 403, body: { error: { code: "owner_account_required", message: "A goal needs an account behind the key." } } },
+      ],
+    );
+    expect(keyless.exitCode).not.toBe(0);
+    expect(keyless.stderr.join("")).toContain("owner_account_required");
+    expect(keyless.stderr.join("")).toContain("rom_AbCdEfGhIj was created, but its goal was refused");
+
+    for (const argv of [
+      ["room", "create", "--name", "Parser", "--goal", goalFile, "--until", "check: pytest -q", "--json"],
+      ["room", "create", "--name", "Parser", "--until", "after 2h", "--json"],
+      ["room", "create", "--name", "Parser", "--goal", join(dir, "missing.md"), "--until", "after 2h", "--json"],
+      ["room", "create", "--name", "Parser", "--goal", goalFile, "--until", "every 10m", "--until", "after 2h", "--json"],
+    ]) {
+      const refused = await harnessAfterStart(argv, []);
+      expect(refused.exitCode, argv.join(" ")).not.toBe(0);
+      expect(refused.requests, argv.join(" ")).toHaveLength(0);
+    }
+  });
+
   it("opens a Room with Instances seated by id, lists Rooms, and adds to one", async () => {
     const created = await harnessAfterStart(
       ["room", "create", "--name", "Formed", "--with", "i_AbCdEfGhIj,i_KlMnOpQrSt", "--json"],

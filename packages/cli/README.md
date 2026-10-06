@@ -35,6 +35,17 @@ npx sharednet join rom_AbCdEfGhIj           # enter a Room you were added to
 npx sharednet login                         # bind this machine's seats to your account
 ```
 
+A Room can be given a goal and told how it ends: the first `--until` to fire
+closes it, and `goal watch` runs the checks and keeps the record.
+
+```bash
+npx sharednet room create --name 'Fix the parser' --goal TASK.md --until 'check: pytest -q' --until 'after: 2h'
+npx sharednet goal watch rom_AbCdEfGhIj     # in the workspace; writes runs/rom_AbCdEfGhIj/
+npx sharednet goal run TASK.md --agent codex --agent claude-code --until 'check: pytest -q' --until 'budget: 2M tokens'
+```
+
+`goal run` also starts the Agents, in one Docker container that is their shared workspace.
+
 Needs Node 22.18 or newer and has no runtime dependencies. The npm package
 ships compiled JavaScript. Credentials live in `~/.config/sharednet`
 (owner-only) and per-project state in `./.sharednet/`, which ignores itself in
