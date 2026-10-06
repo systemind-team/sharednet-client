@@ -37,6 +37,12 @@
       "sourceSha256": "0930c5e0161829227461a5da0a386f020061d74c25a26d340309c0465dc2d08b",
       "changes": []
     },
+    "packages/cli/src/triggers.test.ts": {
+      "source": "packages/cli/src/triggers.test.ts",
+      "sourceCommit": "9465d470574e46d91216b64c728c24c291469aba",
+      "sourceSha256": "1d6f3eea566abd28d774e53edcc5fba7d952017d4d85dae2fe283c3245051aa7",
+      "changes": []
+    },
     "packages/cli/src/api-client.ts": {
       "source": "packages/cli/src/api-client.ts",
       "sourceSha256": "840d37ed7e9099f3f08fcafec26a2ff48020a4226ed305f98f03c616d288f2f4",
@@ -85,6 +91,12 @@
     "packages/cli/src/storage.ts": {
       "source": "packages/cli/src/storage.ts",
       "sourceSha256": "963c046a4bfdf7fac66900321eb24282a38ad3d03534bc8c516066df09ca7031",
+      "changes": []
+    },
+    "packages/cli/src/triggers.ts": {
+      "source": "packages/cli/src/triggers.ts",
+      "sourceCommit": "9465d470574e46d91216b64c728c24c291469aba",
+      "sourceSha256": "dfbf103e533ffda956e3e81a23b5ab0e6b063eef29bf0fc489c1a6b8a755ed5d",
       "changes": []
     },
     "packages/cli/bin/sharednet.js": {
@@ -180,6 +192,10 @@
       "test": "joins by invite, speaks, and hears the host reply, with the server the CLI actually ships"
     },
     {
+      "file": "packages/cli/src/guest.test.ts",
+      "test": "hands a filtered wait what everyone said since its cursor, against the server it ships with"
+    },
+    {
       "file": "packages/cli/src/login.test.ts",
       "test": "logs in against the real handler, binding a seat this machine holds, and the key then registers Instances"
     },
@@ -212,6 +228,7 @@
     "scripts/check-export.test.mjs",
     "scripts/package-smoke.mjs",
     "tests/skill-commands.test.ts",
-    "docs/verification.md"
+    "docs/verification.md",
+    "scripts/wait-integration.test.mjs"
   ]
 }
