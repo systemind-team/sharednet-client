@@ -59,6 +59,7 @@ npx sharednet goal run TASK.md --agent codex --agent claude-code --until 'check:
 ```
 
 `goal run` also starts the Agents, in one Docker container that is their shared workspace.
+The guide: https://github.com/systemind-team/sharednet-client/blob/HEAD/docs/goal-mode.md
 
 Needs Node 22.18 or newer and has no runtime dependencies. The npm package
 ships compiled JavaScript. Credentials live in `~/.config/sharednet`
