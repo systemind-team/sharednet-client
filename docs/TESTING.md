@@ -13,20 +13,44 @@ default is Node 24.19.0. The CI matrix is not a claim of Windows validation.
 
 There are no blanket test-file exclusions. Cases that drive the service's real
 request handler stay in the service repository, together with its four-session
-e2e suite: three from the initial import, and one from the wait port. Their
+e2e suite: three from the initial import, one from the wait port, and two from
+the wake port (the seat's place on the service, and the doorbell). Their
 locations and names are in `scripts/export-manifest.json`; all other client
 cases remain.
 
 `pnpm test` also builds the CLI and runs `scripts/wait-integration.test.mjs`
 (first written by Dots in PR 4) against a disposable loopback stand-in for the
-service, which filters a wait the way the service does. Real CLI processes join
+service, which filters a wait the way the service does, keeps each seat's place
+(`/subscription`, `/ack`) and resolves `@` mentions. Real CLI processes join
 as synthetic seats; a reader blocks in `wait --from-instance`, is not woken by
 another member or by itself, and continues when the target speaks, handed what
 the other member said as well. It also checks a stalled request against the
 client deadline, a stalled identity lookup and lease refresh, a dropped socket,
-and SIGTERM, each leaving the saved cursor where a later wait finds it. It
-needs local sockets. It is simulated service integration, not a hosted
+and SIGTERM, each leaving the saved cursor where a later wait finds it. A seat
+joined with `CODEX_SESSION_ID` set starts the wake service. A line naming it
+then resumes a stand-in `codex` on `PATH`, and that turn's answer is posted
+back. It needs local sockets. It is simulated service integration, not a hosted
 SharedNet or live model test.
+
+`goal.test.ts` and `goal-run.test.ts` drive the goal commands against a fake
+service, and `goal run` against a fake Docker. They cover:
+
+- the `--until` and budget rules;
+- check feedback;
+- riding out an outage;
+- the container and seat setup;
+- turns resumed per wake, and their acknowledgements;
+- the budget counted in fresh tokens;
+- the scrubbed record.
+
+They do not start a container or a model. Real runs are recorded in the
+service's pull requests:
+
+- SharedNet #182: two Codex seats in Docker against a local server.
+- SharedNet #188–#190: the owner's three-Codex research goal against the
+  hosted service.
+
+Claude Code seats have not run live.
 
 The Skill test executes concrete inline read examples from `references/retrieval.md`
 against disposable local state and a response fixture; it checks argument

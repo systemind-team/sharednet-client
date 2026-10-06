@@ -1,11 +1,20 @@
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, join, resolve as resolvePathFrom } from "node:path";
 
 import { ApiClient, resolveBaseUrl } from "./api-client.ts";
 import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner } from "./guest.ts";
 import { login } from "./login.ts";
-import { refreshIfNeeded, registerInstance, selectSession } from "./session.ts";
+import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
+import { containerName, dockerRunner, parseAgents, prepareRun, runGoal, type DockerRunner } from "./goal-run.ts";
+import { parseDuration } from "./triggers.ts";
+import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
+import type { TurnRunner } from "./wake-driver.ts";
 
 
 type Environment = Record<string, string | undefined>;
@@ -24,6 +33,16 @@ export interface CliDependencies {
   openBrowser?: (url: string) => Promise<boolean>;
   /** Runs the `watch --run` command; tests capture it instead of shelling out. */
   exec?: CommandRunner;
+  /** Runs `docker` for `goal run`; tests replace it. */
+  docker?: DockerRunner;
+  /** The running CLI's entry file, mounted into `goal run`'s container; defaults to this process's. */
+  cliEntry?: string;
+  /** Ends a resident command such as `serve --push`; a person ends it with Ctrl-C instead. */
+  signal?: AbortSignal;
+  /** Runs one resumed turn of a seat's own session in `serve`; tests replace it. */
+  runTurn?: TurnRunner;
+  /** Starts `serve` in the background after a join; only the real process (main.ts) supplies it. */
+  startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
 
 interface ResolvedDependencies {
@@ -35,6 +54,11 @@ interface ResolvedDependencies {
   cwd: string;
   sleep?: (ms: number) => Promise<void>;
   openBrowser?: (url: string) => Promise<boolean>;
+  docker?: DockerRunner;
+  cliEntry?: string;
+  signal?: AbortSignal;
+  runTurn?: TurnRunner;
+  startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
 
 interface GlobalArguments {
@@ -46,7 +70,12 @@ interface GlobalArguments {
 interface ParsedArguments {
   options: Map<string, string | true>;
   positionals: string[];
+  /** Every value of a repeatable option, in order. */
+  repeated: Map<string, string[]>;
 }
+
+/** Options that may be given more than once: a goal has as many end triggers as it needs. */
+const repeatableOptionNames = new Set(["until", "agent"]);
 
 const optionValueNames = new Set([
   "after",
@@ -67,8 +96,15 @@ const optionValueNames = new Set([
   "limit",
   "with",
   "status",
+  "goal",
+  "until",
+  "workspace",
+  "out",
+  "check-every",
+  "agent",
+  "image",
 ]);
-const booleanOptionNames = new Set(["new", "private"]);
+const booleanOptionNames = new Set(["new", "private", "quiet-checks"]);
 
 /** `--with i_a,i_b`: the Instances to seat, as the API takes them. */
 function instanceList(value: string | undefined): string[] | undefined {
@@ -116,6 +152,7 @@ function extractGlobals(argv: string[]): GlobalArguments {
 function parseArguments(args: string[]): ParsedArguments {
   const options = new Map<string, string | true>();
   const positionals: string[] = [];
+  const repeated = new Map<string, string[]>();
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index]!;
     if (!argument.startsWith("--")) {
@@ -124,6 +161,15 @@ function parseArguments(args: string[]): ParsedArguments {
     }
     const separator = argument.indexOf("=");
     const name = argument.slice(2, separator === -1 ? undefined : separator);
+    if (repeatableOptionNames.has(name)) {
+      const value = separator === -1 ? args[++index] : argument.slice(separator + 1);
+      if (!value || value.startsWith("--")) {
+        throw localError("missing_option_value", `The --${name} option requires a value.`);
+      }
+      repeated.set(name, [...(repeated.get(name) ?? []), value]);
+      if (!options.has(name)) options.set(name, value);
+      continue;
+    }
     if (options.has(name)) {
       throw localError("duplicate_option", `The --${name} option may be supplied only once.`);
     }
@@ -143,7 +189,7 @@ function parseArguments(args: string[]): ParsedArguments {
     }
     options.set(name, value);
   }
-  return { options, positionals };
+  return { options, positionals, repeated };
 }
 
 function option(arguments_: ParsedArguments, name: string): string | undefined {
@@ -249,17 +295,39 @@ async function roomCommand(
   const parsed = parseArguments(commandArgs);
   if (action === "create") {
     assertPositionals(parsed, 0);
-    assertOnlyOptions(parsed, ["name", "description", "with"]);
+    assertOnlyOptions(parsed, ["name", "description", "with", "goal", "until"]);
     const name = requiredOption(parsed, "name");
     const description = option(parsed, "description");
     const withIds = instanceList(option(parsed, "with"));
-    return withSelectedSession(globals, dependencies, (client, session) =>
-      client.request("POST", "/rooms", session.instance_token, {
+    // A goal Room (decision 2026-10-05): everything about the goal is checked before the Room exists.
+    const goalPath = option(parsed, "goal");
+    if (goalPath === undefined && parsed.repeated.has("until")) {
+      throw localError("invalid_arguments", "--until ends a goal; give the goal with --goal <file>.");
+    }
+    const goal =
+      goalPath === undefined
+        ? null
+        : {
+            content: await readGoalFile(dependencies.cwd, goalPath),
+            until: parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime()).wire,
+          };
+    const apiKey = goal === null ? null : await resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL));
+    return withSelectedSession(globals, dependencies, async (client, session) => {
+      const created = await client.request<{ room?: { id?: string }; [key: string]: unknown }>("POST", "/rooms", session.instance_token, {
         name,
         ...(description === undefined ? {} : { description }),
         ...(withIds === undefined ? {} : { with: withIds }),
-      }, { "idempotency-key": randomUUID() }),
-    );
+      }, { "idempotency-key": randomUUID() });
+      if (goal === null || apiKey === null) return created;
+      const roomId = created.room?.id;
+      if (!roomId) throw new CliError("invalid_server_response", "The Room was created but its id did not come back.", 5);
+      const started = await startGoal(client, apiKey, roomId, goal.content, goal.until).catch((error: unknown) => {
+        // The Room stands without its goal; say which one, so it can be closed or given the goal again.
+        const refused = asCliError(error);
+        throw new CliError(refused.code, `${roomId} was created, but its goal was refused: ${refused.message}`, refused.exitCode, refused.requestId);
+      });
+      return { ...created, ...started };
+    });
   }
 
   if (action === "list") {
@@ -395,6 +463,149 @@ async function decisionCommand(
   throw localError("unknown_command", "Unknown decision command. Use decision list, approve <id>, or deny <id>.");
 }
 
+/**
+ * `goal watch <rom_…>` sits in a goal Room until one of its end triggers
+ * fires, closes it with that trigger, and writes the record; `goal export
+ * <rom_…>` writes the record of a Room without watching it.
+ */
+async function goalCommand(
+  action: string | undefined,
+  commandArgs: string[],
+  globals: GlobalArguments,
+  dependencies: ResolvedDependencies,
+): Promise<unknown> {
+  const parsed = parseArguments(commandArgs);
+  if (action === "run") return goalRunCommand(parsed, globals, dependencies);
+  const usage =
+    "Use goal run <goal file> --agent codex[:model] --until <trigger> [...], goal watch <rom_…> [--workspace <dir>] [--out <dir>] [--check-every 1m] [--quiet-checks], or goal export <rom_…> [--out <dir>].";
+  const roomId = parsed.positionals[0];
+  if ((action !== "watch" && action !== "export") || parsed.positionals.length !== 1 || !/^rom_[0-9A-Za-z]{10}$/.test(roomId ?? "")) {
+    throw localError("unknown_command", usage);
+  }
+  const out = resolvePathFrom(dependencies.cwd, option(parsed, "out") ?? join("runs", roomId!));
+  // A runner sits for hours: no one request may hold it longer than the long-poll it is.
+  const limited: ResolvedDependencies = { ...dependencies, fetch: withRequestLimit(dependencies.fetch) };
+  if (action === "export") {
+    assertOnlyOptions(parsed, ["out"]);
+    return withSelectedSession(globals, limited, (client, session) => goalExport(client, session.instance_token, roomId!, out));
+  }
+  assertOnlyOptions(parsed, ["workspace", "out", "check-every", "quiet-checks"]);
+  const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
+  const checkEveryMs = parsed.options.has("check-every") ? parseDuration(option(parsed, "check-every"), "--check-every") : 60_000;
+  const apiKey = await resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL));
+  const exec = (dependencies as { exec?: CommandRunner }).exec;
+  return withSelectedSession(globals, limited, (client, session) =>
+    goalWatch(
+      client,
+      session.instance_token,
+      apiKey,
+      { roomId: roomId!, workspace, out, checkEveryMs, quietChecks: parsed.options.get("quiet-checks") === true },
+      {
+        now: dependencies.now,
+        ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
+        stderr: dependencies.stderr,
+        // Tests hand the command runner in; a real run uses the shell, in the workspace.
+        ...(exec
+          ? {
+              check: async (command: string) => {
+                const result = await exec(command, "", {});
+                return { exitCode: result.exitCode, output: `${result.stdout}${result.stderr}` };
+              },
+            }
+          : {}),
+      },
+    ),
+  );
+}
+
+/**
+ * `goal run <goal file> --agent <driver[:model]>… --until <trigger>…`: the goal Room, the
+ * Agents that work on it in a container, and the runner that ends it, in one command.
+ * Everything that could fail half-way (the goal, the triggers, Docker, each driver's sign-in)
+ * is checked before the Room exists.
+ */
+async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks"]);
+  if (parsed.positionals.length !== 1) {
+    throw localError(
+      "invalid_arguments",
+      "Usage: sharednet goal run <goal file> --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks]",
+    );
+  }
+  const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
+  const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime(), { budget: true });
+  const agents = parseAgents(parsed.repeated.get("agent") ?? []);
+  const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
+  if (!(await stat(workspace).then((entry) => entry.isDirectory(), () => false))) {
+    throw localError("invalid_arguments", `--workspace ${workspace} is not a directory.`);
+  }
+  const checkEveryMs = parsed.options.has("check-every") ? parseDuration(option(parsed, "check-every"), "--check-every") : 60_000;
+  const baseUrl = resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL);
+  const apiKey = await resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), baseUrl);
+  const docker = dependencies.docker ?? dockerRunner(dependencies.env);
+  const plan = await prepareRun(
+    {
+      agents,
+      image: option(parsed, "image") ?? null,
+      workspace,
+      env: dependencies.env,
+      home: dependencies.env.HOME ?? homedir(),
+      entry: dependencies.cliEntry ?? realpathSync(process.argv[1]!),
+    },
+    docker,
+    dependencies.stderr,
+  );
+  const limited: ResolvedDependencies = { ...dependencies, fetch: withRequestLimit(dependencies.fetch) };
+  return withSelectedSession(globals, limited, async (client, session) => {
+    const created = await client.request<{ room?: { id?: string } }>(
+      "POST",
+      "/rooms",
+      session.instance_token,
+      { name: option(parsed, "name") ?? basename(workspace) },
+      { "idempotency-key": randomUUID() },
+    );
+    const roomId = created.room?.id;
+    if (!roomId) throw new CliError("invalid_server_response", "The Room was created but its id did not come back.", 5);
+    const started = await startGoal(client, apiKey, roomId, content, until.wire).catch((error: unknown) => {
+      const refused = asCliError(error);
+      throw new CliError(refused.code, `${roomId} was created, but its goal was refused: ${refused.message}`, refused.exitCode, refused.requestId);
+    });
+    const invite = await client.request<{ token?: string }>("POST", `/rooms/${encodeURIComponent(roomId)}/invites`, session.instance_token);
+    if (!invite?.token) throw new CliError("invalid_server_response", "The Agents' invite did not come back.", 5);
+    const out = resolvePathFrom(dependencies.cwd, option(parsed, "out") ?? join("runs", roomId));
+    dependencies.stderr(`goal: ${roomId} is open; the record goes to ${out}\n`);
+    // Ctrl-C ends the run without leaving Agents at work in a container nobody watches.
+    const interrupt = () => {
+      spawnSync("docker", ["rm", "--force", containerName(roomId)]);
+      dependencies.stderr(`goal: stopped; the Agents' container is gone and ${roomId} is still open\n`);
+      process.exit(130);
+    };
+    if (!dependencies.docker) process.once("SIGINT", interrupt);
+    try {
+      return await runGoal(
+        client,
+        session.instance_token,
+        apiKey,
+        {
+          plan,
+          roomId,
+          inviteToken: invite.token,
+          goal: content,
+          goalSequence: (started.message as { sequence?: number } | undefined)?.sequence ?? 1,
+          until: until.wire,
+          baseUrl,
+          out,
+          checkEveryMs,
+          quietChecks: parsed.options.get("quiet-checks") === true,
+        },
+        { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
+      );
+    } finally {
+      process.off("SIGINT", interrupt);
+    }
+  });
+}
+
 async function execute(
   globals: GlobalArguments,
   dependencies: ResolvedDependencies,
@@ -424,9 +635,12 @@ async function execute(
   if (resource === "decision") {
     return decisionCommand(action, commandArgs, globals, dependencies);
   }
+  if (resource === "goal") {
+    return goalCommand(action, commandArgs, globals, dependencies);
+  }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach, balance/redeem/pay/ledger, upload/download/files, or session start/status, room create/list/invite/add/join/post/messages, and decision list/approve/deny.",
+    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach/timer, balance/redeem/pay/ledger, upload/download/files, or session start/status, room create/list/invite/add/join/post/messages, goal run/watch/export, and decision list/approve/deny.",
   );
 }
 
@@ -488,6 +702,11 @@ export async function runCli(
     ...(supplied.sleep ? { sleep: supplied.sleep } : {}),
     ...(supplied.openBrowser ? { openBrowser: supplied.openBrowser } : {}),
     ...(supplied.exec ? { exec: supplied.exec } : {}),
+    ...(supplied.docker ? { docker: supplied.docker } : {}),
+    ...(supplied.cliEntry ? { cliEntry: supplied.cliEntry } : {}),
+    ...(supplied.signal ? { signal: supplied.signal } : {}),
+    ...(supplied.runTurn ? { runTurn: supplied.runTurn } : {}),
+    ...(supplied.startWakeService ? { startWakeService: supplied.startWakeService } : {}),
   };
   let json = argv.includes("--json");
   try {

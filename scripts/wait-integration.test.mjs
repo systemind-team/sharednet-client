@@ -2,10 +2,11 @@
 // fetch cannot show, such as a caller that is actually blocked in `wait` and then continues, a
 // socket that stalls or drops, and a process killed mid-wait. First written by Dots for this
 // repository's PR 4; adapted to the server-side filter (SharedNet #140) and to a wake that hands
-// over everything said since the cursor (SharedNet #178).
+// over everything said since the cursor (SharedNet #178), to the seat's place kept by the service
+// (#183), to mentions (#186), and to a seat that is woken by resuming its own session (#191).
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,7 @@ const roomId = "rom_LocalRoom1";
 const readerId = "i_Reader0001";
 const targetId = "i_Target0001";
 const otherId = "i_Other00001";
+const drivenId = "i_Driven0001";
 const page = (items) => ({ items, next_cursor: null, has_more: false });
 
 before(async () => {
@@ -38,6 +40,14 @@ async function fixture(t, options = {}) {
   let setupRequests = 0;
   let stall = false;
   let disconnect = false;
+  // Each seat's place, as the service keeps it: what it was handed, and what it has handled.
+  const places = new Map();
+  const placeOf = (request) => {
+    const token = request.headers.authorization ?? "";
+    if (!places.has(token)) places.set(token, { delivered_through: 0, acked_through: 0 });
+    return places.get(token);
+  };
+  const seatIds = { reader: seatId, target: targetId, other: otherId, driven: drivenId };
   const answer = (response, body) => {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify(body));
@@ -48,15 +58,19 @@ async function fixture(t, options = {}) {
     for await (const chunk of request) chunks.push(chunk);
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
     if (url.pathname.endsWith("/join")) {
-      const id = body.name === "target" ? targetId : body.name === "other" ? otherId : seatId;
+      const id = seatIds[body.name] ?? seatId;
       answer(response, { room: { id: roomId }, membership: { member_id: id }, member_token: `sni_${id.padEnd(43, "X")}`, history: page(messages) });
     } else if (url.pathname === "/api/v1/instances/current" || url.pathname === "/api/v1/instances/current/heartbeat") {
       setupRequests += 1;
       // Deliberately hold identity/lease setup open to test the client deadline.
     } else if (request.method === "POST" && url.pathname.endsWith("/messages")) {
       const token = request.headers.authorization;
-      const senderId = token.includes(targetId) ? targetId : token.includes(otherId) ? otherId : readerId;
-      const message = { id: `msg_${String(messages.length + 1).padStart(10, "0")}`, sequence: messages.length + 1, content: body.content, sender: { member_id: senderId, kind: "instance", name: "same display name" } };
+      const senderId = [targetId, otherId, drivenId].find((id) => token.includes(id)) ?? readerId;
+      // As the service does: the seats a line addresses by @name or @id, never the speaker.
+      const mentions = Object.entries(seatIds)
+        .filter(([name, id]) => id !== senderId && new RegExp(`@(?:${name}|${id})\\b`).test(body.content))
+        .map(([, id]) => id);
+      const message = { id: `msg_${String(messages.length + 1).padStart(10, "0")}`, sequence: messages.length + 1, content: body.content, mentions, sender: { member_id: senderId, kind: "instance", name: "same display name" } };
       messages.push(message);
       answer(response, { message });
       for (const waiter of pending) waiter.flush();
@@ -67,15 +81,29 @@ async function fixture(t, options = {}) {
       reads.push({ after, limit, filtered: url.searchParams.has("sender_instance_id") || url.searchParams.has("q") });
       const rest = messages.filter((message) => message.sequence > after);
       answer(response, { items: rest.slice(0, limit), next_cursor: null, has_more: rest.length > limit });
+    } else if (request.method === "GET" && url.pathname.endsWith("/subscription")) {
+      answer(response, { subscription: { room_id: roomId, ...placeOf(request) } });
+    } else if (request.method === "POST" && url.pathname.endsWith("/ack")) {
+      const place = placeOf(request);
+      place.acked_through = Math.min(Math.max(place.acked_through, Number(body.through) || 0), messages.length);
+      place.delivered_through = Math.max(place.delivered_through, place.acked_through);
+      answer(response, { subscription: { room_id: roomId, ...place } });
     } else if (url.pathname.endsWith("/wait")) {
       const sender = url.searchParams.get("sender_instance_id");
+      const mentioned = url.searchParams.get("mentions");
+      const place = placeOf(request);
       requests.push({ after: Number(url.searchParams.get("after")), timeout: Number(url.searchParams.get("timeout")), sender });
       if (disconnect) { request.socket.destroy(); return; }
       const after = requests.at(-1).after;
       const waiter = { flush() {
         // As the service does: a filtered wait answers only when a matching message is there.
-        const fresh = messages.filter((message) => message.sequence > after && (sender === null || message.sender.member_id === sender));
-        if (!stall && fresh.length) { pending.delete(waiter); clearTimeout(timer); answer(response, page(fresh)); }
+        const fresh = messages.filter((message) => message.sequence > after && (sender === null || message.sender.member_id === sender) && (mentioned === null || message.mentions.includes(mentioned)));
+        if (!stall && fresh.length) {
+          pending.delete(waiter);
+          clearTimeout(timer);
+          place.delivered_through = Math.max(place.delivered_through, fresh.at(-1).sequence);
+          answer(response, page(fresh));
+        }
       } };
       const timer = setTimeout(() => {
         if (!stall) { pending.delete(waiter); answer(response, page([])); }
@@ -108,6 +136,9 @@ async function fixture(t, options = {}) {
     await rm(scratch, { recursive: true, force: true });
   });
   return {
+    env,
+    projects,
+    messages,
     requests,
     reads,
     setupRequests: () => setupRequests,
@@ -217,4 +248,50 @@ test("disconnect and process cancellation preserve restart recovery", { timeout:
   assert.equal(resumed.code, 0, resumed.stderr);
   assert.equal(JSON.parse(resumed.stdout).items[0].content, "arrived while caller was disconnected");
   assert.equal(await f.cursor(), 1);
+});
+
+test("a seat joined from inside a Codex session is resumed when addressed, and its answer is posted", { timeout: 30000 }, async (t) => {
+  const f = await fixture(t);
+  // A stand-in for Codex: it answers with what it was resumed with, so the test sees both.
+  const harness = join(f.projects.reader, "..", "harness-bin");
+  await mkdir(harness);
+  await writeFile(
+    join(harness, "codex"),
+    `#!${process.execPath}
+const args = process.argv.slice(2);
+let prompt = "";
+process.stdin.on("data", (chunk) => (prompt += chunk)).on("end", () => {
+  const resumed = args[0] === "exec" && args[1] === "resume" && args.at(-1) === "-";
+  const lines = prompt.split("\\n").filter((line) => line.startsWith("#")).join(" | ");
+  const said = resumed ? "resumed " + args.at(-2) + ": " + lines : "not a resume: " + args.join(" ");
+  for (const event of [{ type: "item.completed", item: { type: "agent_message", text: said } }, { type: "turn.completed", usage: {} }]) console.log(JSON.stringify(event));
+});
+`,
+    { mode: 0o755 },
+  );
+  const project = join(f.projects.reader, "..", "driven");
+  await mkdir(project);
+  const env = { ...f.env, PATH: `${harness}:${f.env.PATH}`, CODEX_SESSION_ID: "thread-0001" };
+  const joined = JSON.parse(
+    (await exec(process.execPath, [cli, "join", roomId, "--token", `rit_${"T".repeat(43)}`, "--name", "driven", "--json"], { cwd: project, env, timeout: 5000 })).stdout,
+  );
+  try {
+    // The join remembered the session and started the wake service, which now sits on the seat.
+    assert.equal(joined.wake.service, "started", JSON.stringify(joined.wake));
+    assert.equal(joined.wake.session, "thread-0001");
+    await f.say("other", "the build is green");
+    await f.say("target", "@driven what is left?");
+    let answer;
+    for (let attempt = 0; attempt < 200 && !answer; attempt += 1) {
+      await delay(100);
+      answer = f.messages.find((message) => message.sender.member_id === drivenId);
+    }
+    assert.ok(answer, "the addressed seat's session was never resumed");
+    // The same thread, resumed with everything said since the join, and its last words posted for it.
+    assert.match(answer.content, /^resumed thread-0001: /);
+    assert.match(answer.content, /#\d+ same display name: the build is green \| #\d+ same display name: @driven what is left\?$/);
+  } finally {
+    await exec(process.execPath, [cli, "serve", "--stop", "--json"], { cwd: project, env, timeout: 5000 }).catch(() => undefined);
+    try { process.kill(joined.wake.pid, "SIGKILL"); } catch { /* already gone */ }
+  }
 });
