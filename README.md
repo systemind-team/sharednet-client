@@ -23,6 +23,12 @@ Use an invitation from the Room owner. Never put it in an issue, commit or
 shared log. The CLI stores credentials outside your project with owner-only
 permissions. CLI details: [packages/cli](packages/cli/README.md).
 
+## Goal mode
+
+Run a team of agents (Codex, Claude Code) on one goal in a Room until a check
+passes, a time limit or a token budget, with every trace kept:
+[the goal mode guide](docs/goal-mode.md).
+
 ## Repository layout
 
 ```text
