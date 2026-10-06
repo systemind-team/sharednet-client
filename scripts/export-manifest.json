@@ -16,13 +16,16 @@
       "source": "packages/cli/src/goal-run.test.ts",
       "sourceCommit": "23c45afaa93a64bb9a68d7b5b1b4a4401259c10c",
       "sourceSha256": "bb0651544baba907d326a8a326f3b3388aaf539c6e8179bf15a4688874d1a668",
-      "changes": []
+      "changes": [
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183–#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is fc50fc7ff95bb6326d186f0f395b17a3b47c53fe373f35510ecfa29b0a72f1b0."
+      ]
     },
     "packages/cli/src/guest.test.ts": {
       "source": "packages/cli/src/guest.test.ts",
       "sourceSha256": "9635b8ec33a7c7f59561629be410e9dd7a7c846583aeb996dc8c686d1bab682f",
       "changes": [
-        "Remove private server imports; retain all pure client tests."
+        "Remove private server imports; retain all pure client tests.",
+        "Updated to SharedNet 3d66c5ebdd3d (#183–#191), whose sha256 is 55c7938dc015295f871932f97fac9a79ab8995c5ce68642c27208c45d432120d, with the same removal: the private server's imports, and every test that needs it (two more, listed under privateTestsRetainedAtSource)."
       ]
     },
     "packages/cli/src/instance-computation.test.ts": {
@@ -55,6 +58,12 @@
       "sourceSha256": "1d6f3eea566abd28d774e53edcc5fba7d952017d4d85dae2fe283c3245051aa7",
       "changes": []
     },
+    "packages/cli/src/wake-driver.test.ts": {
+      "source": "packages/cli/src/wake-driver.test.ts",
+      "sourceCommit": "3d66c5ebdd3d6ea0f08d3806ad442a10699445e6",
+      "sourceSha256": "51c6c2cc8e93f4fbc95edac16723872625ff89f8c9276c89b4f448becef22781",
+      "changes": []
+    },
     "packages/cli/src/api-client.ts": {
       "source": "packages/cli/src/api-client.ts",
       "sourceSha256": "840d37ed7e9099f3f08fcafec26a2ff48020a4226ed305f98f03c616d288f2f4",
@@ -63,7 +72,9 @@
     "packages/cli/src/cli.ts": {
       "source": "packages/cli/src/cli.ts",
       "sourceSha256": "9062dc6877d203ad5aa23ac6568567d4d55efe8b8f1a5c25fc63b76557966ac2",
-      "changes": []
+      "changes": [
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183–#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 0c43b38027c8ee5039a14e0f324897e7da46b2592becbe7c4eec12ff0d06dca8."
+      ]
     },
     "packages/cli/src/errors.ts": {
       "source": "packages/cli/src/errors.ts",
@@ -80,12 +91,16 @@
       "source": "packages/cli/src/goal-run.ts",
       "sourceCommit": "23c45afaa93a64bb9a68d7b5b1b4a4401259c10c",
       "sourceSha256": "77fbfac18209c69b8f501d0fb86c0e5e2721d8cd489a8c098d1de0e3653f6c70",
-      "changes": []
+      "changes": [
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183–#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 2711a04c434c30410f1d050999b8b2bb3ac45622bec785890ff4ad7ce24f165b."
+      ]
     },
     "packages/cli/src/guest.ts": {
       "source": "packages/cli/src/guest.ts",
       "sourceSha256": "f25dff24e8aed7f076e931b18e3e09ceda0b10537304004e323fe76989c952b5",
-      "changes": []
+      "changes": [
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183–#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is a143227d6f7e0ff9c81c6639330cd600e94cec4e8d626fa4a40d769336c07e7b."
+      ]
     },
     "packages/cli/src/instance-computation.ts": {
       "source": "packages/cli/src/instance-computation.ts",
@@ -100,7 +115,9 @@
     "packages/cli/src/main.ts": {
       "source": "packages/cli/src/main.ts",
       "sourceSha256": "a16ed3c9e0c0aa6c7a1e41dbebda6ec1981476b38eeccf46b498b6d23c2e9585",
-      "changes": []
+      "changes": [
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183–#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 5523411f1298f28a8be5ed096b2014dc036d3b5bff577af69165f6462107241f."
+      ]
     },
     "packages/cli/src/runtime-detection.ts": {
       "source": "packages/cli/src/runtime-detection.ts",
@@ -115,12 +132,20 @@
     "packages/cli/src/storage.ts": {
       "source": "packages/cli/src/storage.ts",
       "sourceSha256": "963c046a4bfdf7fac66900321eb24282a38ad3d03534bc8c516066df09ca7031",
-      "changes": []
+      "changes": [
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183–#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 997d20b8d94032a786c4f0adf85482d3149b8020b5c8ef35528ecd7a2b22e63e."
+      ]
     },
     "packages/cli/src/triggers.ts": {
       "source": "packages/cli/src/triggers.ts",
       "sourceCommit": "9465d470574e46d91216b64c728c24c291469aba",
       "sourceSha256": "dfbf103e533ffda956e3e81a23b5ab0e6b063eef29bf0fc489c1a6b8a755ed5d",
+      "changes": []
+    },
+    "packages/cli/src/wake-driver.ts": {
+      "source": "packages/cli/src/wake-driver.ts",
+      "sourceCommit": "3d66c5ebdd3d6ea0f08d3806ad442a10699445e6",
+      "sourceSha256": "0ff3e83e092d9354f40373a2ff5cd8136c1af13c7784c8100caaba7df87ada47",
       "changes": []
     },
     "packages/cli/bin/sharednet.js": {
@@ -143,7 +168,9 @@
     "packages/cli/README.md": {
       "source": "packages/cli/README.md",
       "sourceSha256": "ab8a773826d0bae882364d6b8581357b09957543df9f7ec3b70c2b5270713762",
-      "changes": []
+      "changes": [
+        "Client-side additions not in the source: the one wait (`wait --on`, `serve`, the filter rule, untrusted input) since the one-wait port, and being woken when addressed since the wake port."
+      ]
     },
     "packages/cli/LICENSE": {
       "source": "packages/cli/LICENSE",
@@ -183,7 +210,9 @@
     "skills/sharednet-room/references/engagement.md": {
       "source": ".agents/skills/sharednet-room/references/engagement.md",
       "sourceSha256": "20b59aec9bf5b2a03f73c33565ac0a8a8be9f70e50a025b44333e2f63175c5c8",
-      "changes": []
+      "changes": [
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183–#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 80583989b3b952cc3f1ae9229b6f653414c8f0342c7111818e23bcfd5c82dc87."
+      ]
     },
     "skills/sharednet-room/references/files.md": {
       "source": ".agents/skills/sharednet-room/references/files.md",
@@ -218,6 +247,14 @@
     {
       "file": "packages/cli/src/guest.test.ts",
       "test": "hands a filtered wait what everyone said since its cursor, against the server it ships with"
+    },
+    {
+      "file": "packages/cli/src/guest.test.ts",
+      "test": "sits behind a doorbell: not one request while nothing is said, and looks when the service rings"
+    },
+    {
+      "file": "packages/cli/src/guest.test.ts",
+      "test": "keeps the seat's place on the service: handed over is not handled until the seat says so"
     },
     {
       "file": "packages/cli/src/login.test.ts",

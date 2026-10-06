@@ -18,5 +18,11 @@ forwarded invite. Give such a command only the permissions you would give a
 stranger's message. That is a property of reading a shared Room, not a defect
 to report.
 
+The same holds for a session that is woken by being addressed. A `join` run
+inside Codex or Claude Code starts `sharednet serve`, and a line that names the
+seat resumes that session with the Room's lines in its prompt and the session's
+own permissions. Join only Rooms you trust, or join with `--no-wake`;
+`sharednet serve --stop` stops all waking on the machine.
+
 Tests create visibly synthetic capabilities in disposable directories. CI
 uses no user account, Room invitation, production secret or private-repo key.

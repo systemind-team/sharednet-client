@@ -14,6 +14,7 @@ import { containerName, dockerRunner, parseAgents, prepareRun, runGoal, type Doc
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
+import type { TurnRunner } from "./wake-driver.ts";
 
 
 type Environment = Record<string, string | undefined>;
@@ -36,6 +37,12 @@ export interface CliDependencies {
   docker?: DockerRunner;
   /** The running CLI's entry file, mounted into `goal run`'s container; defaults to this process's. */
   cliEntry?: string;
+  /** Ends a resident command such as `serve --push`; a person ends it with Ctrl-C instead. */
+  signal?: AbortSignal;
+  /** Runs one resumed turn of a seat's own session in `serve`; tests replace it. */
+  runTurn?: TurnRunner;
+  /** Starts `serve` in the background after a join; only the real process (main.ts) supplies it. */
+  startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
 
 interface ResolvedDependencies {
@@ -49,6 +56,9 @@ interface ResolvedDependencies {
   openBrowser?: (url: string) => Promise<boolean>;
   docker?: DockerRunner;
   cliEntry?: string;
+  signal?: AbortSignal;
+  runTurn?: TurnRunner;
+  startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
 
 interface GlobalArguments {
@@ -630,7 +640,7 @@ async function execute(
   }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach, balance/redeem/pay/ledger, upload/download/files, or session start/status, room create/list/invite/add/join/post/messages, goal run/watch/export, and decision list/approve/deny.",
+    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach/timer, balance/redeem/pay/ledger, upload/download/files, or session start/status, room create/list/invite/add/join/post/messages, goal run/watch/export, and decision list/approve/deny.",
   );
 }
 
@@ -694,6 +704,9 @@ export async function runCli(
     ...(supplied.exec ? { exec: supplied.exec } : {}),
     ...(supplied.docker ? { docker: supplied.docker } : {}),
     ...(supplied.cliEntry ? { cliEntry: supplied.cliEntry } : {}),
+    ...(supplied.signal ? { signal: supplied.signal } : {}),
+    ...(supplied.runTurn ? { runTurn: supplied.runTurn } : {}),
+    ...(supplied.startWakeService ? { startWakeService: supplied.startWakeService } : {}),
   };
   let json = argv.includes("--json");
   try {

@@ -468,6 +468,9 @@ export async function runGoal(
       "-e",
       `SHAREDNET_BASE_URL=${base}`,
       ...(seat?.member_id ? ["-e", `SHAREDNET_SEAT=${seat.member_id}`] : []),
+      // This runner wakes its seats itself. Whatever a seat runs, its join or an agent's own
+      // `sharednet join rom_…` in a turn, starts no wake service of its own.
+      ...(seat ? ["-e", "SHAREDNET_WAKE=off"] : []),
       ...(seat?.driver === "claude-code" && plan.claudeAuth ? ["-e", plan.claudeAuth] : []),
       ...(seat?.driver === "codex" && plan.codexAuth?.kind === "api-key" ? ["-e", "OPENAI_API_KEY"] : []),
       ...Object.keys(options.env ?? {}).flatMap((name) => ["-e", name]),

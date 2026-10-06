@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { localError } from "./errors.ts";
+import { parseSeatWake, type SeatWake } from "./wake-driver.ts";
 
 type Environment = Record<string, string | undefined>;
 
@@ -41,6 +42,8 @@ export interface StoredRoomCredential {
   name: string;
   member_token: string;
   joined_at: string;
+  /** The session that took the seat, which `serve` resumes when the seat is addressed. */
+  wake?: SeatWake;
 }
 
 /**
@@ -442,6 +445,7 @@ function parseRoomCredential(raw: string): StoredRoomCredential {
     throw localError("invalid_local_state", "A Room credential file has an unsupported version.");
   }
   const source = "A Room credential file";
+  const wake = parseSeatWake(value.wake);
   return {
     schema_version: 1,
     base_url: requireString(value.base_url, source),
@@ -450,6 +454,7 @@ function parseRoomCredential(raw: string): StoredRoomCredential {
     name: requireString(value.name, source),
     member_token: requireString(value.member_token, source),
     joined_at: requireString(value.joined_at, source),
+    ...(wake ? { wake } : {}),
   };
 }
 

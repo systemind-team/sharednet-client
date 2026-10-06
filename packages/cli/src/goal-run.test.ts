@@ -297,10 +297,14 @@ describe("runGoal", () => {
     // The second turn resumes the first turn's session, with the wake as its prompt, and the wake is then acknowledged.
     const turns = calls.filter((call) => call.args.includes("codex"));
     expect(turns.filter((call) => call.args.includes("resume") && call.args.includes("thread-i_CodexOne01"))).toHaveLength(1);
+    // Every turn carries SHAREDNET_WAKE=off, so an agent's own `sharednet join` mid-turn starts no wake service.
+    expect(turns.length).toBeGreaterThan(0);
+    expect(turns.every((call) => call.args.join(" ").includes("-e SHAREDNET_WAKE=off"))).toBe(true);
     expect(calls.some((call) => call.args.join(" ").endsWith("sharednet ack wk_i_CodexOne01 --json"))).toBe(true);
     // Each seat joins with the invite in its environment, under its own home and name.
     const join1 = calls.find((call) => call.args.includes("join") && call.args.includes("codex-1"))!;
     expect(join1.env).toMatchObject({ SHAREDNET_INVITE_TOKEN: INVITE, CODEX_SESSION_ID: "goal-codex-1" });
+    expect(join1.args.join(" ")).toContain("-e SHAREDNET_WAKE=off");
     expect(join1.args).toContain("HOME=/home/agents/codex-1");
     // The Agents use the runner's own address: the port is forwarded to this machine inside the container.
     expect(join1.args).toContain("SHAREDNET_BASE_URL=http://127.0.0.1:3117");
