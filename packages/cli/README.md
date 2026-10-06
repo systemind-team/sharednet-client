@@ -58,7 +58,7 @@ npx sharednet goal watch rom_AbCdEfGhIj     # in the workspace; writes runs/rom_
 npx sharednet goal run TASK.md --agent codex --agent claude-code --until 'check: pytest -q' --until 'budget: 2M tokens'
 ```
 
-`goal run` also starts the Agents, in one Docker container that is their shared workspace.
+`goal run` also starts the Agents, each in its own Docker container; the containers share the workspace.
 The guide: https://github.com/systemind-team/sharednet-client/blob/HEAD/docs/goal-mode.md
 
 Needs Node 22.18 or newer and has no runtime dependencies. The npm package

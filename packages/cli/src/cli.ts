@@ -10,7 +10,7 @@ import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
-import { containerName, dockerRunner, parseAgents, prepareRun, runGoal, type DockerRunner } from "./goal-run.ts";
+import { dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type DockerRunner } from "./goal-run.ts";
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
@@ -103,6 +103,8 @@ const optionValueNames = new Set([
   "check-every",
   "agent",
   "image",
+  "web-search",
+  "turn-limit",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks"]);
 
@@ -525,12 +527,20 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit"]);
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks]",
+      "Usage: sharednet goal run <goal file> --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m]",
     );
+  }
+  const webSearch = option(parsed, "web-search") ?? "live";
+  if (webSearch !== "live" && webSearch !== "off") {
+    throw localError("invalid_arguments", "--web-search is live or off.");
+  }
+  const turnLimitMs = parsed.options.has("turn-limit") ? parseDuration(option(parsed, "turn-limit"), "--turn-limit") : undefined;
+  if (turnLimitMs !== undefined && turnLimitMs < 60_000) {
+    throw localError("invalid_arguments", "--turn-limit is at least 1m.");
   }
   const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
   const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime(), { budget: true });
@@ -574,10 +584,10 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     if (!invite?.token) throw new CliError("invalid_server_response", "The Agents' invite did not come back.", 5);
     const out = resolvePathFrom(dependencies.cwd, option(parsed, "out") ?? join("runs", roomId));
     dependencies.stderr(`goal: ${roomId} is open; the record goes to ${out}\n`);
-    // Ctrl-C ends the run without leaving Agents at work in a container nobody watches.
+    // Ctrl-C ends the run without leaving Agents at work in containers nobody watches.
     const interrupt = () => {
-      spawnSync("docker", ["rm", "--force", containerName(roomId)]);
-      dependencies.stderr(`goal: stopped; the Agents' container is gone and ${roomId} is still open\n`);
+      spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents)]);
+      dependencies.stderr(`goal: stopped; the Agents' containers are gone and ${roomId} is still open\n`);
       process.exit(130);
     };
     if (!dependencies.docker) process.once("SIGINT", interrupt);
@@ -597,6 +607,8 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           out,
           checkEveryMs,
           quietChecks: parsed.options.get("quiet-checks") === true,
+          webSearch,
+          ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
         },
         { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
       );

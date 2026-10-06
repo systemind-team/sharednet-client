@@ -326,6 +326,20 @@ describe("reach: forming a group from the account CLI", () => {
     expect(sentBody(open.requests[0]!)).not.toHaveProperty("reach");
   });
 
+  it("refuses a goal run whose web search is neither live nor off, before anything is sent", async () => {
+    const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--web-search", "maybe"], []);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr.join(" ")).toContain("--web-search is live or off");
+    expect(refused.requests).toEqual([]);
+  });
+
+  it("refuses a goal run whose turn limit is shorter than a minute, before anything is sent", async () => {
+    const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--turn-limit", "30s"], []);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr.join(" ")).toContain("--turn-limit is at least 1m");
+    expect(refused.requests).toEqual([]);
+  });
+
   it("opens a goal Room: the Room with the session, then the goal as the owner, and nothing at all for a goal with no bound", async () => {
     const dir = await mkdtemp(join(tmpdir(), "sharednet-goal-file-"));
     cleanup.push(dir);

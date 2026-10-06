@@ -19,6 +19,7 @@ import {
   openingPrompt,
   parseAgents,
   prepareRun,
+  runContainers,
   runGoal,
   scrubHome,
   turnCommand,
@@ -69,6 +70,25 @@ describe("a turn", () => {
     ]);
   });
 
+  it("stops a turn at the run's turn limit, 20 minutes unless the run sets another", () => {
+    const codex = { name: "codex-1", driver: "codex" as const, model: null };
+    expect(turnCommand(codex, "the goal", null, "live", 2700).slice(0, 3)).toEqual(["timeout", "2700", "codex"]);
+    const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
+    expect(turnCommand(claude, "new lines", "session-1", "live", 2700).slice(0, 3)).toEqual(["timeout", "2700", "claude"]);
+  });
+
+  it("takes web search away from every Agent when it is off, for a benchmark that forbids the internet", () => {
+    const codex = { name: "codex-1", driver: "codex" as const, model: null };
+    const off = turnCommand(codex, "the goal", null, "off");
+    expect(off).toContain('web_search="disabled"');
+    expect(off).not.toContain('web_search="live"');
+    const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
+    // The list of denied tools ends at the next flag, so the prompt stays the prompt.
+    expect(turnCommand(claude, "the goal", null, "off")).toEqual([
+      "timeout", "1200", "claude", "-p", "--disallowedTools", "WebSearch", "WebFetch", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "the goal",
+    ]);
+  });
+
   it("reads the session to resume and the spend from each harness's own stream, cached reads apart", () => {
     const codex = new TurnReader("codex");
     for (const event of [
@@ -112,6 +132,8 @@ describe("a turn", () => {
     expect(opening).toContain("<goal>\nMake the tests pass.\n</goal>");
     expect(opening).toContain('Say "DONE" in the Room only when you believe the goal is met');
     expect(opening).toContain("Do not run `sharednet wait`");
+    // Each Agent has a container of its own, so it is told what it shares and what it does not.
+    expect(opening).toContain("You share this directory (/workspace) with the others, and only this one");
     const wake = wakePrompt({
       wake_id: "wk_1",
       fired: ["message"],
@@ -141,7 +163,8 @@ function fakeDocker(answer: (call: DockerCall, command: readonly string[]) => { 
   const docker: DockerRunner = async (args, options = {}) => {
     const call: DockerCall = { args, env: options.env ?? {}, ...(options.input === undefined ? {} : { input: options.input }) };
     calls.push(call);
-    const container = args.indexOf(containerName(ROOM));
+    // Every container of the run is named for the Room: an Agent's adds its seat.
+    const container = args.findIndex((arg) => arg.startsWith(containerName(ROOM)));
     const command = args[0] === "exec" && container !== -1 ? args.slice(container + 1) : [];
     const result = await answer(call, command);
     for (const line of result.lines ?? []) options.onLine?.(line);
@@ -300,6 +323,8 @@ describe("runGoal", () => {
     // Every turn carries SHAREDNET_WAKE=off, so an agent's own `sharednet join` mid-turn starts no wake service.
     expect(turns.length).toBeGreaterThan(0);
     expect(turns.every((call) => call.args.join(" ").includes("-e SHAREDNET_WAKE=off"))).toBe(true);
+    // Web search is live unless the run turns it off, and the record says which.
+    expect(turns.every((call) => call.args.includes('web_search="live"'))).toBe(true);
     expect(calls.some((call) => call.args.join(" ").endsWith("sharednet ack wk_i_CodexOne01 --json"))).toBe(true);
     // Each seat joins with the invite in its environment, under its own home and name.
     const join1 = calls.find((call) => call.args.includes("join") && call.args.includes("codex-1"))!;
@@ -313,11 +338,34 @@ describe("runGoal", () => {
     // The owner's key reads and closes the Room from this machine; no call into Docker ever carries it.
     expect(requests.some((line) => line === `POST /rooms/${ROOM}/close ${OWNER_KEY}`)).toBe(true);
     expect(calls.every((call) => !JSON.stringify(call).includes(OWNER_KEY))).toBe(true);
-    // The Codex login is mounted for the seats; the container is stopped, copied out, and removed.
-    expect(calls.find((call) => call.args[0] === "run")!.args).toContain("/Users/someone/.codex/auth.json:/run/codex/auth.json");
+    // Each Agent runs in its own container and the checks in one more; every one mounts the shared workspace.
+    const runs = calls.filter((call) => call.args[0] === "run");
+    const named = (name: string) => runs.find((call) => call.args[call.args.indexOf("--name") + 1] === name)!;
+    expect(runs.map((call) => call.args[call.args.indexOf("--name") + 1])).toEqual([containerName(ROOM), containerName(ROOM, "codex-1"), containerName(ROOM, "codex-2")]);
+    expect(runs.every((call) => call.args.includes(`${workspace}:/workspace`))).toBe(true);
+    // The Codex login is mounted for the Codex seats, and never for the checks.
+    expect(named(containerName(ROOM, "codex-1")).args).toContain("/Users/someone/.codex/auth.json:/run/codex/auth.json");
+    expect(named(containerName(ROOM)).args.join(" ")).not.toContain("auth.json");
+    // Everything a seat runs, its join, its turns, its waits, runs in that seat's container alone.
+    const asSeat = (memberId: string) => calls.filter((call) => call.args.includes(`SHAREDNET_SEAT=${memberId}`));
+    expect(asSeat("i_CodexTwo02").length).toBeGreaterThan(0);
+    expect(asSeat("i_CodexTwo02").every((call) => call.args.includes(containerName(ROOM, "codex-2")))).toBe(true);
+    expect(asSeat("i_CodexOne01").every((call) => call.args.includes(containerName(ROOM, "codex-1")))).toBe(true);
+    // Each Agent's container gets its own forwarder and its own sharednet command.
+    const forwarders = calls.filter((call) => call.args[0] === "exec" && call.args.includes("--detach"));
+    const target = (call: DockerCall) => call.args.find((arg) => arg.startsWith(containerName(ROOM)));
+    expect(forwarders.map(target)).toEqual([containerName(ROOM, "codex-1"), containerName(ROOM, "codex-2")]);
+    const installs = calls.filter((call) => call.args.join(" ").includes("cat > /usr/local/bin/sharednet"));
+    expect(installs.map(target)).toEqual([containerName(ROOM, "codex-1"), containerName(ROOM, "codex-2")]);
+    // Every container is stopped, each home is copied out of its own Agent's container, and every container is removed.
     const kinds = calls.map((call) => call.args[0]);
     expect(kinds.lastIndexOf("stop")).toBeLessThan(kinds.indexOf("cp"));
-    expect(calls.at(-1)!.args).toEqual(["rm", "--force", containerName(ROOM)]);
+    expect(calls.find((call) => call.args[0] === "stop")!.args).toEqual(["stop", "--time", "5", ...runContainers(ROOM, plan.agents)]);
+    expect(calls.filter((call) => call.args[0] === "cp").map((call) => call.args[1])).toEqual([
+      `${containerName(ROOM, "codex-1")}:/home/agents/codex-1`,
+      `${containerName(ROOM, "codex-2")}:/home/agents/codex-2`,
+    ]);
+    expect(calls.at(-1)!.args).toEqual(["rm", "--force", ...runContainers(ROOM, plan.agents)]);
 
     // The record: one line per turn, each Agent's stream and home, the token totals.
     const wakes = (await readFile(join(out, "wakes.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
@@ -329,8 +377,63 @@ describe("runGoal", () => {
     await expect(readFile(join(home, ".codex", "auth.json"))).rejects.toThrow();
     await expect(readFile(join(home, ".config", "sharednet", "rooms", "seat.json"))).rejects.toThrow();
     const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
-    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
+    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", turn_limit_s: 1200, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
     expect(episode.agents).toHaveLength(2);
+  });
+});
+
+describe("a check", () => {
+  it("runs in the checks' own container, on the shared workspace, under no Agent's home", async () => {
+    const out = await temporary();
+    const workspace = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents(["claude-code"]),
+      workspace,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: null,
+      claudeAuth: "ANTHROPIC_API_KEY",
+    };
+    const { docker, calls } = fakeDocker((_call, command) => {
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_ClaudeOne01" }) };
+      if (command[0] === "sharednet" && command[1] === "wait") {
+        return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [{ kind: "closed" }], messages: [] }) };
+      }
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["check pytest -q", "after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) return { room: { id: ROOM, state: "open", goal }, memberships: [] };
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) {
+          return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: "2026-10-05T12:01:00.000Z" } } } };
+        }
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    const result = await runGoal(
+      client,
+      "sni_owner-seat",
+      OWNER_KEY,
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, webSearch: "off", turnLimitMs: 2_700_000 },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
+    );
+
+    expect(result.ended_by).toMatchObject({ trigger: "check pytest -q" });
+    // With web search off, the Claude Code seat's turn denies the web tools; the turn runs up to the run's
+    // own limit; and the record says both.
+    const turn = calls.find((call) => call.args.includes("claude"))!;
+    expect(turn.args.join(" ")).toContain("--disallowedTools WebSearch WebFetch --output-format");
+    expect(turn.args.join(" ")).toContain("timeout 2700 claude -p");
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ web_search: "off", turn_limit_s: 2700 });
+    const check = calls.find((call) => call.args[0] === "exec" && call.args.slice(-3).join(" ") === "sh -c pytest -q")!;
+    expect(check.args).toContain(containerName(ROOM));
+    expect(check.args.some((arg) => arg.startsWith("HOME="))).toBe(false);
+    // The checks' container has the shared workspace and nothing an Agent holds: no CLI, no sign-in.
+    const checker = calls.find((call) => call.args[0] === "run" && call.args.includes(containerName(ROOM)))!;
+    expect(checker.args).toEqual(["run", "--detach", "--name", containerName(ROOM), "--volume", `${workspace}:/workspace`, DEFAULT_IMAGE, "sleep", "infinity"]);
+    expect(calls.at(-1)!.args).toEqual(["rm", "--force", containerName(ROOM, "claude-code-1"), containerName(ROOM)]);
   });
 });
 
@@ -363,7 +466,7 @@ describe("a start that fails", () => {
       }),
     ).rejects.toMatchObject({ code: "join_failed" });
     expect(closes).toEqual([{ detail: expect.stringContaining("goal run could not start: codex-1 could not join the Room") }]);
-    expect(calls.at(-1)!.args).toEqual(["rm", "--force", containerName(ROOM)]);
+    expect(calls.at(-1)!.args).toEqual(["rm", "--force", ...runContainers(ROOM, plan.agents)]);
     // A key-signed Codex seat gets its key from the Docker client's environment, never from an argument.
     expect(calls.some((call) => call.args.includes("OPENAI_API_KEY"))).toBe(true);
   });
