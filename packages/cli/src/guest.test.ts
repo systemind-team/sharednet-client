@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runCli } from "./cli.ts";
 import type { CommandRunner } from "./guest.ts";
+import type { TurnRunner, TurnSpec } from "./wake-driver.ts";
 
 const cleanup: string[] = [];
 
@@ -87,14 +88,39 @@ async function run(
   space: Awaited<ReturnType<typeof workspace>>,
   responses: Array<{ status?: number; body?: unknown; error?: Error; raw?: Response; hang?: true }>,
   environment: Record<string, string> = {},
-  overrides: { exec?: CommandRunner; now?: () => Date } = {},
+  overrides: {
+    exec?: CommandRunner;
+    now?: () => Date;
+    service?: { delivered_through: number; acked_through: number };
+    runTurn?: TurnRunner;
+    startWakeService?: (input: { env: Record<string, string | undefined>; logFile: string }) => number | null;
+  } = {},
 ) {
   const { mkdir } = await import("node:fs/promises");
   await mkdir(space.project, { recursive: true });
   const stdout: string[] = [];
   const stderr: string[] = [];
   const requests: Array<{ url: string; init: RequestInit }> = [];
+  // The seat's place is the service's (wait PR 5). A stand-in keeps it here, so the scripted
+  // answers stay what each test is about; `acks` is what the CLI told it, in order. Pass the same
+  // `service` to two runs and it carries over, as the real one does.
+  const { service: kept, ...dependencyOverrides } = overrides;
+  const service = kept ?? { delivered_through: 0, acked_through: 0 };
+  const acks: number[] = [];
   const fetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+    const place = /\/api\/v1\/rooms\/(rom_[A-Za-z0-9]+)\/(subscription|ack)$/.exec(new URL(String(input)).pathname);
+    if (place) {
+      if (place[2] === "ack") {
+        const through = (JSON.parse(String(init.body)) as { through: number }).through;
+        acks.push(through);
+        service.acked_through = Math.max(service.acked_through, through);
+        service.delivered_through = Math.max(service.delivered_through, service.acked_through);
+      }
+      return new Response(JSON.stringify({ subscription: { room_id: place[1], ...service } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     requests.push({ url: String(input), init });
     const next = responses.shift();
     if (!next) throw new Error("Unexpected fetch");
@@ -119,9 +145,9 @@ async function run(
     sleep: async () => undefined,
     stdout: (value) => stdout.push(value),
     stderr: (value) => stderr.push(value),
-    ...overrides,
+    ...dependencyOverrides,
   });
-  return { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), requests };
+  return { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), requests, acks, service };
 }
 
 function own(sequence: number, content: string) {
@@ -196,6 +222,8 @@ describe("sharednet join", () => {
       name: "claude-code",
       last_sequence: 2,
       history: expect.objectContaining({ items: expect.any(Array) }),
+      // The session that took the seat is what being addressed resumes; nothing runs to do it here.
+      wake: { driver: "claude-code", session: "claude-session-stays-local", address: "@claude-code", service: "not_started" },
     });
     expect(result.stdout).not.toContain("sni_");
     expect(result.stdout).not.toContain("rit_");
@@ -548,7 +576,8 @@ describe("sharednet say and wait", () => {
       { status: 200, body: { room: { id: OTHER_ROOM, name: "Reach test", state: "open" }, membership: { member_id: MEMBER_ID, admitted_by: "added", state: "active" } } },
       page([{ ...message(1, "welcome to the other room"), room_id: OTHER_ROOM }, { ...message(2, "second"), room_id: OTHER_ROOM }]),
     ]);
-    expect(entered.stderr).toBe("");
+    // The one thing said: how this seat is woken, now that it is in the other Room too.
+    expect(entered.stderr).toMatch(/^Wake: when someone writes @i_KlMnOpQrSt in this Room, this Claude Code session is resumed[^\n]*\n$/);
     expect(entered.exitCode).toBe(0);
     // No invite: the seat's own token joins by Room id, idempotently.
     expect(entered.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${OTHER_ROOM}/join`);
@@ -1006,7 +1035,8 @@ describe("sharednet say and wait", () => {
     // Two loops, so two refusals end them; neither is asserted on order, only that both were seen.
     const space = await joinedSpace();
     await seatIn(space, "rom_SecondRoom", "i_AbCdEfGhIj");
-    const result = await run(["serve", "--json"], space, [revoked(), revoked(), revoked(), revoked()]);
+    const { exec } = recorder({ exitCode: 0, stdout: "" });
+    const result = await run(["serve", "--run", "handle", "--json"], space, [revoked(), revoked(), revoked(), revoked()], {}, { exec });
 
     expect(result.stderr).toContain("sitting in 2 Room(s)");
     expect(result.stderr).toContain(ROOM_ID);
@@ -1194,6 +1224,428 @@ describe("sharednet say and wait", () => {
     const result = await run(["wait", flag, value, "--json"], space, []);
     expect(result.exitCode).not.toBe(0);
     expect(result.requests).toHaveLength(0);
+  });
+
+  describe("the service keeps the seat's place (wait PR 5)", () => {
+    // One mark per seat per Room, on the service: every door moves the same one. The seat file and
+    // the connector's file only mirror it, and whichever is further along wins.
+    it("starts where the seat stopped, even when this directory is behind", async () => {
+      const space = await joinedSpace();
+      const result = await run(["wait", "--json"], space, [page([message(6, "new")])], {}, { service: { delivered_through: 5, acked_through: 5 } });
+
+      expect(result.exitCode).toBe(0);
+      expect(new URL(result.requests[0]!.url).searchParams.get("after")).toBe("5");
+      expect(JSON.parse(result.stdout).items.map((item: { sequence: number }) => item.sequence)).toEqual([6]);
+      expect(result.acks).toEqual([6]);
+      expect(await cursorOf(space)).toBe(6);
+    });
+
+    it("carries this directory's progress to the service once, instead of handing it over again", async () => {
+      const space = await joinedSpace();
+      await run(["wait", "--json"], space, [page([message(2, "a"), message(3, "b")])]);
+      const service = { delivered_through: 0, acked_through: 0 };
+      // An older CLI kept the place only here: the service is told, and the wait starts after it.
+      const result = await run(["wait", "--json"], space, [page([message(4, "c")])], {}, { service });
+
+      expect(result.acks).toEqual([3, 4]);
+      expect(new URL(result.requests[0]!.url).searchParams.get("after")).toBe("3");
+      expect(service.acked_through).toBe(4);
+    });
+
+    it("tells the service nothing when nothing was handed over", async () => {
+      const space = await joinedSpace();
+      const result = await run(["wait", "--timeout", "0", "--json"], space, [page([])], {}, { service: { delivered_through: 1, acked_through: 1 } });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.acks).toEqual([]);
+    });
+
+    it("with --ack manual, moves the service's mark only on `sharednet ack`", async () => {
+      const space = await joinedSpace();
+      const service = { delivered_through: 1, acked_through: 1 };
+      const held = await run(["wait", "--on", "message", "--ack", "manual", "--json"], space, [page([message(2, "review this")])], {}, { service });
+      const wake = JSON.parse(held.stdout);
+      expect(held.acks).toEqual([]);
+      expect(service.acked_through).toBe(1);
+
+      const acked = await run(["ack", wake.wake_id, "--json"], space, [], {}, { service });
+      expect(acked.exitCode).toBe(0);
+      expect(acked.acks).toEqual([2]);
+      expect(service.acked_through).toBe(2);
+    });
+
+    it("has watch acknowledge only once the command succeeded and its reply is in", async () => {
+      const space = await joinedSpace();
+      const service = { delivered_through: 1, acked_through: 1 };
+      const failing = await run(["watch", "--on", "message", "--run", "agent-turn", "--max-runs", "1", "--max-failures", "1", "--json"], space, [page([message(2, "hi")])], {}, {
+        service,
+        exec: async () => ({ exitCode: 1, stdout: "", stderr: "" }),
+      });
+      expect(failing.exitCode).not.toBe(0);
+      expect(failing.acks).toEqual([]);
+
+      const working = await run(["watch", "--on", "message", "--run", "agent-turn", "--max-runs", "1", "--json"], space, [page([message(2, "hi")])], {}, {
+        service,
+        exec: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      });
+      expect(working.exitCode).toBe(0);
+      expect(working.acks).toEqual([2]);
+    });
+
+    it("has serve resume from the service's place, whatever its own file says", async () => {
+      const space = await joinedSpace();
+      await seatCursor(space, ROOM_ID, MEMBER_ID, 1);
+      const service = { delivered_through: 7, acked_through: 7 };
+      const { exec } = recorder({ exitCode: 0, stdout: "" });
+      const result = await run(["serve", "--rooms", ROOM_ID, "--run", "handle", "--json"], space, [page([message(8, "next")]), revoked()], {}, { service, exec });
+
+      expect(new URL(result.requests[0]!.url).searchParams.get("after")).toBe("7");
+      expect(result.acks).toEqual([8]);
+    });
+
+    it("counts a joined Room's history as handled, as the MCP join does", async () => {
+      const space = await workspace();
+      const result = await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome"), message(2, "Agenda")])]);
+
+      expect(result.exitCode).toBe(0);
+      expect(result.acks).toEqual([2]);
+    });
+  });
+
+  describe("a wait for a mention asks the service for those lines alone (wait PR 8)", () => {
+    it("narrows the long-poll to lines that address this seat, and still hands over the whole span", async () => {
+      const space = await joinedSpace();
+      const result = await run(["wait", "--on", "mention", "--json"], space, [
+        roomState("open"),
+        page([{ ...message(3, "@claude-code your turn"), mentions: [MEMBER_ID] } as ReturnType<typeof message>]),
+        page([message(2, "an aside"), message(3, "@claude-code your turn")]),
+      ]);
+
+      expect(result.exitCode).toBe(0);
+      const poll = new URL(result.requests[1]!.url);
+      expect(poll.searchParams.get("mentions")).toBe(MEMBER_ID);
+      expect(JSON.parse(result.stdout)).toMatchObject({ fired: ["mention"] });
+      expect(JSON.parse(result.stdout).messages.map((item: { sequence: number }) => item.sequence)).toEqual([2, 3]);
+    });
+
+    it("takes the service's word for who a line addresses, so an account seat named by its tag wakes too", async () => {
+      const space = await joinedSpace();
+      const result = await run(["wait", "--on", "mention", "--on", "said", "nothing-matches-this", "--json"], space, [
+        roomState("open"),
+        page([{ ...message(2, "@reviewer the build is red"), mentions: [MEMBER_ID] } as ReturnType<typeof message>]),
+      ]);
+
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ fired: ["mention"] });
+    });
+
+    it("does not narrow when anything said may wake it", async () => {
+      const space = await joinedSpace();
+      const result = await run(["wait", "--on", "mention", "--on", "message", "--json"], space, [roomState("open"), page([message(2, "hello")])]);
+
+      expect(result.exitCode).toBe(0);
+      expect(new URL(result.requests[1]!.url).searchParams.has("mentions")).toBe(false);
+    });
+  });
+
+  describe("the session that took a seat is resumed when the seat is addressed (the drivers)", () => {
+    // A Codex session, as Codex's own commands see it: the thread id is CODEX_SESSION_ID.
+    const CODEX = { CLAUDE_SESSION_ID: "", CODEX_SESSION_ID: "019a-codex-thread", CODEX_HOME: "/codex-home", PATH: "" };
+    const credentialOf = async (space: Awaited<ReturnType<typeof workspace>>) =>
+      JSON.parse(await readFile(join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, `${MEMBER_ID}.json`), "utf8"));
+    const serveCursorOf = async (space: Awaited<ReturnType<typeof workspace>>) =>
+      Number((await readFile(join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, `${MEMBER_ID}.serve-cursor`), "utf8")).trim());
+    const addressed = (sequence: number, content: string) => ({ ...message(sequence, content), mentions: [MEMBER_ID] }) as ReturnType<typeof message>;
+    /** A turn runner that records each turn and answers as Codex's --json stream would. */
+    function turnsOf(answer: { exitCode?: number; stdout?: string } = {}) {
+      const turns: TurnSpec[] = [];
+      const runTurn: TurnRunner = async (spec) => {
+        turns.push(spec);
+        return {
+          exitCode: answer.exitCode ?? 0,
+          stdout:
+            answer.stdout ??
+            [
+              JSON.stringify({ type: "thread.started", thread_id: "019a-codex-thread" }),
+              JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "@host 2+2 is 4." } }),
+              JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 2 } }),
+            ].join("\n"),
+          stderr: "",
+          timedOut: false,
+        };
+      };
+      return { turns, runTurn };
+    }
+
+    it("remembers the session at join, and leaves it out with --no-wake or SHAREDNET_WAKE=off", async () => {
+      const space = await workspace();
+      const result = await run(["join", PASTED_INVITE, "--json"], space, [joined([message(1, "Welcome")])], CODEX);
+
+      expect(result.exitCode).toBe(0);
+      expect((await credentialOf(space)).wake).toEqual({ driver: "codex", session: "019a-codex-thread", cwd: space.project, command: "codex", codex_home: "/codex-home" });
+      expect(JSON.parse(result.stdout).wake).toEqual({ driver: "codex", session: "019a-codex-thread", address: "@codex", service: "not_started" });
+      expect(result.stderr).toContain("Wake: when someone writes @codex in this Room, this Codex session is resumed with what was said");
+      // The session id is this machine's business: the server never hears it.
+      expect(String(result.requests[0]!.init.body)).not.toContain("019a-codex-thread");
+
+      for (const [flags, environment] of [[["--no-wake"], CODEX], [[], { ...CODEX, SHAREDNET_WAKE: "off" }]] as const) {
+        const other = await workspace();
+        const quiet = await run(["join", PASTED_INVITE, ...flags, "--json"], other, [joined([message(1, "Welcome")])], environment);
+        expect(quiet.exitCode).toBe(0);
+        expect((await credentialOf(other)).wake).toBeUndefined();
+        expect(JSON.parse(quiet.stdout).wake).toBeUndefined();
+        expect(quiet.stderr).not.toContain("Wake:");
+      }
+    });
+
+    it("starts the wake service after a join, but not from inside a sandbox, and not a second one", async () => {
+      const started: Array<{ logFile: string; env: Record<string, string | undefined> }> = [];
+      const startWakeService = (input: { env: Record<string, string | undefined>; logFile: string }) => (started.push(input), 4242);
+
+      const space = await workspace();
+      const first = await run(["join", PASTED_INVITE, "--json"], space, [joined([message(1, "Welcome")])], CODEX, { startWakeService });
+      expect(JSON.parse(first.stdout).wake).toMatchObject({ service: "started", pid: 4242 });
+      expect(started).toHaveLength(1);
+      expect(started[0]!.logFile).toBe(join(space.env.XDG_STATE_HOME!, "sharednet", "serve.log"));
+      expect(first.stderr).toContain("pid 4242");
+
+      const boxed = await workspace();
+      const sandboxed = await run(["join", PASTED_INVITE, "--json"], boxed, [joined([message(1, "Welcome")])], { ...CODEX, CODEX_SANDBOX: "seatbelt" }, { startWakeService });
+      expect(JSON.parse(sandboxed.stdout).wake.service).toBe("not_started");
+      expect(sandboxed.stderr).toContain("sandbox");
+      expect(started).toHaveLength(1);
+
+      // A connector that drives is already running (this process stands in for it): it takes the seat.
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const busy = await workspace();
+      await mkdir(join(busy.env.XDG_CONFIG_HOME!, "sharednet"), { recursive: true, mode: 0o700 });
+      const status = join(busy.env.XDG_CONFIG_HOME!, "sharednet", "serve.json");
+      await writeFile(status, JSON.stringify({ pid: process.pid, started_at: "2026-10-05T00:00:00.000Z", rooms: [], drives: true }));
+      const running = await run(["join", PASTED_INVITE, "--json"], busy, [joined([message(1, "Welcome")])], CODEX, { startWakeService });
+      expect(JSON.parse(running.stdout).wake.service).toBe("running");
+      expect(started).toHaveLength(1);
+
+      // One from before the drivers resumes nobody, and the join says to restart it.
+      await writeFile(status, JSON.stringify({ pid: process.pid, started_at: "2026-10-05T00:00:00.000Z", rooms: [] }));
+      const outdated = await run(["join", PASTED_INVITE, "--json"], await workspace().then(async (fresh) => {
+        await mkdir(join(fresh.env.XDG_CONFIG_HOME!, "sharednet"), { recursive: true, mode: 0o700 });
+        await writeFile(join(fresh.env.XDG_CONFIG_HOME!, "sharednet", "serve.json"), JSON.stringify({ pid: process.pid, started_at: "2026-10-05T00:00:00.000Z", rooms: [] }));
+        return fresh;
+      }), [joined([message(1, "Welcome")])], CODEX, { startWakeService });
+      expect(JSON.parse(outdated.stdout).wake.service).toBe("outdated");
+      expect(outdated.stderr).toContain("sharednet serve --stop");
+      expect(started).toHaveLength(1);
+    });
+
+    it("resumes the seat's own Codex session with everything said since, posts its answer, and counts it handled only after", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const { turns, runTurn } = turnsOf();
+      let cursorDuringTurn: number | null = null;
+      const watched: TurnRunner = async (spec) => {
+        cursorDuringTurn = await serveCursorOf(space);
+        return runTurn(spec);
+      };
+      const service = { delivered_through: 1, acked_through: 1 };
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(3, "@codex what is 2+2?")]),
+        page([message(2, "the build is green"), addressed(3, "@codex what is 2+2?")]),
+        { status: 201, body: { message: own(4, "@host 2+2 is 4.") } },
+        revoked(),
+      ], CODEX, { service, runTurn: watched });
+
+      expect(result.exitCode).toBe(0);
+      // The long-poll asks for lines that address this seat; the wake still carries the whole span.
+      expect(new URL(result.requests[0]!.url).searchParams.get("mentions")).toBe(MEMBER_ID);
+      expect(result.requests[1]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages?after=1&limit=100`);
+      expect(turns).toHaveLength(1);
+      const turn = turns[0]!;
+      // No sandbox chosen in /codex-home: the turn gets the one an interactive session works in.
+      expect([turn.command, ...turn.args]).toEqual([
+        "codex", "exec", "resume", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "019a-codex-thread", "-",
+      ]);
+      expect(turn.cwd).toBe(space.project);
+      expect(turn.env).toMatchObject({ SHAREDNET_SEAT: MEMBER_ID, CODEX_HOME: "/codex-home" });
+      // The session being resumed is not the one serve runs in: its markers stay behind.
+      expect(turn.env.CODEX_SESSION_ID).toBeUndefined();
+      expect(turn.input).toContain(`You were addressed in Room ${ROOM_ID}`);
+      expect(turn.input).toContain("#2 host: the build is green");
+      expect(turn.input).toContain("#3 host: @codex what is 2+2?");
+      // The turn's last message is the seat's reply, posted for it.
+      const reply = result.requests[2]!;
+      expect(reply.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages`);
+      expect(header(reply, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+      expect(JSON.parse(String(reply.init.body))).toEqual({ content: "@host 2+2 is 4." });
+      // Handled after the turn, not when it was handed over: a crash mid-turn hands it over again.
+      expect(cursorDuringTurn).toBe(1);
+      expect(result.acks).toEqual([3]);
+      expect(await serveCursorOf(space)).toBe(3);
+      expect(result.stderr).toContain("finished its turn: @host 2+2 is 4.");
+    });
+
+    it("posts nothing for a turn that ends with nothing to say", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const { turns, runTurn } = turnsOf({
+        stdout: ['{"type":"item.completed","item":{"type":"agent_message","text":"(no reply)"}}', '{"type":"turn.completed","usage":{}}'].join("\n"),
+      });
+      const service = { delivered_through: 1, acked_through: 1 };
+      const result = await run(["serve", "--json"], space, [page([addressed(2, "@codex fyi, deploy done")]), page([addressed(2, "@codex fyi, deploy done")]), revoked()], CODEX, { service, runTurn });
+
+      expect(result.exitCode).toBe(0);
+      expect(turns).toHaveLength(1);
+      expect(result.requests.filter((request) => request.init.method === "POST")).toHaveLength(0);
+      expect(result.acks).toEqual([2]);
+      expect(result.stderr).toContain("finished its turn with nothing to say");
+    });
+
+    it("tells the Room when the session could not be resumed, and does not wake for it again", async () => {
+      // The workspace's own Claude Code session took this seat.
+      const space = await joinedSpace();
+      const { turns, runTurn } = turnsOf({
+        exitCode: 1,
+        stdout: JSON.stringify({ type: "result", subtype: "success", is_error: true, result: "Not logged in · Please run /login" }),
+      });
+      const service = { delivered_through: 1, acked_through: 1 };
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(2, "@claude-code review this")]),
+        page([addressed(2, "@claude-code review this")]),
+        { status: 201, body: { message: own(3, "(claude-code was addressed …)") } },
+        revoked(),
+      ], {}, { service, runTurn });
+
+      expect(result.exitCode).toBe(0);
+      expect([turns[0]!.command, ...turns[0]!.args]).toEqual(["claude", "-p", "--resume", "claude-session-stays-local", "--output-format", "json"]);
+      const said = result.requests[2]!;
+      expect(said.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages`);
+      expect(JSON.parse(String(said.init.body)).content).toBe(
+        "(claude-code was addressed, but its Claude Code session could not be resumed: Not logged in · Please run /login)",
+      );
+      expect(result.acks).toEqual([2]);
+    });
+
+    it("leaves alone a seat no session took, unless --run gives it a command", async () => {
+      // Such a seat is someone's own `wait`'s to answer; sitting in it would count its lines as handled.
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE, "--no-wake"], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
+      const result = await run(["serve", "--json"], space, []);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain("no session to wake");
+      expect(result.requests).toHaveLength(0);
+    });
+
+    it("starts a driven seat where its join left it, so nothing said after the join is skipped", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([])], CODEX)).exitCode).toBe(0);
+      const { turns, runTurn } = turnsOf({ stdout: '{"type":"turn.completed","usage":{}}' });
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(3, "@codex and you?")]),
+        page([message(1, "said after the join"), message(2, "and this"), addressed(3, "@codex and you?")]),
+        revoked(),
+      ], CODEX, { runTurn });
+
+      expect(result.exitCode).toBe(0);
+      // No jump to the Room's end: the long-poll starts at the join's place.
+      expect(new URL(result.requests[0]!.url).searchParams.get("after")).toBe("0");
+      expect(turns[0]!.input).toContain("#1 host: said after the join");
+      expect(result.acks).toEqual([3]);
+    });
+
+    it("speaks with the token the seat's session holds now, not the one it joined with", async () => {
+      // A session that registers again is handed a new token; only the session file has it.
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const sessions = join(space.env.XDG_STATE_HOME!, "sharednet", "sessions");
+      await mkdir(sessions, { recursive: true, mode: 0o700 });
+      const fresh = `sni_${"F".repeat(43)}`;
+      await writeFile(
+        join(sessions, `${MEMBER_ID}.json`),
+        JSON.stringify({
+          schema_version: 1,
+          base_url: "https://www.sharednet.ai",
+          principal_id: "p_AbCdEfGhIj",
+          agent_id: null,
+          instance_id: MEMBER_ID,
+          local_instance_key: null,
+          instance_token: fresh,
+          created_at: "2026-10-05T00:00:00.000Z",
+          lease_expires_at: "2026-10-05T00:01:30.000Z",
+          expires_at: null,
+        }),
+        { mode: 0o600 },
+      );
+      const service = { delivered_through: 1, acked_through: 1 };
+      const result = await run(["serve", "--json"], space, [revoked()], CODEX, { service });
+
+      expect(result.exitCode).toBe(0);
+      expect(header(result.requests[0]!, "authorization")).toBe(`Bearer ${fresh}`);
+    });
+
+    it("serves an explicit --run command instead of resuming anything", async () => {
+      const space = await joinedSpace();
+      const { turns, runTurn } = turnsOf();
+      const { calls, exec } = recorder({ exitCode: 0, stdout: "" });
+      const service = { delivered_through: 1, acked_through: 1 };
+      const result = await run(["serve", "--run", "handle", "--json"], space, [page([message(2, "hello")]), revoked()], {}, { service, runTurn, exec });
+
+      expect(result.exitCode).toBe(0);
+      expect(new URL(result.requests[0]!.url).searchParams.has("mentions")).toBe(false);
+      expect(calls).toHaveLength(1);
+      expect(turns).toHaveLength(0);
+    });
+
+    it("is the one connector on the machine, and gives the slot back when it ends", async () => {
+      const space = await joinedSpace();
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const status = join(space.env.XDG_CONFIG_HOME!, "sharednet", "serve.json");
+      await mkdir(join(space.env.XDG_CONFIG_HOME!, "sharednet"), { recursive: true });
+      // Another live process holds the slot: the test runner's parent stands in for it.
+      await writeFile(status, JSON.stringify({ pid: process.ppid, started_at: "2026-10-05T00:00:00.000Z", rooms: [ROOM_ID], drives: true }));
+      const second = await run(["serve", "--json"], space, []);
+      expect(second.exitCode).not.toBe(0);
+      expect(JSON.parse(second.stdout || second.stderr).error?.code ?? second.stderr).toContain("serve_running");
+      expect(second.requests).toHaveLength(0);
+
+      // A slot whose process is gone is taken over, and given back at the end.
+      await writeFile(status, JSON.stringify({ pid: 2 ** 22 + 17, started_at: "2026-10-05T00:00:00.000Z", rooms: [ROOM_ID] }));
+      const service = { delivered_through: 1, acked_through: 1 };
+      const served = await run(["serve", "--json"], space, [revoked()], {}, { service });
+      expect(served.exitCode).toBe(0);
+      const after = await run(["serve", "--status", "--json"], space, []);
+      expect(JSON.parse(after.stdout)).toMatchObject({ running: false });
+    });
+  });
+
+  describe("sharednet timer: a line the Room's clock says on schedule (wait PR 6)", () => {
+    const TIMER = { id: "tm_AbCdEfGhIj", room_id: ROOM_ID, when: "every 20m", say: "@claude-code stand-up", next_at: "2026-10-05T12:20:00.000Z", member_id: "i_ClockClock", created_by: MEMBER_ID, created_at: "2026-10-05T12:00:00.000Z" };
+
+    it("sets one with the seat's token, and lists and cancels them", async () => {
+      const space = await joinedSpace();
+      const set = await run(["timer", "add", "every 20m", "@claude-code stand-up", "--json"], space, [{ status: 201, body: { timer: TIMER } }]);
+      expect(set.exitCode).toBe(0);
+      expect(set.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/timers`);
+      expect(set.requests[0]!.init.method).toBe("POST");
+      expect(JSON.parse(String(set.requests[0]!.init.body))).toEqual({ when: "every 20m", say: "@claude-code stand-up" });
+      expect(header(set.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+      expect(JSON.parse(set.stdout).timer.id).toBe(TIMER.id);
+
+      const listed = await run(["timer", "list", "--json"], space, [{ status: 200, body: { items: [TIMER] } }]);
+      expect(listed.requests[0]!.init.method).toBe("GET");
+      expect(JSON.parse(listed.stdout).items).toHaveLength(1);
+
+      const cancelled = await run(["timer", "cancel", TIMER.id, "--json"], space, [{ status: 200, body: { timer: TIMER } }]);
+      expect(cancelled.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/timers/${TIMER.id}/cancel`);
+    });
+
+    it("refuses what is not a timer command before asking the service", async () => {
+      const space = await joinedSpace();
+      for (const argv of [["timer"], ["timer", "add", "every 20m"], ["timer", "cancel", "not-a-timer"], ["timer", "list", "extra"], ["timer", "snooze"]]) {
+        const result = await run([...argv, "--json"], space, []);
+        expect(result.exitCode, argv.join(" ")).not.toBe(0);
+        expect(result.requests, argv.join(" ")).toHaveLength(0);
+      }
+    });
   });
 
   describe("a wait keeps its deadline", () => {

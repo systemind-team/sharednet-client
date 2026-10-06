@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join as joinPath, resolve as resolvePathFrom } from "node:path";
 
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
@@ -10,6 +10,7 @@ import { computeLocalInstanceKey } from "./instance-computation.ts";
 import { detectRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
 import { hasAccountCredential, refreshIfNeeded, registerInstance } from "./session.ts";
+import { replyFrom, runTurn, sandboxed, seatWakeFrom, turnSpec, turnSummary, wakeTurnPrompt, type SeatWake, type TurnRunner } from "./wake-driver.ts";
 import {
   getOrCreateInstallationSecret,
   getStoragePaths,
@@ -50,6 +51,15 @@ export interface GuestDependencies {
   sleep?: (ms: number) => Promise<void>;
   /** Runs the `watch --run` command; the default shells out. Tests capture it. */
   exec?: CommandRunner;
+  /** Ends a resident command such as `serve --push`; a person ends it with Ctrl-C instead. */
+  signal?: AbortSignal;
+  /** Runs one resumed turn of a seat's own session; tests replace it. */
+  runTurn?: TurnRunner;
+  /**
+   * Starts `sharednet serve` in the background after a join, so the session that joined is woken
+   * when it is addressed. Only the real process supplies it; without it, a join starts nothing.
+   */
+  startWakeService?: (input: { env: Environment; logFile: string }) => number | null;
 }
 
 export type CommandRunner = (
@@ -72,6 +82,8 @@ interface MessageShape {
   sender?: { member_id: string; kind: string; name: string | null };
   created_at?: string;
   [key: string]: unknown;
+  /** The seats the service resolved this line to address (wait PR 8). */
+  mentions?: string[];
 }
 
 interface PageShape {
@@ -97,10 +109,10 @@ const INVITE_TOKEN_PATTERN = /^rit_[A-Za-z0-9_-]{43}$/;
 /** The server caps one wait at this; the client loops. */
 const WAIT_MAX_SECONDS = 25;
 
-const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every"]);
+const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on"]);
-const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop"]);
+const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake"]);
 
 function parseGuestArguments(args: string[]): ParsedGuestArguments {
   const options = new Map<string, string | true>();
@@ -267,13 +279,17 @@ function invalidServerResponse(): CliError {
 
 async function join(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["name", "token", "private", "as", "claim", "agent"]);
+  assertOnlyOptions(parsed, ["name", "token", "private", "as", "claim", "agent", "no-wake"]);
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet join <invite> [--name <name>] [--agent <tag>] [--private] [--claim <clp_…>], or sharednet join <rom_…> [--as <i_…>]",
+      "Usage: sharednet join <invite> [--name <name>] [--agent <tag>] [--private] [--claim <clp_…>] [--no-wake], or sharednet join <rom_…> [--as <i_…>]",
     );
   }
+  // The session taking the seat is remembered, so being addressed in the Room resumes it. --no-wake
+  // (or SHAREDNET_WAKE=off, for a runner that wakes its seats itself) keeps the join to the seat.
+  const wakeOff = parsed.options.get("no-wake") === true || dependencies.env.SHAREDNET_WAKE?.trim() === "off";
+  const wake = wakeOff ? null : seatWakeFrom(dependencies.env, dependencies.cwd);
   // --agent: the tag (an a_ id or a handle) to group this seat under. A tag
   // belongs to an account, so it needs one on this machine.
   const agent = stringOption(parsed, "agent");
@@ -282,7 +298,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   const argument = parsed.positionals[0]!;
   const inviteToken = stringOption(parsed, "token") ?? dependencies.env.SHAREDNET_INVITE_TOKEN?.trim();
   if (ROOM_ID_PATTERN.test(argument) && !inviteToken) {
-    return enterAsSeat(argument, stringOption(parsed, "as"), dependencies);
+    return enterAsSeat(argument, stringOption(parsed, "as"), dependencies, { wake, wakeOff });
   }
   const { roomId, token, baseUrl } = parseInvite(argument, parsed, dependencies.env);
   const name = stringOption(parsed, "name") ?? defaultGuestName(dependencies.env);
@@ -340,7 +356,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   // Instance of the account and the invite only admits it; without one, the
   // join provisions an anonymous Principal.
   if (await hasAccountCredential(dependencies.env, paths, baseUrl)) {
-    return joinAsAccount(roomId, token, name, baseUrl, paths, client, dependencies, reach, agent);
+    return joinAsAccount(roomId, token, name, baseUrl, paths, client, dependencies, reach, agent, wake);
   }
   if (agent !== undefined) {
     throw localError(
@@ -370,6 +386,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     name,
     member_token: memberToken,
     joined_at: dependencies.now().toISOString(),
+    ...(wake ? { wake } : {}),
   };
   await writeRoomCredential(paths, credential);
   const state: ProjectRoomState = {
@@ -383,10 +400,12 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     anchorKey: await anchorKeyFor(dependencies.env, paths),
     joinedAt: credential.joined_at,
   });
+  await historyHandled(client, payload.room.id, memberToken, state.last_sequence, dependencies);
   // The one moment to say it: this seat belongs to nobody yet.
   dependencies.stderr?.(
     `Joined ${payload.room.id} as ${memberId}, an anonymous seat. Run \`sharednet login\` on this machine to make it yours; it binds every seat this machine holds.\n`,
   );
+  const woken = await wakeAfterJoin(credential, `@${name}`, paths, dependencies);
 
   // Everything the Agent should report, and nothing it should not: the tokens
   // stay in the credential file.
@@ -398,6 +417,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     name,
     last_sequence: state.last_sequence,
     history: payload.history,
+    ...(woken ? { wake: woken } : {}),
   };
 }
 
@@ -439,6 +459,7 @@ async function enterAsSeat(
   roomId: string,
   memberId: string | undefined,
   dependencies: GuestDependencies,
+  choice: { wake: SeatWake | null; wakeOff: boolean },
 ): Promise<unknown> {
   const paths = getStoragePaths(dependencies.env);
   const seats = await heldSeats(paths);
@@ -477,12 +498,17 @@ async function enterAsSeat(
     seat.member_token,
   );
   if (!Array.isArray(history?.items)) throw invalidServerResponse();
-  await writeRoomCredential(paths, {
-    ...seat,
+  // The session entering is the one to wake; a seat entered from no session keeps the one it had.
+  const { wake: previous, ...held } = seat;
+  const wake = choice.wakeOff ? null : (choice.wake ?? previous ?? null);
+  const entered: StoredRoomCredential = {
+    ...held,
     room_id: payload.room.id,
     member_id: payload.membership.member_id,
     joined_at: dependencies.now().toISOString(),
-  });
+    ...(wake ? { wake } : {}),
+  };
+  await writeRoomCredential(paths, entered);
   const state: ProjectRoomState = {
     schema_version: 1,
     base_url: baseUrl,
@@ -494,6 +520,8 @@ async function enterAsSeat(
     anchorKey: await anchorKeyFor(dependencies.env, paths),
     joinedAt: dependencies.now().toISOString(),
   });
+  await historyHandled(client, payload.room.id, seat.member_token, state.last_sequence, dependencies);
+  const woken = await wakeAfterJoin(entered, `@${payload.membership.member_id}`, paths, dependencies);
   return {
     room: payload.room,
     member_id: payload.membership.member_id,
@@ -502,6 +530,7 @@ async function enterAsSeat(
     admitted_by: payload.membership.admitted_by ?? null,
     last_sequence: state.last_sequence,
     history,
+    ...(woken ? { wake: woken } : {}),
   };
 }
 
@@ -515,6 +544,7 @@ async function joinAsAccount(
   dependencies: GuestDependencies,
   reach?: "public" | "private",
   agent?: string,
+  wake?: SeatWake | null,
 ): Promise<unknown> {
   // A join is one session taking one seat, so it always registers a fresh
   // Instance. It never reuses one by local session key: two sessions whose
@@ -545,7 +575,7 @@ async function joinAsAccount(
 
   // The seat file mirrors the session so say/wait need no second lookup; the
   // session file stays the source of a fresh token when the lease is renewed.
-  await writeRoomCredential(paths, {
+  const credential: StoredRoomCredential = {
     schema_version: 1,
     base_url: baseUrl,
     room_id: payload.room.id,
@@ -553,7 +583,9 @@ async function joinAsAccount(
     name,
     member_token: session.instance_token,
     joined_at: dependencies.now().toISOString(),
-  });
+    ...(wake ? { wake } : {}),
+  };
+  await writeRoomCredential(paths, credential);
   const state: ProjectRoomState = {
     schema_version: 1,
     base_url: baseUrl,
@@ -565,9 +597,12 @@ async function joinAsAccount(
     anchorKey: session.local_instance_key ?? (await anchorKeyFor(dependencies.env, paths)),
     joinedAt: dependencies.now().toISOString(),
   });
+  await historyHandled(client, payload.room.id, session.instance_token, state.last_sequence, dependencies);
   dependencies.stderr?.(
     `Seat ${session.instance_id} in ${payload.room.id}. Other sessions of yours may hold seats in this directory too; address this one with --as ${session.instance_id}.\n`,
   );
+  // An account's seat answers to its tag's @handle when it has one, and always to its Instance id.
+  const woken = await wakeAfterJoin(credential, agent !== undefined && !agent.startsWith("a_") ? `@${agent} or @${session.instance_id}` : `@${session.instance_id}`, paths, dependencies);
   return {
     room: payload.room,
     member_id: session.instance_id,
@@ -582,7 +617,49 @@ async function joinAsAccount(
       wait: `npx -y sharednet@latest wait --as ${session.instance_id}`,
       note: "This seat is yours alone. Pass --as on every verb when this directory holds seats from other sessions.",
     },
+    ...(woken ? { wake: woken } : {}),
   };
+}
+
+/**
+ * After a join from inside a Codex or Claude Code session: say how the seat is woken, and make sure
+ * something is there to wake it. One `serve` drives every seat on the machine and looks for new
+ * ones every few seconds, so a join either finds it running or starts it in the background.
+ */
+async function wakeAfterJoin(
+  seat: StoredRoomCredential,
+  address: string,
+  paths: ReturnType<typeof getStoragePaths>,
+  dependencies: GuestDependencies,
+): Promise<Record<string, unknown> | null> {
+  const wake = seat.wake;
+  if (!wake) return null;
+  const harness = wake.driver === "codex" ? "Codex" : "Claude Code";
+  const status = (await readServeStatus(paths).catch(() => ({}))) as { running?: boolean; pid?: number; drives?: boolean };
+  let service: "running" | "started" | "not_started" | "outdated";
+  let how: string;
+  let pid: number | null = null;
+  if (status.running && status.pid) {
+    service = status.drives ? "running" : "outdated";
+    how = status.drives
+      ? `the wake service already running here (pid ${status.pid}) takes this seat within seconds`
+      : `the connector running here (pid ${status.pid}) resumes no sessions, being older or running a --run command; to be woken, stop it (sharednet serve --stop) and run sharednet serve`;
+  } else if (sandboxed(dependencies.env)) {
+    service = "not_started";
+    how = "this session runs in a sandbox, which a background service would inherit, so nothing was started: run `sharednet serve` outside it";
+  } else if (dependencies.startWakeService) {
+    const logFile = joinPath(paths.stateDir, "serve.log");
+    pid = dependencies.startWakeService({ env: dependencies.env, logFile });
+    service = pid ? "started" : "not_started";
+    how = pid
+      ? `the wake service is now running in the background (pid ${pid}, log ${logFile}); stop it with: sharednet serve --stop`
+      : "the wake service did not start: run `sharednet serve`";
+  } else {
+    service = "not_started";
+    how = "run `sharednet serve` to be woken";
+  }
+  dependencies.stderr?.(`Wake: when someone writes ${address} in this Room, this ${harness} session is resumed with what was said; ${how}.\n`);
+  return { driver: wake.driver, session: wake.session, address, service, ...(pid ? { pid } : {}) };
 }
 
 async function currentSeat(
@@ -813,6 +890,69 @@ async function everythingSaid(
   return items;
 }
 
+/** A join hands over the history it returns, so the seat's place starts after it, as the MCP join's does. */
+async function historyHandled(client: ApiClient, roomId: string, token: string, through: number, dependencies: GuestDependencies): Promise<void> {
+  if (through <= 0) return;
+  const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  await acknowledgeThrough(client, roomId, token, through, sleep, dependencies);
+}
+
+/**
+ * Where this seat stands in its Room, as the service keeps it (wait PR 5): the last sequence it has
+ * finished handling. Every door moves the same mark, whatever directory, connector or chat product
+ * it runs in. The seat file and the connector's cursor file only mirror it: whichever is further
+ * along wins and the service is told, so progress made earlier, or by an older CLI, is carried
+ * over instead of handed over again.
+ */
+async function keptPlace(
+  client: ApiClient,
+  roomId: string,
+  token: string,
+  local: number,
+  sleep: (ms: number) => Promise<void>,
+  dependencies: GuestDependencies,
+  deadline: number | null = null,
+): Promise<number> {
+  const kept = await pollThroughBlips(
+    () => client.request<{ subscription?: { acked_through?: unknown } }>("GET", `/rooms/${encodeURIComponent(roomId)}/subscription`, token),
+    sleep,
+    dependencies,
+    deadline,
+  );
+  const acked = kept?.subscription?.acked_through;
+  if (typeof acked !== "number" || !Number.isSafeInteger(acked)) throw invalidServerResponse();
+  if (local <= acked) return acked;
+  await acknowledgeThrough(client, roomId, token, local, sleep, dependencies, deadline);
+  return local;
+}
+
+/**
+ * Tells the service this seat has handled everything through `through`. Acks are cumulative, so one
+ * that is lost is covered by the next. A lost one never undoes the work: the mirror keeps this
+ * directory from handing the same messages over again, so it is reported, not raised.
+ */
+async function acknowledgeThrough(
+  client: ApiClient,
+  roomId: string,
+  token: string,
+  through: number,
+  sleep: (ms: number) => Promise<void>,
+  dependencies: GuestDependencies,
+  deadline: number | null = null,
+): Promise<void> {
+  try {
+    await pollThroughBlips(
+      () => client.request("POST", `/rooms/${encodeURIComponent(roomId)}/ack`, token, { through }),
+      sleep,
+      dependencies,
+      deadline,
+    );
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    dependencies.stderr?.(`the service did not take the acknowledgement through ${through} (${error.code}); the next one covers it\n`);
+  }
+}
+
 function defaultExec(command: string, input: string, env: Record<string, string>) {
   const shell = process.platform === "win32" ? ["cmd", "/c", command] : ["sh", "-c", command];
   return new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve) => {
@@ -1019,6 +1159,11 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
   const log = dependencies.stderr ?? (() => undefined);
   const me = await whoAmI(client, state, credential);
   const iso = (ms: number) => new Date(ms).toISOString();
+  // A wait that wakes only when addressed asks the service for those lines alone (wait PR 8): one
+  // message to one seat wakes one seat, not every seat in the Room. Once it wakes, the wake still
+  // carries everything said since the last one handled.
+  const said = triggers.filter((trigger) => SAID_KINDS.has(trigger.kind));
+  if (said.length > 0 && said.every((trigger) => trigger.kind === "mention")) filters.set("mentions", me);
 
   // What the clock-free triggers need from the Room: the seat's own name for
   // `mention`, the Room's state for `closed`. Looked up once, and `closed`
@@ -1036,8 +1181,10 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
     lastRoomCheckAt = startedAt;
   }
 
-  let cursor = state.last_sequence;
-  let persisted = state.last_sequence;
+  // The service keeps this seat's place (wait PR 5); a wake starts after what it has handled.
+  const start = await keptPlace(client, state.room_id, credential.member_token, state.last_sequence, sleep, dependencies, deadline);
+  let cursor = start;
+  let persisted = start;
   let batch: MessageShape[] = [];
   let lastRunAt = startedAt;
   let lastMessageAt: number | null = null;
@@ -1058,7 +1205,9 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
       case "message":
         return batch.length > 0 && settled;
       case "mention":
-        return settled && batch.some((item) => mentions(item.content, { memberId: me, name: myName }));
+        // The service resolved whom each line addresses, an account seat's tag included; the local
+        // rule covers a service that predates that.
+        return settled && batch.some((item) => item.mentions?.includes(me) || mentions(item.content, { memberId: me, name: myName }));
       case "said":
         return settled && batch.some((item) => saidIn(item.content, trigger));
       case "count":
@@ -1236,7 +1385,8 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
         if (wake.wake_id !== null) {
           await writePendingWake(dependencies.cwd, state.member_id, { wake_id: wake.wake_id, room_id: state.room_id, from: persisted, through: cursor });
         }
-      } else if (cursor > state.last_sequence) {
+      } else if (cursor > persisted) {
+        await acknowledgeThrough(client, state.room_id, credential.member_token, cursor, sleep, dependencies, deadline);
         await writeProjectRoomState(dependencies.cwd, { ...state, last_sequence: cursor });
       }
       await appendWakeLog(logPath, {
@@ -1292,6 +1442,7 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
     }
 
     if (status === "ok") {
+      if (cursor > persisted) await acknowledgeThrough(client, state.room_id, credential.member_token, cursor, sleep, dependencies, deadline);
       persisted = cursor;
       await writeProjectRoomState(dependencies.cwd, { ...state, last_sequence: persisted });
       spend();
@@ -1393,7 +1544,9 @@ async function wait(args: string[], dependencies: GuestDependencies): Promise<un
   // toward --min, or come back. A page of nothing but one's own words is
   // consumed and the sit continues.
   const items: MessageShape[] = [];
-  let cursor = state.last_sequence;
+  // The service keeps this seat's place (wait PR 5); the seat file mirrors it.
+  const start = await keptPlace(client, state.room_id, credential.member_token, state.last_sequence, sleep, dependencies, deadline);
+  let cursor = start;
   for (;;) {
     // Setup may already have spent the time this wait was given.
     if (totalSeconds !== null && totalSeconds > 0 && dependencies.now().getTime() >= deadline!) break;
@@ -1423,9 +1576,9 @@ async function wait(args: string[], dependencies: GuestDependencies): Promise<un
     if (!advanced) await sleep(0);
   }
   // A filter chose the moment; what comes back is everything said since the cursor, not only the match.
-  if (filters.size > 0 && cursor > state.last_sequence) {
+  if (filters.size > 0 && cursor > start) {
     const everything = await pollThroughBlips(
-      () => everythingSaid(client, state.room_id, credential.member_token, state.last_sequence, cursor),
+      () => everythingSaid(client, state.room_id, credential.member_token, start, cursor),
       sleep,
       dependencies,
       deadline,
@@ -1434,7 +1587,8 @@ async function wait(args: string[], dependencies: GuestDependencies): Promise<un
   }
   const page: PageShape = { items, next_cursor: null, has_more: false };
 
-  if (cursor > state.last_sequence) {
+  if (cursor > start) {
+    await acknowledgeThrough(client, state.room_id, credential.member_token, cursor, sleep, dependencies, deadline);
     await writeProjectRoomState(dependencies.cwd, { ...state, last_sequence: cursor });
   }
 
@@ -1461,7 +1615,7 @@ async function ackWake(args: string[], dependencies: GuestDependencies): Promise
   if (parsed.positionals.length !== 1 || !/^wk_[A-Za-z0-9_-]{16}$/.test(wakeId!)) {
     throw localError("invalid_arguments", "Usage: sharednet ack <wk_…> [--as <member_id>]");
   }
-  const { state } = await currentSeat(dependencies, stringOption(parsed, "as"));
+  const { client, state, credential } = await currentSeat(dependencies, stringOption(parsed, "as"));
   const held = await readPendingWake(dependencies.cwd, state.member_id);
   if (!held || held.wake_id !== wakeId || held.room_id !== state.room_id) {
     throw localError(
@@ -1469,6 +1623,13 @@ async function ackWake(args: string[], dependencies: GuestDependencies): Promise
       "This seat is not holding that wake, so nothing moved. `sharednet wait --ack manual` shows what is pending.",
     );
   }
+  // Asked for by name, so a refusal is reported and the wake stays held for another try.
+  const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  await pollThroughBlips(
+    () => client.request("POST", `/rooms/${encodeURIComponent(state.room_id)}/ack`, credential.member_token, { through: held.through }),
+    sleep,
+    dependencies,
+  );
   const lastSequence = Math.max(state.last_sequence, held.through);
   await writeProjectRoomState(dependencies.cwd, { ...state, last_sequence: lastSequence });
   const { rm } = await import("node:fs/promises");
@@ -1980,15 +2141,133 @@ function contentTypeFor(filename: string): string {
  * not hang forever, this never does. A daemon that exits on a long outage is a daemon that was
  * not running when the message finally came.
  */
+/**
+ * The local end of a seat's doorbell (wait PR 7): an HTTP listener on this machine that the service
+ * rings through a tunnel, ngrok on a laptop. A ring is checked against the seat's secret and its
+ * timestamp, answered at once, and only makes the seat look; it carries nothing to trust.
+ */
+async function openDoorbell(port: number, dependencies: GuestDependencies, signal: AbortSignal) {
+  const { createServer } = await import("node:http");
+  const { createHmac, timingSafeEqual } = await import("node:crypto");
+  const secrets = new Map<string, string>();
+  const pending = new Set<string>();
+  const waiters = new Map<string, (rung: boolean) => void>();
+  const server = createServer((request, response) => {
+    const match = /^\/sharednet\/push\/(i_[0-9A-Za-z]{10})$/.exec((request.url ?? "").split("?")[0]!);
+    if (request.method !== "POST" || !match) {
+      response.writeHead(404).end();
+      return;
+    }
+    const memberId = match[1]!;
+    const chunks: Buffer[] = [];
+    let size = 0;
+    request.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > 4096) request.destroy();
+      else chunks.push(chunk);
+    });
+    request.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      const secret = secrets.get(memberId);
+      const timestamp = String(request.headers["x-sharednet-timestamp"] ?? "");
+      const given = String(request.headers["x-sharednet-signature"] ?? "");
+      const expected = secret === undefined ? "" : `sha256=${createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex")}`;
+      // A ring more than five minutes off is a replay, or a clock to fix; either way it is refused.
+      const fresh = /^\d+$/.test(timestamp) && Math.abs(dependencies.now().getTime() - Number(timestamp) * 1000) <= 300_000;
+      const valid = secret !== undefined && fresh && given.length === expected.length && timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+      if (!valid) {
+        response.writeHead(401).end();
+        return;
+      }
+      response.writeHead(204).end();
+      const waiter = waiters.get(memberId);
+      if (waiter) {
+        waiters.delete(memberId);
+        waiter(true);
+      } else {
+        pending.add(memberId);
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "127.0.0.1", () => resolve());
+  });
+  signal.addEventListener(
+    "abort",
+    () => {
+      for (const [memberId, waiter] of waiters) {
+        waiters.delete(memberId);
+        waiter(false);
+      }
+    },
+    { once: true },
+  );
+  return {
+    register(memberId: string, secret: string) {
+      secrets.set(memberId, secret);
+    },
+    /** Resolves true when the seat is rung (or was, while it was busy), false once serve is stopping. */
+    rung(memberId: string): Promise<boolean> {
+      if (signal.aborted) return Promise.resolve(false);
+      if (pending.delete(memberId)) return Promise.resolve(true);
+      return new Promise((resolve) => waiters.set(memberId, resolve));
+    },
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+/** Where the service should ring: the public address given, or the https tunnel a local ngrok has open to this port. */
+async function doorbellAddress(option: string, port: number, dependencies: GuestDependencies): Promise<string> {
+  if (option !== "ngrok") {
+    try {
+      const url = new URL(option);
+      if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error();
+      return url.toString().replace(/\/$/, "");
+    } catch {
+      throw localError("invalid_arguments", "--push takes the public address that reaches --listen, such as https://abc.ngrok.app, or ngrok.");
+    }
+  }
+  type Tunnel = { public_url?: unknown; config?: { addr?: unknown } };
+  const listed = await dependencies
+    .fetch("http://127.0.0.1:4040/api/tunnels")
+    .then((response) => response.json() as Promise<{ tunnels?: Tunnel[] }>)
+    .catch(() => null);
+  const tunnels = Array.isArray(listed?.tunnels) ? listed.tunnels : [];
+  const https = tunnels.filter((tunnel) => typeof tunnel.public_url === "string" && tunnel.public_url.startsWith("https://"));
+  const tunnel = https.find((candidate) => String(candidate.config?.addr ?? "").endsWith(`:${port}`)) ?? https[0];
+  if (!tunnel) throw localError("ngrok_not_running", `No ngrok tunnel reaches port ${port}. Run: ngrok http ${port}`);
+  return String(tunnel.public_url).replace(/\/$/, "");
+}
+
+/** How often a running `serve` looks for seats joined since it started. */
+const RESCAN_MS = 5_000;
+/** One resumed turn may run this long before it is stopped. */
+const TURN_LIMIT_MS = 20 * 60_000;
+/**
+ * A backstop, not a budget: two seats that keep addressing each other would otherwise wake each
+ * other for ever. Past this many turns in an hour a seat's next wake waits for the hour to pass,
+ * and still carries everything said meanwhile.
+ */
+const MAX_TURNS_PER_HOUR = 30;
+/** The service takes a message of at most this many bytes. */
+const MAX_MESSAGE_BYTES = 32_768;
+
 async function serve(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["run", "reply", "rooms", "from-instance", "from-agent", "grep", "status", "stop"]);
+  assertOnlyOptions(parsed, ["run", "reply", "rooms", "from-instance", "from-agent", "grep", "status", "stop", "push", "listen"]);
   if (parsed.positionals.length !== 0) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet serve [--run '<command>'] [--reply] [--rooms all|rom_…,rom_…] [--grep TEXT] , or sharednet serve --status | --stop",
+      "Usage: sharednet serve [--run '<command>'] [--reply] [--rooms all|rom_…,rom_…] [--grep TEXT] [--push <public address>|ngrok [--listen <port>]], or sharednet serve --status | --stop",
     );
   }
+  const pushOption = stringOption(parsed, "push");
+  const listenOption = stringOption(parsed, "listen");
+  if (listenOption !== undefined && (pushOption === undefined || !/^\d+$/.test(listenOption) || Number(listenOption) < 1 || Number(listenOption) > 65535)) {
+    throw localError("invalid_arguments", "--listen takes a port from 1 to 65535, and goes with --push.");
+  }
+  const listen = listenOption === undefined ? 8787 : Number(listenOption);
   const paths = getStoragePaths(dependencies.env);
   if (parsed.options.get("status") === true) return readServeStatus(paths);
   if (parsed.options.get("stop") === true) return stopServe(paths, dependencies);
@@ -2004,44 +2283,179 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       if (!ROOM_ID_PATTERN.test(roomId)) throw localError("invalid_arguments", `--rooms takes Room ids such as rom_AbCdEfGhIj, or all. Got ${roomId}.`);
     }
   }
+  // Without --run there is nothing to do for a seat but resume the session that took it, so only
+  // those seats are served. Any other seat is left to its own waits: a connector that sat in it
+  // would count what it never handled as handled, and that seat's next `wait` would miss it.
+  const served = (seat: StoredRoomCredential) => (only ? only.has(seat.room_id) : true) && (command !== undefined || seat.wake !== undefined);
 
-  const seats = (await heldSeats(paths)).filter((seat) => (only ? only.has(seat.room_id) : true));
+  const held = await heldSeats(paths);
+  const seats = held.filter(served);
   if (seats.length === 0) {
     throw localError(
       "not_in_a_room",
-      only
-        ? "This machine holds no seat in the Rooms named by --rooms."
-        : "This machine holds no Room seats yet. Run: sharednet join <invite>",
+      held.length === 0
+        ? "This machine holds no Room seats yet. Run: sharednet join <invite>"
+        : only && !held.some((seat) => only.has(seat.room_id))
+          ? "This machine holds no seat in the Rooms named by --rooms."
+          : "No seat here was joined from a Codex or Claude Code session, so there is no session to wake. Give --run '<command>' to serve every seat with a command.",
+    );
+  }
+
+  // One connector per machine. Two would each resume the same session for the same line.
+  const started = dependencies.now().toISOString();
+  const statusOf = (all: StoredRoomCredential[]): ServeStatus => ({
+    pid: process.pid,
+    started_at: started,
+    rooms: [...new Set(all.map((seat) => seat.room_id))],
+    drives: !command,
+    seats: all.map((seat) => ({
+      room_id: seat.room_id,
+      member_id: seat.member_id,
+      name: seat.name,
+      resumes: !command && seat.wake ? `${seat.wake.driver} ${seat.wake.session}` : null,
+    })),
+  });
+  const holder = await claimServe(paths, statusOf(seats));
+  if (holder !== null) {
+    throw localError(
+      "serve_running",
+      `${holder === 0 ? "Another connector is starting on this machine" : `A connector is already running on this machine (pid ${holder})`}; it serves every seat here, including ones joined after it started. Stop it first with: sharednet serve --stop`,
     );
   }
 
   const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const exec = dependencies.exec ?? defaultExec;
-  const started = dependencies.now().toISOString();
-  await writeServeStatus(paths, { pid: process.pid, started_at: started, rooms: seats.map((seat) => seat.room_id) });
-  dependencies.stderr?.(`serve: sitting in ${seats.length} Room(s): ${seats.map((seat) => seat.room_id).join(", ")}\n`);
+  const drive = dependencies.runTurn ?? runTurn;
 
-  // One loop per Room. They never await each other, so a slow or broken Room cannot make another
-  // Room miss a message.
-  const loops = seats.map(async (seat) => {
-    const client = new ApiClient(seat.base_url, boundedFetch(dependencies, null, false));
-    // The connector keeps its own cursor per Room. The project cursor belongs to a checkout and a
-    // daemon is not in one; and a cursor that survives a restart is the whole difference between
-    // a wake that was delayed and one that was lost. With no cursor yet it starts at the Room's
-    // current end, so a first start does not replay the entire history as if it were new.
-    const me = seat.member_id;
-    let cursor = await readServeCursor(paths, seat.room_id, seat.member_id);
-    if (cursor === null) {
-      cursor = await roomEnd(client, seat).catch(() => 0);
-      await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
+  // With --push the seats sit behind a doorbell (wait PR 7): no long-poll, and not one request while
+  // nothing is said. Ctrl-C takes the doorbells down before it goes.
+  const stopping = new AbortController();
+  const stop = () => stopping.abort();
+  dependencies.signal?.addEventListener("abort", stop, { once: true });
+  let doorbell: Awaited<ReturnType<typeof openDoorbell>> | null = null;
+  let base: string | null = null;
+  try {
+    if (pushOption !== undefined) {
+      base = await doorbellAddress(pushOption, listen, dependencies);
+      doorbell = await openDoorbell(listen, dependencies, stopping.signal);
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
     }
+  } catch (error) {
+    await releaseServe(paths);
+    throw error;
+  }
+
+  dependencies.stderr?.(`serve: sitting in ${seats.length} Room(s): ${seats.map((seat) => seat.room_id).join(", ")}\n`);
+  if (base !== null) dependencies.stderr?.(`serve: doorbell at ${base}/sharednet/push/<seat>, listening on 127.0.0.1:${listen}; idle until rung\n`);
+
+  const sitIn = async (seat: StoredRoomCredential) => {
+    const client = new ApiClient(seat.base_url, boundedFetch(dependencies, null, false));
+    const me = seat.member_id;
+    // A seat taken from inside a Codex or Claude Code session is driven: being addressed resumes
+    // that session (the drivers). An explicit --run serves every seat with the command instead.
+    const driving = !command && seat.wake !== undefined;
+    // Driven, a seat wakes when a line addresses it; the wake still carries everything said since.
+    const seatFilters = driving ? new URLSearchParams({ mentions: me }) : filters;
+    if (driving) {
+      dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} (${me}) resumes ${seat.wake!.driver} session ${seat.wake!.session} when addressed\n`);
+    }
+    const turns: number[] = [];
+    // An account's seat can be handed a new token while this runs (its session registered again);
+    // the session file holds the current one, which is the one `say` and `wait` use too.
+    const current = async () => {
+      if (!seat.member_id.startsWith("i_")) return;
+      const session = await readSessionById(paths, seat.member_id).catch(() => null);
+      if (session && sameOrigin(session.base_url, seat.base_url)) seat.member_token = session.instance_token;
+    };
+    await current();
+    // The place is the service's (wait PR 5), shared with every other door this seat uses; the
+    // connector's file mirrors it. A seat that has handled nothing anywhere starts at the Room's
+    // current end, so a first start does not hand over the whole history as if it were new.
+    let cursor: number;
+    try {
+      const mirrored = await readServeCursor(paths, seat.room_id, seat.member_id);
+      const kept = await keptPlace(client, seat.room_id, seat.member_token, mirrored ?? 0, sleep, dependencies);
+      // A driven seat's join counted the history as handled, so its place is exact from then on, and
+      // what was said since is the session's to hear when it is next woken.
+      cursor = driving || kept > 0 || mirrored !== null ? kept : await roomEnd(client, seat).catch(() => 0);
+      if (cursor > kept) await acknowledgeThrough(client, seat.room_id, seat.member_token, cursor, sleep, dependencies);
+    } catch (error) {
+      if (!(error instanceof CliError)) throw error;
+      dependencies.stderr?.(`serve: ${seat.room_id} stopped: ${error.code}\n`);
+      return;
+    }
+    await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
+    if (doorbell !== null && base !== null) {
+      try {
+        const set = await client.request<{ push?: { secret?: unknown } }>("PUT", `/rooms/${encodeURIComponent(seat.room_id)}/subscription`, seat.member_token, {
+          push_url: `${base}/sharednet/push/${seat.member_id}`,
+        });
+        if (typeof set?.push?.secret !== "string") throw invalidServerResponse();
+        doorbell.register(seat.member_id, set.push.secret);
+      } catch (error) {
+        if (!(error instanceof CliError)) throw error;
+        dependencies.stderr?.(`serve: ${seat.room_id} has no doorbell (${error.code}); stopped\n`);
+        return;
+      }
+    }
+    const handled = async (through: number) => {
+      cursor = through;
+      await acknowledgeThrough(client, seat.room_id, seat.member_token, cursor, sleep, dependencies);
+      await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
+    };
+    /** One wake of a driven seat: its own session, resumed with what was said. */
+    const resumeSession = async (said: MessageShape[], from: number, through: number) => {
+      const hour = dependencies.now().getTime() - 3_600_000;
+      while (turns.length > 0 && turns[0]! <= hour) turns.shift();
+      if (turns.length >= MAX_TURNS_PER_HOUR) {
+        const wait = turns[0]! + 3_600_000 - dependencies.now().getTime();
+        dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} was resumed ${turns.length} times in the last hour; the next turn waits ${Math.ceil(wait / 60_000)} min\n`);
+        await sleep(Math.max(wait, 0));
+      }
+      turns.push(dependencies.now().getTime());
+      // The seat file names the session to resume; a later join from another session replaces it.
+      const wake = (await readRoomCredential(paths, seat.room_id, seat.member_id).catch(() => null))?.wake ?? seat.wake!;
+      const prompt = wakeTurnPrompt({ roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through });
+      dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed; resuming ${wake.driver} session ${wake.session} with #${from + 1}..#${through}\n`);
+      const outcome = await drive(turnSpec(wake, prompt, dependencies.env, seat.member_id, TURN_LIMIT_MS));
+      const summary = turnSummary(wake.driver, outcome.stdout);
+      const post = (content: string) =>
+        client.request("POST", `/rooms/${encodeURIComponent(seat.room_id)}/messages`, seat.member_token, { content }, { "idempotency-key": randomUUID() });
+      if (summary.ok && outcome.exitCode === 0) {
+        // The turn's last message is the seat's reply; the session does not have to reach the Room.
+        const answer = replyFrom(summary.said, MAX_MESSAGE_BYTES);
+        dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} finished its turn${answer ? `: ${answer.replace(/\s+/g, " ").slice(0, 160)}` : " with nothing to say"}\n`);
+        if (answer) {
+          await post(answer).catch((error: unknown) => {
+            dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name}'s reply was not posted (${error instanceof CliError ? error.code : "error"})\n`);
+          });
+        }
+        return;
+      }
+      // The Room hears the harness's own words, or the exit code; the machine's output stays in the log.
+      const why = outcome.timedOut
+        ? `it ran past ${TURN_LIMIT_MS / 60_000} minutes and was stopped`
+        : (summary.said?.trim() || `the ${wake.driver} command exited ${outcome.exitCode}`).slice(0, 200);
+      const detail = outcome.stderr.trim().split("\n").slice(-3).join(" / ").slice(0, 400);
+      dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} could not be resumed: ${why}${detail ? ` (${detail})` : ""}\n`);
+      // Whoever addressed the seat would otherwise hear nothing at all, and not know why.
+      await post(`(${seat.name} was addressed, but its ${wake.driver === "codex" ? "Codex" : "Claude Code"} session could not be resumed: ${why})`).catch(() => undefined);
+    };
+
     // Where the long-poll resumes. Without a filter it is the cursor. With one it can run ahead, past
     // the seat's own matching words, while the cursor stays at what has been handed over.
     let polled = cursor;
+    let idle = false;
     for (;;) {
+      if (stopping.signal.aborted) return;
+      // Behind a doorbell there is no long-poll: once nothing is left to hand over, the seat waits to
+      // be rung, and looks once when it is.
+      if (doorbell !== null && idle && !(await doorbell.rung(seat.member_id))) return;
+      await current();
       let page: PageShape;
       try {
-        page = await waitPage(client, seat.room_id, seat.member_token, polled, WAIT_MAX_SECONDS, filters);
+        page = await waitPage(client, seat.room_id, seat.member_token, polled, doorbell !== null ? 0 : WAIT_MAX_SECONDS, seatFilters);
       } catch (error) {
         // Three different things, and treating them alike was wrong. Unreachable is temporary and
         // is waited out forever, because that is the whole job. A refusal — a revoked seat, a
@@ -2058,12 +2472,13 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         await sleep(10_000);
         continue;
       }
+      idle = page.items.length === 0;
       polled = highestSequence(page.items, polled);
       const matched = page.items.filter((item) => !isOwn(item, me, seat.member_id));
-      if (matched.length === 0 && filters.size > 0) continue;
+      if (matched.length === 0 && seatFilters.size > 0) continue;
       // A filter chose the moment; the wake still carries everything said since the last one.
       let others = matched;
-      if (filters.size > 0) {
+      if (seatFilters.size > 0) {
         try {
           others = (await everythingSaid(client, seat.room_id, seat.member_token, cursor, polled)).filter(
             (item) => !isOwn(item, me, seat.member_id),
@@ -2076,8 +2491,13 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
           continue;
         }
       }
-      cursor = polled;
-      await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
+      if (driving && others.length > 0) {
+        await resumeSession(others, cursor, polled);
+        // Handled only now, so a wake cut short by a crash or a restart is handed over again.
+        await handled(polled);
+        continue;
+      }
+      if (polled > cursor) await handled(polled);
       if (others.length === 0) continue;
       dependencies.stderr?.(`serve: ${seat.room_id} woke on ${others.length} message(s) through sequence ${cursor}\n`);
       if (!command) continue;
@@ -2101,9 +2521,70 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
           });
       }
     }
-  });
-  await Promise.all(loops);
-  return { served: seats.length };
+
+  };
+
+  // Every seat gets its own loop, and no loop awaits another, so a slow or broken Room cannot make
+  // another Room miss a message. A seat joined while this runs is picked up by the next look.
+  const loops = new Map<string, Promise<void>>();
+  const sitting: StoredRoomCredential[] = [];
+  let live = 0;
+  let failure: unknown = null;
+  let finish: () => void = () => undefined;
+  const finished = new Promise<void>((resolve) => (finish = resolve));
+  const begin = (seat: StoredRoomCredential) => {
+    const key = `${seat.room_id}/${seat.member_id}`;
+    if (loops.has(key)) return false;
+    sitting.push(seat);
+    live += 1;
+    loops.set(
+      key,
+      sitIn(seat).then(
+        () => {
+          live -= 1;
+          if (live === 0) finish();
+        },
+        (error: unknown) => {
+          failure ??= error;
+          finish();
+        },
+      ),
+    );
+    return true;
+  };
+  for (const seat of seats) begin(seat);
+  let looking = false;
+  const rescan = setInterval(() => {
+    if (looking || stopping.signal.aborted) return;
+    looking = true;
+    void heldSeats(paths)
+      .then(async (all) => {
+        const fresh = all.filter(served).filter(begin);
+        if (fresh.length === 0) return;
+        dependencies.stderr?.(`serve: now also sitting in ${fresh.map((seat) => `${seat.room_id} as ${seat.name}`).join(", ")}\n`);
+        await writeServeStatus(paths, statusOf(all.filter(served)));
+      })
+      .catch(() => undefined)
+      .finally(() => (looking = false));
+  }, RESCAN_MS);
+  await finished;
+  clearInterval(rescan);
+  if (doorbell !== null) {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    // The service stops ringing an address nobody answers; taking the doorbells down says so now.
+    await Promise.all(
+      sitting.map((seat) =>
+        new ApiClient(seat.base_url, boundedFetch(dependencies, null, true))
+          .request("PUT", `/rooms/${encodeURIComponent(seat.room_id)}/subscription`, seat.member_token, { push_url: null })
+          .catch(() => undefined),
+      ),
+    );
+    await doorbell.close();
+  }
+  await releaseServe(paths);
+  if (failure !== null) throw failure;
+  return { served: loops.size };
 }
 
 /** Where the connector remembers how far it has read in one Room. */
@@ -2135,7 +2616,14 @@ async function roomEnd(client: ApiClient, seat: StoredRoomCredential): Promise<n
   return page.items[0]?.sequence ?? 0;
 }
 
-type ServeStatus = { pid: number; started_at: string; rooms: string[] };
+type ServeStatus = {
+  pid: number;
+  started_at: string;
+  rooms: string[];
+  /** True for a connector that resumes sessions; one running a --run command, or an older one, does not. */
+  drives?: boolean;
+  seats?: Array<{ room_id: string; member_id: string; name: string; resumes: string | null }>;
+};
 
 function serveStatusPath(paths: ReturnType<typeof getStoragePaths>): string {
   return joinPath(paths.configDir, "serve.json");
@@ -2144,6 +2632,39 @@ function serveStatusPath(paths: ReturnType<typeof getStoragePaths>): string {
 async function writeServeStatus(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus): Promise<void> {
   await mkdir(paths.configDir, { recursive: true, mode: 0o700 });
   await writeFile(serveStatusPath(paths), `${JSON.stringify(status)}\n`, { mode: 0o600 });
+}
+
+/**
+ * Takes the machine's one connector slot: null when it is now this process's, or the pid of the
+ * live connector that holds it. A slot whose process is gone is taken over.
+ */
+async function claimServe(paths: ReturnType<typeof getStoragePaths>, status: ServeStatus): Promise<number | null> {
+  await mkdir(paths.configDir, { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await writeFile(serveStatusPath(paths), `${JSON.stringify(status)}\n`, { mode: 0o600, flag: "wx" });
+      return null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    let holder: { running?: boolean; pid?: number };
+    try {
+      holder = (await readServeStatus(paths)) as { running?: boolean; pid?: number };
+    } catch {
+      // Being written this moment by a connector that is starting.
+      return 0;
+    }
+    // A connector run inside this very process (a test, an embedding) is this process's own.
+    if (holder.running && holder.pid && holder.pid !== process.pid) return holder.pid;
+    await unlink(serveStatusPath(paths)).catch(() => undefined);
+  }
+  return 0;
+}
+
+/** Gives the slot back, if it is still this process's. */
+async function releaseServe(paths: ReturnType<typeof getStoragePaths>): Promise<void> {
+  const status = (await readServeStatus(paths).catch(() => null)) as { pid?: number } | null;
+  if (status?.pid === process.pid) await unlink(serveStatusPath(paths)).catch(() => undefined);
 }
 
 /** `running` is checked, not claimed: a status file outlives the process that wrote it. */
@@ -2173,7 +2694,30 @@ async function stopServe(paths: ReturnType<typeof getStoragePaths>, dependencies
   return { stopped: true, pid: status.pid };
 }
 
+const TIMER_USAGE =
+  "Usage: sharednet timer add '<every 20m | cron 0 9 * * 1-5 | after 2h | at 2026-10-06T09:00Z>' '<what the clock says>', sharednet timer list, or sharednet timer cancel <tm_…> [--as <member_id>]";
+
+/**
+ * `sharednet timer`: a line the Room's clock says on a schedule (wait PR 6), whether or not any
+ * process is running. Name a seat in it ("@alpha review the open PRs") to wake that seat on
+ * schedule; a cron is read in UTC.
+ */
+async function timer(args: string[], dependencies: GuestDependencies): Promise<unknown> {
+  const parsed = parseGuestArguments(args);
+  assertOnlyOptions(parsed, ["as"]);
+  const [action, ...rest] = parsed.positionals;
+  const valid =
+    action === "add" ? rest.length === 2 : action === "list" ? rest.length === 0 : action === "cancel" ? rest.length === 1 && /^tm_[0-9A-Za-z]{10}$/.test(rest[0]!) : false;
+  if (!valid) throw localError("invalid_arguments", TIMER_USAGE);
+  const { client, state, credential } = await currentSeat(dependencies, stringOption(parsed, "as"));
+  const timers = `/rooms/${encodeURIComponent(state.room_id)}/timers`;
+  if (action === "list") return client.request("GET", timers, credential.member_token);
+  if (action === "cancel") return client.request("POST", `${timers}/${rest[0]}/cancel`, credential.member_token);
+  return client.request("POST", timers, credential.member_token, { when: rest[0], say: rest[1] });
+}
+
 export type GuestVerb =
+  | "timer"
   | "serve"
   | "whoami"
   | "join"
@@ -2198,6 +2742,7 @@ export type GuestVerb =
 
 export function isGuestVerb(value: string | undefined): value is GuestVerb {
   return (
+    value === "timer" ||
     value === "serve" ||
     value === "whoami" ||
     value === "join" ||
@@ -2227,6 +2772,7 @@ export async function runGuestVerb(
   args: string[],
   dependencies: GuestDependencies,
 ): Promise<unknown> {
+  if (verb === "timer") return timer(args, dependencies);
   if (verb === "serve") return serve(args, dependencies);
   if (verb === "whoami") return whoami(args, dependencies);
   if (verb === "join") return join(args, dependencies);
