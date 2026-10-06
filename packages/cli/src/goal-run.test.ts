@@ -1,0 +1,378 @@
+// @vitest-environment node
+
+import { realpathSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import type { ApiClient } from "./api-client.ts";
+import {
+  AGENT_DOCKERFILE,
+  DEFAULT_IMAGE,
+  TurnReader,
+  codexSessionUsage,
+  containerName,
+  freshTokens,
+  loopbackPort,
+  openingPrompt,
+  parseAgents,
+  prepareRun,
+  runGoal,
+  scrubHome,
+  turnCommand,
+  wakePrompt,
+  type DockerRunner,
+  type RunPlan,
+} from "./goal-run.ts";
+
+const ROOM = "rom_AbCdEfGhIj";
+const OWNER_KEY = "snk_owner-key-never-in-a-container";
+const INVITE = "rit_invite-token-travels-by-environment";
+
+const cleanup: string[] = [];
+afterEach(async () => {
+  await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
+
+async function temporary() {
+  const dir = await mkdtemp(join(tmpdir(), "sharednet-goal-run-"));
+  cleanup.push(dir);
+  return dir;
+}
+
+describe("--agent", () => {
+  it("names each seat after its driver, and takes a model after a colon", () => {
+    expect(parseAgents(["codex:gpt-6-luna", "codex", "claude-code:claude-sonnet-5-5"])).toEqual([
+      { name: "codex-1", driver: "codex", model: "gpt-6-luna" },
+      { name: "codex-2", driver: "codex", model: null },
+      { name: "claude-code-1", driver: "claude-code", model: "claude-sonnet-5-5" },
+    ]);
+    for (const raws of [[], ["gemini"], ["codex:bad model"], Array.from({ length: 9 }, () => "codex")]) {
+      expect(() => parseAgents(raws), raws.join(" ")).toThrow();
+    }
+  });
+});
+
+describe("a turn", () => {
+  it("starts a harness with nothing asked of a person, and resumes the same session on the next wake", () => {
+    const codex = { name: "codex-1", driver: "codex" as const, model: "gpt-6-luna" };
+    expect(turnCommand(codex, "the goal", null)).toEqual([
+      "timeout", "1200", "codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", 'web_search="live"', "-m", "gpt-6-luna", "the goal",
+    ]);
+    expect(turnCommand(codex, "new lines", "thread-1").slice(2, 5)).toEqual(["codex", "exec", "resume"]);
+    expect(turnCommand(codex, "new lines", "thread-1").slice(-2)).toEqual(["thread-1", "new lines"]);
+    const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
+    expect(turnCommand(claude, "new lines", "session-1")).toEqual([
+      "timeout", "1200", "claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--resume", "session-1", "new lines",
+    ]);
+  });
+
+  it("reads the session to resume and the spend from each harness's own stream, cached reads apart", () => {
+    const codex = new TurnReader("codex");
+    for (const event of [
+      { type: "thread.started", thread_id: "thread-1" },
+      { type: "turn.completed", usage: { input_tokens: 1_000, cached_input_tokens: 800, output_tokens: 50 } },
+    ]) {
+      codex.line(JSON.stringify(event));
+    }
+    codex.line("not json");
+    // Codex counts cached input inside input_tokens; only 200 of the 1,000 were read fresh.
+    expect(codex.reading).toEqual({ sessionId: "thread-1", usage: { input: 200, cached: 800, output: 50 }, failed: false });
+    expect(freshTokens(codex.reading.usage)).toBe(250);
+    const failed = new TurnReader("codex");
+    failed.line(JSON.stringify({ type: "turn.failed", error: { message: "quota" } }));
+    expect(failed.reading.failed).toBe(true);
+
+    const claude = new TurnReader("claude-code");
+    claude.line(JSON.stringify({ type: "system", subtype: "init", session_id: "session-1" }));
+    claude.line(JSON.stringify({ type: "result", session_id: "session-1", is_error: false, usage: { input_tokens: 10, cache_creation_input_tokens: 200, cache_read_input_tokens: 3_000, output_tokens: 40 } }));
+    expect(claude.reading).toEqual({ sessionId: "session-1", usage: { input: 210, cached: 3_000, output: 40 }, failed: false });
+  });
+
+  it("reads a Codex session file's own running total, the last one written", () => {
+    const line = (total: Record<string, number> | null) => JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: total ? { total_token_usage: total } : null } });
+    const rollout = [
+      JSON.stringify({ type: "session_meta", payload: { id: "thread-1" } }),
+      line(null),
+      line({ input_tokens: 1_000, cached_input_tokens: 900, output_tokens: 10 }),
+      line({ input_tokens: 2_449_151, cached_input_tokens: 2_321_664, output_tokens: 9_678 }),
+      '{"type":"event_msg","payload":{"type":"token_cou',
+    ].join("\n");
+    expect(codexSessionUsage(rollout)).toEqual({ input: 127_487, cached: 2_321_664, output: 9_678 });
+    expect(codexSessionUsage("")).toBeNull();
+  });
+
+  it("tells each Agent who it is, the goal, how the Room ends, and how to speak; a wake carries what was said", () => {
+    const seats = parseAgents(["codex", "claude-code"]);
+    const opening = openingPrompt({ seat: seats[0]!, seats, roomId: ROOM, goal: "Make the tests pass.\n", goalSequence: 1, until: ["check pytest -q", "said DONE", "after 1h"] });
+    expect(opening).toContain("You are codex-1, one of 2 agents");
+    expect(opening).toContain("The others: claude-code-1.");
+    expect(opening).toContain("<goal>\nMake the tests pass.\n</goal>");
+    expect(opening).toContain('Say "DONE" in the Room only when you believe the goal is met');
+    expect(opening).toContain("Do not run `sharednet wait`");
+    const wake = wakePrompt({
+      wake_id: "wk_1",
+      fired: ["message"],
+      from: 3,
+      through: 5,
+      events: [],
+      messages: [
+        { sequence: 4, content: "I take the parser.", sender: { member_id: "i_b", name: "claude-code-1" } },
+        { sequence: 5, content: "check failed", sender: { member_id: "i_r", name: "runner" } },
+      ],
+    });
+    expect(wake).toContain("#4 claude-code-1: I take the parser.");
+    expect(wake).toContain("#5 runner: check failed");
+  });
+
+  it("forwards only a development service on this machine's loopback into the container", () => {
+    expect(loopbackPort("http://127.0.0.1:3117")).toBe(3117);
+    expect(loopbackPort("https://www.sharednet.ai")).toBeNull();
+  });
+});
+
+type DockerCall = { args: readonly string[]; env: Record<string, string>; input?: string };
+
+/** Docker as goal run uses it, answering from a script. */
+function fakeDocker(answer: (call: DockerCall, command: readonly string[]) => { code?: number; stdout?: string; stderr?: string; lines?: string[] } | Promise<{ code?: number; stdout?: string; stderr?: string; lines?: string[] }>) {
+  const calls: DockerCall[] = [];
+  const docker: DockerRunner = async (args, options = {}) => {
+    const call: DockerCall = { args, env: options.env ?? {}, ...(options.input === undefined ? {} : { input: options.input }) };
+    calls.push(call);
+    const container = args.indexOf(containerName(ROOM));
+    const command = args[0] === "exec" && container !== -1 ? args.slice(container + 1) : [];
+    const result = await answer(call, command);
+    for (const line of result.lines ?? []) options.onLine?.(line);
+    return { code: result.code ?? 0, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+  };
+  return { docker, calls };
+}
+
+describe("prepareRun", () => {
+  const agents = parseAgents(["codex", "claude-code"]);
+
+  it("refuses before anything exists: no Docker, a missing image, or a driver that cannot sign in", async () => {
+    const home = await temporary();
+    const entry = join(home, "cli", "src", "main.ts");
+    await mkdir(join(home, "cli", "src"), { recursive: true });
+    await writeFile(join(home, "cli", "package.json"), "{}");
+    const base = { agents, image: null, workspace: home, home, entry };
+    const down = fakeDocker(() => ({ code: 1 }));
+    const pause = async () => undefined;
+    await expect(prepareRun({ ...base, env: {} }, down.docker, () => undefined, pause)).rejects.toMatchObject({ code: "docker_unavailable" });
+
+    const noImage = fakeDocker((call) => ({ code: call.args[0] === "image" ? 1 : 0 }));
+    await expect(prepareRun({ ...base, image: "mine:1", env: {} }, noImage.docker, () => undefined, pause)).rejects.toMatchObject({ code: "image_not_found" });
+    // No Codex login and no key: refused, though the image was built.
+    await expect(prepareRun({ ...base, env: { ANTHROPIC_API_KEY: "sk-test" } }, noImage.docker, () => undefined, pause)).rejects.toMatchObject({ code: "agent_auth_missing" });
+    expect(noImage.calls.find((call) => call.args[0] === "build")).toMatchObject({ args: ["build", "-t", DEFAULT_IMAGE, "-"], input: AGENT_DOCKERFILE });
+
+    // Docker Desktop waking from idle: the image is there on the third look, and nothing is built.
+    let looks = 0;
+    const waking = fakeDocker((call) => ({ code: call.args[0] === "image" && ++looks < 3 ? 1 : 0 }));
+    await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-test", ANTHROPIC_API_KEY: "sk-test" } }, waking.docker, () => undefined, pause);
+    expect(looks).toBe(3);
+    expect(waking.calls.some((call) => call.args[0] === "build")).toBe(false);
+
+    await mkdir(join(home, ".codex"), { recursive: true });
+    await writeFile(join(home, ".codex", "auth.json"), "{}");
+    const ready = fakeDocker(() => ({ code: 0 }));
+    await expect(prepareRun({ ...base, env: {} }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "agent_auth_missing" });
+    const plan = await prepareRun({ ...base, env: { CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat-test" } }, ready.docker, () => undefined);
+    expect(plan).toMatchObject({
+      image: DEFAULT_IMAGE,
+      codexAuth: { kind: "login", file: realpathSync(join(home, ".codex", "auth.json")) },
+      claudeAuth: "CLAUDE_CODE_OAUTH_TOKEN",
+      cli: { root: join(home, "cli"), entry: join("src", "main.ts") },
+    });
+    const withKey = await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-test", ANTHROPIC_API_KEY: "sk-test" } }, ready.docker, () => undefined);
+    expect(withKey).toMatchObject({ codexAuth: { kind: "api-key" }, claudeAuth: "ANTHROPIC_API_KEY" });
+  });
+});
+
+describe("runGoal", () => {
+  it("runs every seat in turns until the budget is spent, keeps each Agent's trace, and never hands the owner's key to the container", async () => {
+    const out = await temporary();
+    const workspace = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents(["codex:gpt-6-luna", "codex"]),
+      workspace,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "login", file: "/Users/someone/.codex/auth.json" },
+      claudeAuth: null,
+    };
+    const waits = new Map<string, number>();
+    const turnsTaken = new Map<string, number>();
+    const { docker, calls } = fakeDocker(async (call, command) => {
+      const seat = call.args.find((arg) => arg.startsWith("SHAREDNET_SEAT="))?.slice("SHAREDNET_SEAT=".length) ?? null;
+      if (command[0] === "sharednet" && command[1] === "join") {
+        const name = command[command.indexOf("--name") + 1]!;
+        return { stdout: JSON.stringify({ member_id: name === "codex-1" ? "i_CodexOne01" : "i_CodexTwo02" }) };
+      }
+      if (command[2] === "codex") {
+        const resumed = command[4] === "resume";
+        const turn = (turnsTaken.get(seat!) ?? 0) + 1;
+        turnsTaken.set(seat!, turn);
+        // A resumed session reports its running total: 300 fresh tokens per turn here.
+        return {
+          lines: [
+            ...(resumed ? [] : [JSON.stringify({ type: "thread.started", thread_id: `thread-${seat}` })]),
+            JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "on it" } }),
+            JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1_000 * turn, cached_input_tokens: 800 * turn, output_tokens: 100 * turn } }),
+          ],
+        };
+      }
+      if (command[0] === "sharednet" && command[1] === "wait") {
+        const count = (waits.get(seat!) ?? 0) + 1;
+        waits.set(seat!, count);
+        // One wake each, then the Room closes.
+        const wake =
+          count === 1
+            ? { wake_id: `wk_${seat}`, fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: "split it", sender: { member_id: "i_x", name: "codex-x" } }] }
+            : { wake_id: null, fired: ["closed"], from: 2, through: 2, events: [{ kind: "closed" }], messages: [] };
+        return { stdout: JSON.stringify(wake) };
+      }
+      if (call.args[0] === "cp") {
+        const target = call.args[2]!;
+        await mkdir(join(target, ".config", "sharednet", "rooms"), { recursive: true });
+        await writeFile(join(target, ".config", "sharednet", "rooms", "seat.json"), '{"member_token":"sni_secret"}');
+        await mkdir(join(target, ".codex", "sessions", "2026", "10", "05"), { recursive: true });
+        await writeFile(join(target, ".codex", "auth.json"), "{}");
+        // codex-1's session file saw more than its stream reported: a turn the end cut.
+        const total = target.includes("codex-1")
+          ? { input_tokens: 5_000, cached_input_tokens: 4_000, output_tokens: 300 }
+          : { input_tokens: 2_000, cached_input_tokens: 1_600, output_tokens: 200 };
+        const session = target.includes("codex-1") ? "thread-i_CodexOne01" : "thread-i_CodexTwo02";
+        await writeFile(
+          join(target, ".codex", "sessions", "2026", "10", "05", `rollout-2026-10-05T12-00-00-${session}.jsonl`),
+          `${JSON.stringify({ type: "event_msg", payload: { type: "token_count", info: { total_token_usage: total } } })}\n`,
+        );
+      }
+      return {};
+    });
+
+    // The Room as goal watch reads it: the budget is the end that fires.
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["budget 1k tokens", "after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    const requests: string[] = [];
+    const client = {
+      async request(method: string, path: string, token: string, body?: unknown) {
+        requests.push(`${method} ${path} ${token}`);
+        if (method === "GET" && path === `/rooms/${ROOM}`) return { room: { id: ROOM, state: "open", goal }, memberships: [] };
+        if (method === "GET" && path.startsWith(`/rooms/${ROOM}/wait?`)) {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return { items: [] };
+        }
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) {
+          return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: "2026-10-05T12:05:00.000Z" } } } };
+        }
+        throw new Error(`unexpected ${method} ${path}`);
+      },
+    } as unknown as ApiClient;
+
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    const result = await runGoal(
+      client,
+      "sni_owner-seat",
+      OWNER_KEY,
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "Make it pass.", goalSequence: 1, until: goal.until, baseUrl: "http://127.0.0.1:3117", out, checkEveryMs: 60_000, quietChecks: false },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
+    );
+
+    // Two turns each, 300 fresh tokens a turn: the budget ends the goal at 1,200, cached reads uncounted.
+    expect(result.ended_by).toMatchObject({ trigger: "budget 1k tokens", detail: "1200 tokens" });
+    // The record then takes each session's own file: codex-1's saw a cut turn (1,300), codex-2's matches its stream (600).
+    expect(result.tokens).toBe(1_900);
+    expect(result.agents.map((seat) => [seat.name, seat.tokens, seat.usage])).toEqual([
+      ["codex-1", 1_300, { input: 1_000, cached: 4_000, output: 300 }],
+      ["codex-2", 600, { input: 400, cached: 1_600, output: 200 }],
+    ]);
+    expect(result.agents.map((seat) => [seat.name, seat.member_id, seat.session_id, seat.turns])).toEqual([
+      ["codex-1", "i_CodexOne01", "thread-i_CodexOne01", 2],
+      ["codex-2", "i_CodexTwo02", "thread-i_CodexTwo02", 2],
+    ]);
+
+    // The second turn resumes the first turn's session, with the wake as its prompt, and the wake is then acknowledged.
+    const turns = calls.filter((call) => call.args.includes("codex"));
+    expect(turns.filter((call) => call.args.includes("resume") && call.args.includes("thread-i_CodexOne01"))).toHaveLength(1);
+    expect(calls.some((call) => call.args.join(" ").endsWith("sharednet ack wk_i_CodexOne01 --json"))).toBe(true);
+    // Each seat joins with the invite in its environment, under its own home and name.
+    const join1 = calls.find((call) => call.args.includes("join") && call.args.includes("codex-1"))!;
+    expect(join1.env).toMatchObject({ SHAREDNET_INVITE_TOKEN: INVITE, CODEX_SESSION_ID: "goal-codex-1" });
+    expect(join1.args).toContain("HOME=/home/agents/codex-1");
+    // The Agents use the runner's own address: the port is forwarded to this machine inside the container.
+    expect(join1.args).toContain("SHAREDNET_BASE_URL=http://127.0.0.1:3117");
+    expect(calls.find((call) => call.args.includes("--detach") && call.args[0] === "exec")!.args.slice(-1)).toEqual(["3117"]);
+    expect(join1.args.join(" ")).not.toContain(INVITE);
+    // The owner's key reads and closes the Room from this machine; no call into Docker ever carries it.
+    expect(requests.some((line) => line === `POST /rooms/${ROOM}/close ${OWNER_KEY}`)).toBe(true);
+    expect(calls.every((call) => !JSON.stringify(call).includes(OWNER_KEY))).toBe(true);
+    // The Codex login is mounted for the seats; the container is stopped, copied out, and removed.
+    expect(calls.find((call) => call.args[0] === "run")!.args).toContain("/Users/someone/.codex/auth.json:/run/codex/auth.json");
+    const kinds = calls.map((call) => call.args[0]);
+    expect(kinds.lastIndexOf("stop")).toBeLessThan(kinds.indexOf("cp"));
+    expect(calls.at(-1)!.args).toEqual(["rm", "--force", containerName(ROOM)]);
+
+    // The record: one line per turn, each Agent's stream and home, the token totals.
+    const wakes = (await readFile(join(out, "wakes.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(wakes).toHaveLength(4);
+    expect(wakes.find((line) => line.seat === "codex-1" && line.turn === 2)).toMatchObject({ wake_id: "wk_i_CodexOne01", fired: ["message"], tokens: 300 });
+    expect(await readFile(join(out, "agents", "codex-1", "turn-001.jsonl"), "utf8")).toContain("thread.started");
+    const home = join(out, "agents", "codex-1", "home");
+    expect(await readFile(join(home, ".codex", "sessions", "2026", "10", "05", "rollout-2026-10-05T12-00-00-thread-i_CodexOne01.jsonl"), "utf8")).toContain("token_count");
+    await expect(readFile(join(home, ".codex", "auth.json"))).rejects.toThrow();
+    await expect(readFile(join(home, ".config", "sharednet", "rooms", "seat.json"))).rejects.toThrow();
+    const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
+    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
+    expect(episode.agents).toHaveLength(2);
+  });
+});
+
+describe("a start that fails", () => {
+  it("closes the Room it opened, says why, and leaves no container", async () => {
+    const out = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents(["codex"]),
+      workspace: out,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "api-key" },
+      claudeAuth: null,
+    };
+    const { docker, calls } = fakeDocker((_call, command) =>
+      command[0] === "sharednet" && command[1] === "join" ? { code: 4, stderr: "room_full" } : {},
+    );
+    const closes: unknown[] = [];
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) closes.push(body);
+        return {};
+      },
+    } as unknown as ApiClient;
+    await expect(
+      runGoal(client, "sni_owner-seat", OWNER_KEY, { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: ["after 1h"], baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: false }, {
+        docker,
+        now: () => new Date(),
+        sleep: async () => undefined,
+      }),
+    ).rejects.toMatchObject({ code: "join_failed" });
+    expect(closes).toEqual([{ detail: expect.stringContaining("goal run could not start: codex-1 could not join the Room") }]);
+    expect(calls.at(-1)!.args).toEqual(["rm", "--force", containerName(ROOM)]);
+    // A key-signed Codex seat gets its key from the Docker client's environment, never from an argument.
+    expect(calls.some((call) => call.args.includes("OPENAI_API_KEY"))).toBe(true);
+  });
+});
+
+describe("scrubHome", () => {
+  it("takes the seat's token and the harness's sign-in out of a home, and leaves the trace", async () => {
+    const home = await temporary();
+    await mkdir(join(home, ".claude", "projects", "w"), { recursive: true });
+    await writeFile(join(home, ".claude", ".credentials.json"), "{}");
+    await writeFile(join(home, ".claude", "projects", "w", "s.jsonl"), "{}\n");
+    await scrubHome(home);
+    await expect(readFile(join(home, ".claude", ".credentials.json"))).rejects.toThrow();
+    expect(await readFile(join(home, ".claude", "projects", "w", "s.jsonl"), "utf8")).toBe("{}\n");
+  });
+});

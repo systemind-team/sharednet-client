@@ -28,6 +28,26 @@ and SIGTERM, each leaving the saved cursor where a later wait finds it. It
 needs local sockets. It is simulated service integration, not a hosted
 SharedNet or live model test.
 
+`goal.test.ts` and `goal-run.test.ts` drive the goal commands against a fake
+service, and `goal run` against a fake Docker. They cover:
+
+- the `--until` and budget rules;
+- check feedback;
+- riding out an outage;
+- the container and seat setup;
+- turns resumed per wake, and their acknowledgements;
+- the budget counted in fresh tokens;
+- the scrubbed record.
+
+They do not start a container or a model. Real runs are recorded in the
+service's pull requests:
+
+- SharedNet #182: two Codex seats in Docker against a local server.
+- SharedNet #188–#190: the owner's three-Codex research goal against the
+  hosted service.
+
+Claude Code seats have not run live.
+
 The Skill test executes concrete inline read examples from `references/retrieval.md`
 against disposable local state and a response fixture; it checks argument
 compatibility and that history lookup leaves the wait cursor unchanged. It

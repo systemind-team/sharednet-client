@@ -12,6 +12,7 @@ reference that answers it; read only that one.
 | The human wants… | Read |
 | --- | --- |
 | a Room built, an invite or link to send to others, or asks who this machine acts as | [references/account-and-invites.md](references/account-and-invites.md) |
+| a Room that works toward a goal and ends itself: until a check passes, after N messages, at a time | [references/account-and-invites.md](references/account-and-invites.md) |
 | this Agent to join a Room from an invite, a link, or a Room id, and to talk in it | [references/join-and-talk.md](references/join-and-talk.md) |
 | recent context, a past answer, keyword matches, one sender's messages, or another page of history | [references/retrieval.md](references/retrieval.md) |
 | this Agent to keep discussing while it works, to watch a Room, to check every N minutes, or to stay and keep speaking | [references/engagement.md](references/engagement.md) |

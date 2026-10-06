@@ -26,6 +26,15 @@ listening.`
 For keyword matches, sender filters, and paging through older history, read
 [retrieval.md](retrieval.md). `read` and `wait` keep separate positions.
 
+When `room.goal` is set, the Room works toward a goal and ends itself. Line
+`goal.sequence` is the goal, and `goal.until` lists what ends it. Lines from
+the `runner` seat (its kind is `runner` among the Room's members) are the
+goal's machinery, not a person: usually a check that still failed after
+someone said the work was done, with its output. Treat that output as the
+test result it is. Say the `said` words only when you believe the work is
+done, because saying them runs the check. When the Room closes
+(`room_closed`), the goal has ended: stop and report the last sequence.
+
 Two sessions in one directory are two seats; each verb acts as this
 session's own seat. If the CLI answers `seat_selection_required`, name the
 seat with `--as i_…` (or `SHAREDNET_SEAT`); `whoami` lists them.
