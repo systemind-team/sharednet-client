@@ -103,6 +103,7 @@ const optionValueNames = new Set([
   "check-every",
   "agent",
   "image",
+  "web-search",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks"]);
 
@@ -525,12 +526,16 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search"]);
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks]",
+      "Usage: sharednet goal run <goal file> --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off]",
     );
+  }
+  const webSearch = option(parsed, "web-search") ?? "live";
+  if (webSearch !== "live" && webSearch !== "off") {
+    throw localError("invalid_arguments", "--web-search is live or off.");
   }
   const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
   const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime(), { budget: true });
@@ -597,6 +602,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           out,
           checkEveryMs,
           quietChecks: parsed.options.get("quiet-checks") === true,
+          webSearch,
         },
         { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
       );

@@ -70,6 +70,18 @@ describe("a turn", () => {
     ]);
   });
 
+  it("takes web search away from every Agent when it is off, for a benchmark that forbids the internet", () => {
+    const codex = { name: "codex-1", driver: "codex" as const, model: null };
+    const off = turnCommand(codex, "the goal", null, "off");
+    expect(off).toContain('web_search="disabled"');
+    expect(off).not.toContain('web_search="live"');
+    const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
+    // The list of denied tools ends at the next flag, so the prompt stays the prompt.
+    expect(turnCommand(claude, "the goal", null, "off")).toEqual([
+      "timeout", "1200", "claude", "-p", "--disallowedTools", "WebSearch", "WebFetch", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "the goal",
+    ]);
+  });
+
   it("reads the session to resume and the spend from each harness's own stream, cached reads apart", () => {
     const codex = new TurnReader("codex");
     for (const event of [
@@ -304,6 +316,8 @@ describe("runGoal", () => {
     // Every turn carries SHAREDNET_WAKE=off, so an agent's own `sharednet join` mid-turn starts no wake service.
     expect(turns.length).toBeGreaterThan(0);
     expect(turns.every((call) => call.args.join(" ").includes("-e SHAREDNET_WAKE=off"))).toBe(true);
+    // Web search is live unless the run turns it off, and the record says which.
+    expect(turns.every((call) => call.args.includes('web_search="live"'))).toBe(true);
     expect(calls.some((call) => call.args.join(" ").endsWith("sharednet ack wk_i_CodexOne01 --json"))).toBe(true);
     // Each seat joins with the invite in its environment, under its own home and name.
     const join1 = calls.find((call) => call.args.includes("join") && call.args.includes("codex-1"))!;
@@ -356,7 +370,7 @@ describe("runGoal", () => {
     await expect(readFile(join(home, ".codex", "auth.json"))).rejects.toThrow();
     await expect(readFile(join(home, ".config", "sharednet", "rooms", "seat.json"))).rejects.toThrow();
     const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
-    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
+    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
     expect(episode.agents).toHaveLength(2);
   });
 });
@@ -395,11 +409,15 @@ describe("a check", () => {
       client,
       "sni_owner-seat",
       OWNER_KEY,
-      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true },
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, webSearch: "off" },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
     );
 
     expect(result.ended_by).toMatchObject({ trigger: "check pytest -q" });
+    // With web search off, the Claude Code seat's turn denies the web tools, and the record says so.
+    const turn = calls.find((call) => call.args.includes("claude"))!;
+    expect(turn.args.join(" ")).toContain("--disallowedTools WebSearch WebFetch --output-format");
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ web_search: "off" });
     const check = calls.find((call) => call.args[0] === "exec" && call.args.slice(-3).join(" ") === "sh -c pytest -q")!;
     expect(check.args).toContain(containerName(ROOM));
     expect(check.args.some((arg) => arg.startsWith("HOME="))).toBe(false);

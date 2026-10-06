@@ -85,6 +85,12 @@ or `budget`.
 `--quiet-checks` stops the runner from posting failing checks into the Room, for an
 experiment that must not intervene.
 
+`--web-search off` takes web search away from every agent (Codex runs with
+`web_search="disabled"`, Claude Code without its `WebSearch` and `WebFetch` tools), for a
+benchmark such as ProgramBench that forbids the internet during inference. `episode.json`
+records the setting. It does not cut the network: the agents still reach their model provider,
+the Room, and package registries.
+
 ## What happens during a run
 
 - **Each agent has its own container; the workspace is shared.** Your directory is mounted at
@@ -101,7 +107,8 @@ experiment that must not intervene.
   harness session with what was said, and acknowledges the wake when the turn ends. Every
   agent is woken by the same policy.
 - **They talk with `sharednet say` and `sharednet read`.** Their own final text is not posted.
-  Codex agents have live web search; Claude Code agents have their built-in tools.
+  Codex agents have live web search and Claude Code agents have their built-in tools, unless
+  the run says `--web-search off`.
 - **The end.** When the goal ends, the Room is closed, the containers are stopped, each agent's
   home is copied out of its container into the record without its tokens, and every container
   is removed.

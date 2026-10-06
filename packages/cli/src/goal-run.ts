@@ -263,17 +263,23 @@ export function wakePrompt(wake: WakeShape): string {
 }
 
 /** One turn: a fresh harness run, or the same session resumed, with nothing asked of a person. */
-export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null): string[] {
+/** Whether the Agents may search the web: on by default, off for a benchmark that forbids it. */
+export type WebSearch = "live" | "off";
+
+export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live"): string[] {
   const limit = ["timeout", String(TURN_LIMIT_SECONDS)];
   if (seat.driver === "codex") {
     // Live web search, which Claude Code has by default: a goal is as often research as code.
-    const flags = ["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", 'web_search="live"', ...(seat.model ? ["-m", seat.model] : [])];
+    const search = webSearch === "live" ? 'web_search="live"' : 'web_search="disabled"';
+    const flags = ["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", search, ...(seat.model ? ["-m", seat.model] : [])];
     return sessionId === null ? [...limit, "codex", "exec", ...flags, prompt] : [...limit, "codex", "exec", "resume", ...flags, sessionId, prompt];
   }
   return [
     ...limit,
     "claude",
     "-p",
+    // A list option takes every argument up to the next flag, so it stands before the other flags.
+    ...(webSearch === "off" ? ["--disallowedTools", "WebSearch", "WebFetch"] : []),
     "--output-format",
     "stream-json",
     "--verbose",
@@ -399,6 +405,8 @@ export interface GoalRunInput {
   out: string;
   checkEveryMs: number;
   quietChecks: boolean;
+  /** `off` takes web search away from every Agent; the default is `live`. */
+  webSearch?: WebSearch;
 }
 
 export interface GoalRunDependencies {
@@ -563,7 +571,7 @@ export async function runGoal(
       const reader = new TurnReader(seat.driver);
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
-      const result = await exec(seat, turnCommand(seat, prompt, seat.session_id), {
+      const result = await exec(seat, turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live"), {
         onLine: (line) => {
           reader.line(line);
           writes = writes.then(() => appendFile(stream, `${line}\n`));
@@ -675,6 +683,7 @@ export async function runGoal(
         {
           ...episode,
           image: plan.image,
+          web_search: input.webSearch ?? "live",
           agents: records,
           totals: { ...(episode.totals as object), tokens: spend(), cached_tokens: records.reduce((sum, seat) => sum + seat.usage.cached, 0) },
         },
