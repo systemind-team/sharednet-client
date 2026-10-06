@@ -70,6 +70,13 @@ describe("a turn", () => {
     ]);
   });
 
+  it("stops a turn at the run's turn limit, 20 minutes unless the run sets another", () => {
+    const codex = { name: "codex-1", driver: "codex" as const, model: null };
+    expect(turnCommand(codex, "the goal", null, "live", 2700).slice(0, 3)).toEqual(["timeout", "2700", "codex"]);
+    const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
+    expect(turnCommand(claude, "new lines", "session-1", "live", 2700).slice(0, 3)).toEqual(["timeout", "2700", "claude"]);
+  });
+
   it("takes web search away from every Agent when it is off, for a benchmark that forbids the internet", () => {
     const codex = { name: "codex-1", driver: "codex" as const, model: null };
     const off = turnCommand(codex, "the goal", null, "off");
@@ -370,7 +377,7 @@ describe("runGoal", () => {
     await expect(readFile(join(home, ".codex", "auth.json"))).rejects.toThrow();
     await expect(readFile(join(home, ".config", "sharednet", "rooms", "seat.json"))).rejects.toThrow();
     const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
-    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
+    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", turn_limit_s: 1200, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
     expect(episode.agents).toHaveLength(2);
   });
 });
@@ -409,15 +416,17 @@ describe("a check", () => {
       client,
       "sni_owner-seat",
       OWNER_KEY,
-      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, webSearch: "off" },
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, webSearch: "off", turnLimitMs: 2_700_000 },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
     );
 
     expect(result.ended_by).toMatchObject({ trigger: "check pytest -q" });
-    // With web search off, the Claude Code seat's turn denies the web tools, and the record says so.
+    // With web search off, the Claude Code seat's turn denies the web tools; the turn runs up to the run's
+    // own limit; and the record says both.
     const turn = calls.find((call) => call.args.includes("claude"))!;
     expect(turn.args.join(" ")).toContain("--disallowedTools WebSearch WebFetch --output-format");
-    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ web_search: "off" });
+    expect(turn.args.join(" ")).toContain("timeout 2700 claude -p");
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ web_search: "off", turn_limit_s: 2700 });
     const check = calls.find((call) => call.args[0] === "exec" && call.args.slice(-3).join(" ") === "sh -c pytest -q")!;
     expect(check.args).toContain(containerName(ROOM));
     expect(check.args.some((arg) => arg.startsWith("HOME="))).toBe(false);

@@ -104,6 +104,7 @@ const optionValueNames = new Set([
   "agent",
   "image",
   "web-search",
+  "turn-limit",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks"]);
 
@@ -526,16 +527,20 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit"]);
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off]",
+      "Usage: sharednet goal run <goal file> --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m]",
     );
   }
   const webSearch = option(parsed, "web-search") ?? "live";
   if (webSearch !== "live" && webSearch !== "off") {
     throw localError("invalid_arguments", "--web-search is live or off.");
+  }
+  const turnLimitMs = parsed.options.has("turn-limit") ? parseDuration(option(parsed, "turn-limit"), "--turn-limit") : undefined;
+  if (turnLimitMs !== undefined && turnLimitMs < 60_000) {
+    throw localError("invalid_arguments", "--turn-limit is at least 1m.");
   }
   const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
   const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime(), { budget: true });
@@ -603,6 +608,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           checkEveryMs,
           quietChecks: parsed.options.get("quiet-checks") === true,
           webSearch,
+          ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
         },
         { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
       );

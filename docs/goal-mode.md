@@ -91,6 +91,10 @@ benchmark such as ProgramBench that forbids the internet during inference. `epis
 records the setting. It does not cut the network: the agents still reach their model provider,
 the Room, and package registries.
 
+`--turn-limit 45m` stops a single turn after 45 minutes instead of the default 20 (at least
+`1m`). An experiment that wants only the Room's own end to stop an agent sets it to its
+`after`. `episode.json` records it as `turn_limit_s`.
+
 ## What happens during a run
 
 - **Each agent has its own container; the workspace is shared.** Your directory is mounted at
@@ -105,7 +109,7 @@ the Room, and package registries.
 - **The agents work in turns.** Each one first gets the goal and how the Room ends. After
   that, the runner wakes it whenever another member says something: it resumes the same
   harness session with what was said, and acknowledges the wake when the turn ends. Every
-  agent is woken by the same policy.
+  agent is woken by the same policy. A turn is stopped after 20 minutes, or after `--turn-limit`.
 - **They talk with `sharednet say` and `sharednet read`.** Their own final text is not posted.
   Codex agents have live web search and Claude Code agents have their built-in tools, unless
   the run says `--web-search off`.

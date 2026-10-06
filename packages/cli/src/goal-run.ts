@@ -266,8 +266,8 @@ export function wakePrompt(wake: WakeShape): string {
 /** Whether the Agents may search the web: on by default, off for a benchmark that forbids it. */
 export type WebSearch = "live" | "off";
 
-export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live"): string[] {
-  const limit = ["timeout", String(TURN_LIMIT_SECONDS)];
+export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live", turnLimitSeconds = TURN_LIMIT_SECONDS): string[] {
+  const limit = ["timeout", String(turnLimitSeconds)];
   if (seat.driver === "codex") {
     // Live web search, which Claude Code has by default: a goal is as often research as code.
     const search = webSearch === "live" ? 'web_search="live"' : 'web_search="disabled"';
@@ -407,6 +407,8 @@ export interface GoalRunInput {
   quietChecks: boolean;
   /** `off` takes web search away from every Agent; the default is `live`. */
   webSearch?: WebSearch;
+  /** The longest one turn may run; the default is 20 minutes. An experiment may set it to the run's own limit. */
+  turnLimitMs?: number;
 }
 
 export interface GoalRunDependencies {
@@ -434,6 +436,7 @@ export async function runGoal(
   const sleep = dependencies.sleep ?? ((ms: number) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)));
   const checks = containerName(input.roomId);
   const containers = runContainers(input.roomId, plan.agents);
+  const turnLimitSeconds = Math.round((input.turnLimitMs ?? TURN_LIMIT_SECONDS * 1000) / 1000);
   const base = input.baseUrl;
   await mkdir(input.out, { recursive: true });
   const wakeLog = join(input.out, "wakes.ndjson");
@@ -571,7 +574,7 @@ export async function runGoal(
       const reader = new TurnReader(seat.driver);
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
-      const result = await exec(seat, turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live"), {
+      const result = await exec(seat, turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds), {
         onLine: (line) => {
           reader.line(line);
           writes = writes.then(() => appendFile(stream, `${line}\n`));
@@ -684,6 +687,7 @@ export async function runGoal(
           ...episode,
           image: plan.image,
           web_search: input.webSearch ?? "live",
+          turn_limit_s: turnLimitSeconds,
           agents: records,
           totals: { ...(episode.totals as object), tokens: spend(), cached_tokens: records.reduce((sum, seat) => sum + seat.usage.cached, 0) },
         },
