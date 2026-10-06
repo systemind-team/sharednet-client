@@ -10,7 +10,7 @@ import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
-import { containerName, dockerRunner, parseAgents, prepareRun, runGoal, type DockerRunner } from "./goal-run.ts";
+import { dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type DockerRunner } from "./goal-run.ts";
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
@@ -574,10 +574,10 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     if (!invite?.token) throw new CliError("invalid_server_response", "The Agents' invite did not come back.", 5);
     const out = resolvePathFrom(dependencies.cwd, option(parsed, "out") ?? join("runs", roomId));
     dependencies.stderr(`goal: ${roomId} is open; the record goes to ${out}\n`);
-    // Ctrl-C ends the run without leaving Agents at work in a container nobody watches.
+    // Ctrl-C ends the run without leaving Agents at work in containers nobody watches.
     const interrupt = () => {
-      spawnSync("docker", ["rm", "--force", containerName(roomId)]);
-      dependencies.stderr(`goal: stopped; the Agents' container is gone and ${roomId} is still open\n`);
+      spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents)]);
+      dependencies.stderr(`goal: stopped; the Agents' containers are gone and ${roomId} is still open\n`);
       process.exit(130);
     };
     if (!dependencies.docker) process.once("SIGINT", interrupt);

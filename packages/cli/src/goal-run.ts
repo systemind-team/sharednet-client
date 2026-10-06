@@ -9,9 +9,11 @@ import { goalWatch, type GoalWatchResult } from "./goal.ts";
 
 /**
  * `goal run`: the goal Room, the Agents that work on it, and the runner that
- * ends it, in one command. The Agents run in one Docker container, which is
- * the workspace they share and the sandbox they work in: the owner's account
- * key never enters it, and each Agent has its own home and its own seat.
+ * ends it, in one command. Each Agent runs in its own Docker container, its
+ * sandbox: its own processes, its own home, its own seat. The containers share
+ * one thing, the workspace, mounted at /workspace in each. The checks run in
+ * one more container, which has the workspace and nothing an Agent installed.
+ * The owner's account key never enters any of them.
  * Each Agent works in turns. The runner holds every seat's wait, starts a
  * turn when the seat is woken, and resumes the same harness session, so every
  * Agent is woken by one policy and the record says when and by what.
@@ -120,14 +122,20 @@ const TURN_LIMIT_SECONDS = 1_200;
 /** A seat whose harness fails this many turns in a row stops taking turns. */
 const FAILED_TURNS_LIMIT = 3;
 
-export function containerName(roomId: string): string {
-  return `sharednet-goal-${roomId}`;
+/** One container of a run: an Agent's, named for its seat, or with no seat, the checks'. */
+export function containerName(roomId: string, seat?: string): string {
+  return seat === undefined ? `sharednet-goal-${roomId}` : `sharednet-goal-${roomId}-${seat}`;
+}
+
+/** Every container one run starts, so that whatever stops the run can remove them all. */
+export function runContainers(roomId: string, agents: readonly Pick<AgentSpec, "name">[]): string[] {
+  return [...agents.map((agent) => containerName(roomId, agent.name)), containerName(roomId)];
 }
 
 /**
  * The port of a development service on this machine's loopback, the one plain-HTTP address the CLI
- * accepts. Inside the container that address is the container's own, so the runner forwards the
- * same port to this machine; the Agents then use the address the runner uses.
+ * accepts. Inside a container that address is the container's own, so the runner forwards the
+ * same port to this machine in each Agent's container; the Agents then use the address the runner uses.
  */
 export function loopbackPort(baseUrl: string): number | null {
   const url = new URL(baseUrl);
@@ -149,7 +157,7 @@ export interface RunPlan {
   image: string;
   agents: AgentSpec[];
   workspace: string;
-  /** This CLI's own package on this machine, mounted into the container so the Agents run the same version. */
+  /** This CLI's own package on this machine, mounted into each Agent's container so the Agents run the same version. */
   cli: { root: string; entry: string };
   /** How the Codex seats sign in: an API key from this environment, or this machine's Codex login. */
   codexAuth: { kind: "api-key" } | { kind: "login"; file: string } | null;
@@ -176,7 +184,7 @@ export async function prepareRun(
   pause: (ms: number) => Promise<void> = (ms) => new Promise((resolvePause) => setTimeout(resolvePause, ms)),
 ): Promise<RunPlan> {
   if ((await docker(["info", "--format", "{{.ServerVersion}}"])).code !== 0) {
-    throw localError("docker_unavailable", "goal run starts the Agents in a Docker container; start Docker, then run it again.");
+    throw localError("docker_unavailable", "goal run starts the Agents in Docker containers; start Docker, then run it again.");
   }
   const image = input.image ?? DEFAULT_IMAGE;
   // Docker Desktop waking from idle can answer `info` before it can see its images: ask again before building.
@@ -239,7 +247,7 @@ export function openingPrompt(input: { seat: AgentSpec; seats: AgentSpec[]; room
     `The Room ends when the first of these happens: ${input.until.join("; ")}.`,
     ...(claims.length > 0 ? [`Say ${claims.join(" or ")} in the Room only when you believe the goal is met: saying it runs the check.`] : []),
     "",
-    `You share this directory (${CONTAINER_WORKSPACE}) with the others. Talk to them only through the Room, with the sharednet command:`,
+    `You share this directory (${CONTAINER_WORKSPACE}) with the others, and only this one: each of you works in its own container, so what you install elsewhere is yours alone. Talk to them only through the Room, with the sharednet command:`,
     "  sharednet read --last 30 --json    what has been said",
     '  sharednet say "…" --json          say something; keep it short',
     "Do not run `sharednet wait` or `sharednet watch`: when your turn ends, you are woken with whatever is said next.",
@@ -405,7 +413,7 @@ export interface GoalRunResult extends GoalWatchResult {
   tokens: number;
 }
 
-/** Creates nothing outside the container and the record; the Room and its goal already exist. */
+/** Creates nothing outside its containers and the record; the Room and its goal already exist. */
 export async function runGoal(
   client: ApiClient,
   memberToken: string,
@@ -416,28 +424,32 @@ export async function runGoal(
   const { docker, plan } = { docker: dependencies.docker, plan: input.plan };
   const log = dependencies.stderr ?? (() => undefined);
   const sleep = dependencies.sleep ?? ((ms: number) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)));
-  const container = containerName(input.roomId);
+  const checks = containerName(input.roomId);
+  const containers = runContainers(input.roomId, plan.agents);
   const base = input.baseUrl;
   await mkdir(input.out, { recursive: true });
   const wakeLog = join(input.out, "wakes.ndjson");
   await writeFile(wakeLog, "");
 
-  const startContainer = () => docker([
+  /** An Agent's container: the shared workspace, this CLI, and a Codex seat's login; idle until a turn runs in it. */
+  const startContainer = (seat: SeatRecord) => docker([
     "run",
     "--detach",
     "--name",
-    container,
+    containerName(input.roomId, seat.name),
     "--add-host",
     "host.docker.internal:host-gateway",
     "--volume",
     `${plan.workspace}:${CONTAINER_WORKSPACE}`,
     "--volume",
     `${plan.cli.root}:${CONTAINER_CLI}:ro`,
-    ...(plan.codexAuth?.kind === "login" ? ["--volume", `${plan.codexAuth.file}:${CONTAINER_CODEX_AUTH}`] : []),
+    ...(seat.driver === "codex" && plan.codexAuth?.kind === "login" ? ["--volume", `${plan.codexAuth.file}:${CONTAINER_CODEX_AUTH}`] : []),
     plan.image,
     "sleep",
     "infinity",
   ]);
+  /** The checks' container: the image and the shared workspace, and nothing an Agent installed or holds. */
+  const startChecks = () => docker(["run", "--detach", "--name", checks, "--volume", `${plan.workspace}:${CONTAINER_WORKSPACE}`, plan.image, "sleep", "infinity"]);
 
   let ended = false;
   const records: SeatRecord[] = plan.agents.map((agent) => ({
@@ -475,31 +487,34 @@ export async function runGoal(
       ...(seat?.driver === "codex" && plan.codexAuth?.kind === "api-key" ? ["-e", "OPENAI_API_KEY"] : []),
       ...Object.keys(options.env ?? {}).flatMap((name) => ["-e", name]),
     ];
-    return docker(["exec", "--user", AGENT_USER, "--workdir", CONTAINER_WORKSPACE, ...environment, container, ...command], options);
+    return docker(["exec", "--user", AGENT_USER, "--workdir", CONTAINER_WORKSPACE, ...environment, seat ? containerName(input.roomId, seat.name) : checks, ...command], options);
   };
 
-  /** The container, the Agents' command, and every seat; a start that fails closes the Room it opened. */
+  /** The checks' container, then each Agent's container and seat; a start that fails closes the Room it opened. */
   const setUp = async () => {
-    const started = await startContainer();
-    if (started.code !== 0) throw localError("container_failed", `The Agents' container did not start: ${started.stderr.trim()}`);
+    const checker = await startChecks();
+    if (checker.code !== 0) throw localError("container_failed", `The checks' container did not start: ${checker.stderr.trim()}`);
     const port = loopbackPort(base);
-    if (port !== null) {
-      await docker(["exec", "--detach", "--user", AGENT_USER, container, "node", "-e", FORWARDER, String(port)]);
-      let listening = false;
-      for (let attempt = 0; attempt < 20 && !listening; attempt += 1) {
-        listening = (await docker(["exec", "--user", AGENT_USER, container, "node", "-e", FORWARDER_PROBE, String(port)])).code === 0;
-        if (!listening) await sleep(250);
-      }
-      if (!listening) throw localError("container_failed", `The container could not reach this machine's port ${port}.`);
-    }
     // The Agents' `sharednet` is this CLI, so they speak the version that started them.
     const entry = `${CONTAINER_CLI}/${plan.cli.entry}`;
     const wrapper = `#!/bin/sh\nexec node ${entry.endsWith(".ts") ? "--experimental-strip-types --no-warnings " : ""}${entry} "$@"\n`;
-    const installed = await docker(["exec", "--user", "root", "--interactive", container, "sh", "-c", "cat > /usr/local/bin/sharednet && chmod 755 /usr/local/bin/sharednet"], { input: wrapper });
-    if (installed.code !== 0) throw localError("container_failed", `The sharednet command could not be put in the container: ${installed.stderr.trim()}`);
 
-    // Every seat: its own home, its own sign-in, its own seat in the Room.
+    // Every seat: its own container, its own home, its own sign-in, its own seat in the Room.
     for (const seat of records) {
+      const container = containerName(input.roomId, seat.name);
+      const started = await startContainer(seat);
+      if (started.code !== 0) throw localError("container_failed", `${seat.name}'s container did not start: ${started.stderr.trim()}`);
+      if (port !== null) {
+        await docker(["exec", "--detach", "--user", AGENT_USER, container, "node", "-e", FORWARDER, String(port)]);
+        let listening = false;
+        for (let attempt = 0; attempt < 20 && !listening; attempt += 1) {
+          listening = (await docker(["exec", "--user", AGENT_USER, container, "node", "-e", FORWARDER_PROBE, String(port)])).code === 0;
+          if (!listening) await sleep(250);
+        }
+        if (!listening) throw localError("container_failed", `${seat.name}'s container could not reach this machine's port ${port}.`);
+      }
+      const installed = await docker(["exec", "--user", "root", "--interactive", container, "sh", "-c", "cat > /usr/local/bin/sharednet && chmod 755 /usr/local/bin/sharednet"], { input: wrapper });
+      if (installed.code !== 0) throw localError("container_failed", `The sharednet command could not be put in ${seat.name}'s container: ${installed.stderr.trim()}`);
       const home = `${CONTAINER_HOMES}/${seat.name}`;
       const setup =
         seat.driver === "codex"
@@ -625,7 +640,7 @@ export async function runGoal(
         now: dependencies.now,
         ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
         stderr: log,
-        // A check runs where the Agents work: in the container, in the shared workspace.
+        // A check runs in its own container, on the shared workspace: what one Agent installed for itself does not count.
         check: async (command) => {
           const result = await exec(null, ["sh", "-c", command]);
           return { exitCode: result.code, output: `${result.stdout}${result.stderr}` };
@@ -634,8 +649,8 @@ export async function runGoal(
       },
     );
     ended = true;
-    // Stopping the container ends every turn and every wait still running.
-    await docker(["stop", "--time", "5", container]);
+    // Stopping the containers ends every turn and every wait still running.
+    await docker(["stop", "--time", "5", ...containers]);
     await Promise.all(seats);
 
     // Each Agent's own trace is its home: Codex keeps sessions in ~/.codex, Claude Code in ~/.claude.
@@ -643,7 +658,7 @@ export async function runGoal(
       const target = join(input.out, "agents", seat.name, "home");
       await mkdir(dirname(target), { recursive: true });
       await rm(target, { recursive: true, force: true });
-      const copied = await docker(["cp", `${container}:${CONTAINER_HOMES}/${seat.name}`, target]);
+      const copied = await docker(["cp", `${containerName(input.roomId, seat.name)}:${CONTAINER_HOMES}/${seat.name}`, target]);
       if (copied.code !== 0) log(`goal: ${seat.name}'s home could not be copied out: ${copied.stderr.trim()}\n`);
       await scrubHome(target);
       // The record's numbers come from the session's own file when there is one: it saw every turn, a cut one included.
@@ -670,7 +685,7 @@ export async function runGoal(
     return { ...watched, agents: records, tokens: spend() };
   } finally {
     ended = true;
-    await docker(["rm", "--force", container]);
+    await docker(["rm", "--force", ...containers]);
   }
 }
 
