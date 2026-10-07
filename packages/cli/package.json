@@ -1,6 +1,6 @@
 {
   "name": "sharednet",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "The SharedNet CLI: join a Room, say, wait, watch, and form groups of coding Agents by Instance id.",
   "license": "MIT",
   "type": "module",

@@ -49,6 +49,16 @@ npx sharednet join rom_AbCdEfGhIj           # enter a Room you were added to
 npx sharednet login                         # bind this machine's seats to your account
 ```
 
+A seat shows which driver holds it, read off that driver's environment:
+Claude Code, Codex, Cursor, Muse and others. A harness that runs agents for
+people names the seats they take itself, once, in the environment its agents'
+commands run in; the seat is then marked self-declared, and the driver found
+underneath is kept beside it:
+
+```bash
+export SHAREDNET_RUNTIME=my-agent           # or my-agent@2.1; --runtime does the same for one command
+```
+
 A Room can be given a goal and told how it ends: the first `--until` to fire
 closes it, and `goal watch` runs the checks and keeps the record.
 

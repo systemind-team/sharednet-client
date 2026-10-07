@@ -7,9 +7,9 @@ import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
 import { storeAccountCredential } from "./login.ts";
 import { CliError, localError } from "./errors.ts";
 import { computeLocalInstanceKey } from "./instance-computation.ts";
-import { detectRuntime } from "./runtime-detection.ts";
+import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
 import { mentions, nextCronTime, parseCount, parseDuration, parseTrigger, saidIn, triggerTakesParameter, wakeIdentity, type Trigger } from "./triggers.ts";
-import { hasAccountCredential, refreshIfNeeded, registerInstance } from "./session.ts";
+import { hasAccountCredential, refreshIfNeeded, registerInstance, resolveRuntime } from "./session.ts";
 import { replyFrom, runTurn, sandboxed, seatWakeFrom, turnSpec, turnSummary, wakeTurnPrompt, type SeatWake, type TurnRunner } from "./wake-driver.ts";
 import {
   getOrCreateInstallationSecret,
@@ -109,7 +109,7 @@ const INVITE_TOKEN_PATTERN = /^rit_[A-Za-z0-9_-]{43}$/;
 /** The server caps one wait at this; the client loops. */
 const WAIT_MAX_SECONDS = 25;
 
-const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen"]);
+const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on"]);
 const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake"]);
@@ -214,20 +214,18 @@ function parseInvite(
   return { roomId, token, baseUrl };
 }
 
-function defaultGuestName(env: Environment): string {
-  const detected = detectRuntime(env);
-  return detected.kind === "custom" ? "agent" : detected.kind;
+function defaultGuestName(runtime: DetectedRuntime): string {
+  return runtime.kind === "custom" ? "agent" : runtime.kind;
 }
 
-/** What the join tells the server about the driver, when one was recognised. */
-function runtimeReport(env: Environment): { kind: string; version: string | null; entrypoint: string | null; source: "detected" | "declared" } | undefined {
-  const detected = detectRuntime(env);
-  if (detected.kind === "custom") return undefined;
+/** What the join tells the server about the driver, when one was recognised or declared. */
+function runtimeReport(runtime: DetectedRuntime): { kind: string; version: string | null; entrypoint: string | null; source: "detected" | "declared" } | undefined {
+  if (runtime.kind === "custom") return undefined;
   return {
-    kind: detected.kind,
-    version: detected.version,
-    entrypoint: detected.entrypoint,
-    source: detected.source,
+    kind: runtime.kind,
+    version: runtime.version,
+    entrypoint: runtime.entrypoint,
+    source: runtime.source,
   };
 }
 
@@ -279,11 +277,11 @@ function invalidServerResponse(): CliError {
 
 async function join(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["name", "token", "private", "as", "claim", "agent", "no-wake"]);
+  assertOnlyOptions(parsed, ["name", "token", "private", "as", "claim", "agent", "runtime", "no-wake"]);
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet join <invite> [--name <name>] [--agent <tag>] [--private] [--claim <clp_…>] [--no-wake], or sharednet join <rom_…> [--as <i_…>]",
+      "Usage: sharednet join <invite> [--name <name>] [--agent <tag>] [--runtime <handle>] [--private] [--claim <clp_…>] [--no-wake], or sharednet join <rom_…> [--as <i_…>]",
     );
   }
   // The session taking the seat is remembered, so being addressed in the Room resumes it. --no-wake
@@ -301,7 +299,12 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     return enterAsSeat(argument, stringOption(parsed, "as"), dependencies, { wake, wakeOff });
   }
   const { roomId, token, baseUrl } = parseInvite(argument, parsed, dependencies.env);
-  const name = stringOption(parsed, "name") ?? defaultGuestName(dependencies.env);
+  // --runtime, else SHAREDNET_RUNTIME from the harness, else the driver
+  // detected. Resolved before anything leaves the machine, so a malformed
+  // declaration cannot spend a claim and then fail.
+  const runtimeFlag = stringOption(parsed, "runtime");
+  const runtime = resolveRuntime(dependencies.env, runtimeFlag);
+  const name = stringOption(parsed, "name") ?? defaultGuestName(runtime);
   // --private: strangers who know this seat's Instance id have to ask before
   // seating it in another Room. Omitted, the seat is public.
   const reach = parsed.options.get("private") === true ? ("private" as const) : undefined;
@@ -356,7 +359,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   // Instance of the account and the invite only admits it; without one, the
   // join provisions an anonymous Principal.
   if (await hasAccountCredential(dependencies.env, paths, baseUrl)) {
-    return joinAsAccount(roomId, token, name, baseUrl, paths, client, dependencies, reach, agent, wake);
+    return joinAsAccount(roomId, token, name, baseUrl, paths, client, dependencies, reach, agent, wake, runtimeFlag);
   }
   if (agent !== undefined) {
     throw localError(
@@ -365,12 +368,12 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     );
   }
 
-  const runtime = runtimeReport(dependencies.env);
+  const report = runtimeReport(runtime);
   const payload = await client.request<GuestJoinPayload>(
     "POST",
     `/rooms/${encodeURIComponent(roomId)}/join`,
     token,
-    { name, ...(runtime ? { runtime } : {}), ...(reach === undefined ? {} : { reach }) },
+    { name, ...(report ? { runtime: report } : {}), ...(reach === undefined ? {} : { reach }) },
   );
   const memberId = payload.membership?.member_id;
   const memberToken = payload.member_token;
@@ -545,6 +548,7 @@ async function joinAsAccount(
   reach?: "public" | "private",
   agent?: string,
   wake?: SeatWake | null,
+  runtimeOverride?: string,
 ): Promise<unknown> {
   // A join is one session taking one seat, so it always registers a fresh
   // Instance. It never reuses one by local session key: two sessions whose
@@ -557,6 +561,7 @@ async function joinAsAccount(
     freshWhenUndetected: true,
     ...(reach === undefined ? {} : { reach }),
     ...(agent === undefined ? {} : { agent }),
+    ...(runtimeOverride === undefined ? {} : { runtimeOverride }),
   });
   const payload = await client.request<AccountJoinPayload>(
     "POST",

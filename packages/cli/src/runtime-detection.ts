@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { hostname } from "node:os";
 import { basename } from "node:path";
 
 /**
@@ -15,6 +16,13 @@ import { basename } from "node:path";
  * The OpenCode, OpenHands, Gemini CLI and Cursor markers below are taken from
  * their documentation and not yet verified on a machine; the parent-process
  * fallback covers a driver whose variables differ.
+ *
+ * Muse, Meta's hosted personal agent, runs every command in a "runtime cell"
+ * whose environment the host renders: JARVIS_HOME=/home/hatch and
+ * JARVIS_BIN_DIR=/opt/hatch/bin among it (`opt/hatch/runtime-cell/guest.env`
+ * in the unofficial archive win4r/MuseAI-Skills). The cell's machine name,
+ * htch-runtime, is the one marker production has shown: the three Muse seats
+ * taken before Muse was recognised reported it, with the workspace `hatch`.
  */
 
 export type RuntimeSource = "detected" | "declared";
@@ -35,6 +43,13 @@ export interface DetectedRuntime {
    * `runtime_metadata`. Absent whenever detection succeeded.
    */
   unrecognisedParent?: string | null;
+  /**
+   * Set when a harness declared the runtime: the driver detection found
+   * underneath it. A ChatGPT dot runs Codex on its cloud computer, so a seat
+   * it takes is the dot's, and Codex is the evidence of how — kept beside the
+   * declaration rather than lent to it as a version or an entrypoint.
+   */
+  detectedDriver?: string;
 }
 
 type Environment = Record<string, string | undefined>;
@@ -122,7 +137,11 @@ const DRIVER_ORDER = [
   "cursor",
   "hermes",
   "openclaw",
+  "muse",
 ] as const;
+
+/** Muse's runtime cell, by the machine name every VM of its image carries. */
+const MUSE_CELL_HOSTNAME = "htch-runtime";
 
 function candidates(env: Environment): DetectedRuntime[] {
   const found: DetectedRuntime[] = [];
@@ -216,12 +235,32 @@ function candidates(env: Environment): DetectedRuntime[] {
       source: "detected",
     });
   }
+  // Muse's cell exports its own paths into every command it runs. JARVIS_ is
+  // nobody's reserved prefix, so only the cell's values count, the way only
+  // Hermes's value of AI_AGENT does. The cell offers no session id, version or
+  // entrypoint, so a Muse seat is fresh on every join.
+  if (nonEmpty(env.JARVIS_HOME) === "/home/hatch" || nonEmpty(env.JARVIS_BIN_DIR) === "/opt/hatch/bin") {
+    found.push({ kind: "muse", anchor: null, version: null, entrypoint: null, source: "detected" });
+  }
   return found.sort((a, b) => DRIVER_ORDER.indexOf(a.kind as never) - DRIVER_ORDER.indexOf(b.kind as never));
+}
+
+/** This machine's name, or null when it cannot be read. */
+function machineName(): string | null {
+  try {
+    return hostname();
+  } catch {
+    return null;
+  }
 }
 
 export function detectRuntime(
   env: Environment,
-  options: { parentProcess?: () => string | null; ancestorDriver?: () => string | null } = {},
+  options: {
+    parentProcess?: () => string | null;
+    ancestorDriver?: () => string | null;
+    hostname?: () => string | null;
+  } = {},
 ): DetectedRuntime {
   const found = candidates(env);
   const withSession = found.filter((candidate) => candidate.anchor !== null);
@@ -233,6 +272,12 @@ export function detectRuntime(
   if (found.length > 0) {
     const byTree = (options.ancestorDriver ?? nearestDriverAncestor)();
     return found.find((candidate) => candidate.kind === byTree) ?? found[0]!;
+  }
+
+  // Below every variable, above a guess from the parent process: a command
+  // the cell runs without its environment is still on the cell's machine.
+  if ((options.hostname ?? machineName)() === MUSE_CELL_HOSTNAME) {
+    return { kind: "muse", anchor: null, version: null, entrypoint: null, source: "detected" };
   }
 
   const parent = (options.parentProcess ?? parentProcessName)();
@@ -254,11 +299,36 @@ export function isRuntimeKind(value: string): boolean {
   return RUNTIME_KIND_PATTERN.test(value);
 }
 
+/**
+ * A runtime the harness declared — `--runtime`, or SHAREDNET_RUNTIME in the
+ * environment it runs its agents in — names the seat in place of the driver
+ * detected under it. Declaring what was detected changes nothing. Declaring
+ * anything else is the harness's word, not something read off a driver, so it
+ * is reported as declared, carries only the version the declaration gave, and
+ * holds no session anchor: the anchor belongs to the detected driver, which is
+ * why `--runtime` has always needed `--new` to name something else.
+ */
+export function declareRuntime(
+  detected: DetectedRuntime,
+  declared: { kind: string; version: string | null },
+): DetectedRuntime {
+  if (declared.kind === detected.kind) return detected;
+  return {
+    kind: declared.kind,
+    anchor: null,
+    version: declared.version,
+    entrypoint: null,
+    source: "declared",
+    ...(detected.kind === "custom" ? {} : { detectedDriver: detected.kind }),
+  };
+}
+
 /** The diagnostic fields a detected driver contributes to an Instance's metadata. */
 export function runtimeMetadataOf(runtime: DetectedRuntime): Record<string, string> {
   const metadata: Record<string, string> = { runtime_source: runtime.source };
   if (runtime.version) metadata.driver_version = runtime.version;
   if (runtime.entrypoint) metadata.entrypoint = runtime.entrypoint;
   if (runtime.unrecognisedParent) metadata.parent_process = runtime.unrecognisedParent;
+  if (runtime.detectedDriver) metadata.detected_driver = runtime.detectedDriver;
   return metadata;
 }

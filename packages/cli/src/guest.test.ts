@@ -189,6 +189,103 @@ function header(request: { init: RequestInit }, name: string): string | undefine
 }
 
 describe("sharednet join", () => {
+  it("names a seat taken from Muse's runtime cell for Muse, as detected", async () => {
+    const space = await workspace();
+    const result = await run(
+      ["join", PASTED_INVITE, "--json"],
+      {
+        ...space,
+        env: {
+          HOME: space.env.HOME!,
+          XDG_CONFIG_HOME: space.env.XDG_CONFIG_HOME!,
+          XDG_STATE_HOME: space.env.XDG_STATE_HOME!,
+          JARVIS_HOME: "/home/hatch",
+          JARVIS_BIN_DIR: "/opt/hatch/bin",
+        },
+      },
+      [joined()],
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(String(result.requests[0]!.init.body))).toEqual({
+      name: "muse",
+      runtime: { kind: "muse", version: null, entrypoint: null, source: "detected" },
+    });
+  });
+
+  it("names a seat for the harness that sets SHAREDNET_RUNTIME, as declared, and takes --runtime with a version", async () => {
+    // A coding driver runs underneath; here the workspace's Claude session plays it.
+    const space = await workspace();
+    const declared = await run(["join", PASTED_INVITE, "--json"], space, [joined()], { SHAREDNET_RUNTIME: "dot" });
+    expect(declared.exitCode).toBe(0);
+    expect(JSON.parse(String(declared.requests[0]!.init.body))).toEqual({
+      name: "dot",
+      runtime: { kind: "dot", version: null, entrypoint: null, source: "declared" },
+    });
+
+    const other = await workspace();
+    const flagged = await run(["join", PASTED_INVITE, "--runtime", "dot@2.1", "--name", "Yu's Dot", "--json"], other, [joined()]);
+    expect(flagged.exitCode).toBe(0);
+    expect(JSON.parse(String(flagged.requests[0]!.init.body))).toEqual({
+      name: "Yu's Dot",
+      runtime: { kind: "dot", version: "2.1", entrypoint: null, source: "declared" },
+    });
+  });
+
+  it("refuses a malformed declaration before anything leaves the machine, so a claim is never spent on it", async () => {
+    const space = await workspace();
+    // --name, so nothing else on the way to the claim needs the runtime.
+    const result = await run(["join", PASTED_INVITE, "--claim", CLAIM, "--name", "Dot", "--json"], space, [], {
+      SHAREDNET_RUNTIME: "Dot Agent",
+    });
+
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("invalid_runtime");
+    expect(result.requests).toEqual([]);
+  });
+
+  it("registers an account's seat under the declared runtime, from the environment or --runtime, keeping the detected driver as evidence", async () => {
+    const accountJoin = () => [
+      {
+        status: 201,
+        body: {
+          instance: {
+            id: "i_DotSeat0001", principal_id: "p_AcCoUnT0001", agent_id: null, runtime_kind: "dot", cli_version: "0.1.9",
+            runtime_metadata: {}, reach: "public", status: "online", display_name: null,
+            started_at: "2026-10-03T00:00:00.000Z", last_seen_at: "2026-10-03T00:00:00.000Z",
+            lease_expires_at: "2099-10-03T00:01:30.000Z", token_expires_at: "2099-10-04T00:00:00.000Z", ended_at: null, revoked_at: null,
+          },
+          token: `sni_${"D".repeat(43)}`,
+          heartbeat_after_seconds: 30,
+        },
+      },
+      {
+        status: 200,
+        body: {
+          room: { id: ROOM_ID, name: "Launch review", state: "open" },
+          membership: { member_id: "i_DotSeat0001", principal_id: "p_AcCoUnT0001", kind: "instance", admitted_by: "invite", name: null, state: "active" },
+        },
+      },
+      { status: 200, body: { items: [], next_cursor: null, has_more: false } },
+    ];
+    const key = { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` };
+
+    const fromEnvironment = await run(["join", PASTED_INVITE, "--json"], await workspace(), accountJoin(), { ...key, SHAREDNET_RUNTIME: "dot" });
+    expect(fromEnvironment.exitCode).toBe(0);
+    const registration = JSON.parse(String(fromEnvironment.requests[0]!.init.body));
+    expect(registration.runtime_kind).toBe("dot");
+    expect(registration.runtime_metadata).toMatchObject({ runtime_source: "declared", detected_driver: "claude-code" });
+    expect(String(fromEnvironment.requests[0]!.init.body)).not.toContain("claude-session-stays-local");
+    expect(JSON.parse(String(fromEnvironment.requests[1]!.init.body))).toEqual({ invite: INVITE_TOKEN });
+
+    const fromFlag = await run(["join", PASTED_INVITE, "--runtime", "dot@2.1", "--json"], await workspace(), accountJoin(), key);
+    expect(fromFlag.exitCode).toBe(0);
+    expect(JSON.parse(String(fromFlag.requests[0]!.init.body))).toMatchObject({
+      runtime_kind: "dot",
+      runtime_metadata: { runtime_source: "declared", driver_version: "2.1", detected_driver: "claude-code" },
+    });
+  });
+
   it("joins from the pasted Web invite, keeps the tokens out of the project and out of stdout", async () => {
     const space = await workspace();
     const result = await run(["join", PASTED_INVITE], space, [

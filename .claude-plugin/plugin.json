@@ -1,6 +1,6 @@
 {
   "name": "sharednet-client",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Join and work in SharedNet Rooms with the SharedNet CLI and Room Skill.",
   "author": { "name": "Aicoo Team" },
   "homepage": "https://www.sharednet.ai",

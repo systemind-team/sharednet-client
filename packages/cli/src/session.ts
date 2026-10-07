@@ -4,7 +4,13 @@ import { platform } from "node:os";
 import { ApiClient, sameOrigin } from "./api-client.ts";
 import { CliError, localError } from "./errors.ts";
 import { computeLocalInstanceKey } from "./instance-computation.ts";
-import { detectRuntime, isRuntimeKind, runtimeMetadataOf } from "./runtime-detection.ts";
+import {
+  declareRuntime,
+  detectRuntime,
+  isRuntimeKind,
+  runtimeMetadataOf,
+  type DetectedRuntime,
+} from "./runtime-detection.ts";
 import {
   deleteSession,
   getOrCreateInstallationSecret,
@@ -160,10 +166,47 @@ export function runtimeMetadata(env: Environment): Record<string, string> {
   return metadata;
 }
 
-export function validateRuntime(value: string): string {
+export function validateRuntime(value: string, from = "--runtime"): string {
   const kind = value.normalize("NFKC").trim().toLowerCase();
   if (isRuntimeKind(kind)) return kind;
-  throw localError("invalid_runtime", "Runtime must be a handle such as claude-code, codex, or opencode.");
+  throw localError(
+    "invalid_runtime",
+    `${from} must be a handle such as claude-code, codex, or dot, optionally followed by @version.`,
+  );
+}
+
+/**
+ * The runtime a harness declares for the seats it runs: `--runtime`, else
+ * SHAREDNET_RUNTIME, which a hosted product sets once in the environment its
+ * agents' commands run in. A handle with an optional `@version`, the shape of
+ * the AI_AGENT convention (`dot`, `dot@2.1`). Null when nothing was declared.
+ */
+export function declaredRuntime(
+  flag: string | undefined,
+  env: Environment,
+): { kind: string; version: string | null } | null {
+  const fromFlag = flag?.trim();
+  const value = fromFlag || env.SHAREDNET_RUNTIME?.trim();
+  if (!value) return null;
+  const from = fromFlag ? "--runtime" : "SHAREDNET_RUNTIME";
+  const at = value.indexOf("@");
+  const kind = validateRuntime(at === -1 ? value : value.slice(0, at), from);
+  if (at === -1) return { kind, version: null };
+  const version = value.slice(at + 1).trim();
+  if (!/^[\x20-\x7e]{1,64}$/.test(version)) {
+    throw localError(
+      "invalid_runtime",
+      `${from} must be a handle such as claude-code, codex, or dot, optionally followed by @version.`,
+    );
+  }
+  return { kind, version };
+}
+
+/** What this CLI reports as its runtime: the harness's declaration, else the driver detected. */
+export function resolveRuntime(env: Environment, flag?: string): DetectedRuntime {
+  const detected = detectRuntime(env);
+  const declared = declaredRuntime(flag, env);
+  return declared === null ? detected : declareRuntime(detected, declared);
 }
 
 export function storedSessionFromStart(
@@ -253,7 +296,7 @@ export async function refreshIfNeeded(
 
 
 export interface RegisterInstanceOptions {
-  /** `--runtime`: overrides the detected driver's name, never its session. */
+  /** `--runtime`: overrides the detected driver's name, never its session. SHAREDNET_RUNTIME when absent. */
   runtimeOverride?: string;
   /** `--new`: a fresh Instance even though the session was detected. */
   forceNew: boolean;
@@ -278,24 +321,23 @@ export async function registerInstance(
   options: RegisterInstanceOptions,
 ): Promise<{ session: StoredSession; payload: InstanceStartPayload }> {
   const installationSecret = await getOrCreateInstallationSecret(paths);
-  // The driver is read off its own environment; --runtime only overrides the name.
-  const detected = detectRuntime(env);
-  const runtimeKind = options.runtimeOverride ? validateRuntime(options.runtimeOverride) : detected.kind;
+  // The driver is read off its own environment; a declaration (--runtime, or
+  // SHAREDNET_RUNTIME from a harness) only overrides the name, and a name other
+  // than the detected driver's comes without that driver's session.
+  const runtime = resolveRuntime(env, options.runtimeOverride);
   let localInstanceKey: string | null = null;
 
   if (!options.forceNew) {
-    const undetected =
-      detected.anchor === null || (options.runtimeOverride !== undefined && runtimeKind !== detected.kind);
-    if (undetected && !options.freshWhenUndetected) {
+    if (runtime.anchor === null && !options.freshWhenUndetected) {
       throw localError(
         "runtime_session_not_detected",
         "The current runtime session could not be detected; use --new deliberately.",
       );
     }
-    if (!undetected) {
+    if (runtime.anchor !== null) {
       // The key goes to the server, which is the one place that can guarantee
       // one live Instance per runtime session. The raw session id stays here.
-      localInstanceKey = computeLocalInstanceKey(installationSecret, runtimeKind, detected.anchor!);
+      localInstanceKey = computeLocalInstanceKey(installationSecret, runtime.kind, runtime.anchor);
     }
   }
 
@@ -304,12 +346,12 @@ export async function registerInstance(
   const tag = options.agent ? await resolveTag(client, apiKey, options.agent) : undefined;
 
   const payload = await client.request<InstanceStartPayload>("POST", "/instances", apiKey, {
-    runtime_kind: runtimeKind,
+    runtime_kind: runtime.kind,
     cli_version: CLI_VERSION,
     ...(localInstanceKey ? { local_instance_key: localInstanceKey } : {}),
     ...(tag === undefined ? {} : { agent_id: tag?.id ?? null }),
     ...(options.reach === undefined ? {} : { reach: options.reach }),
-    runtime_metadata: { ...runtimeMetadata(env), ...runtimeMetadataOf(detected) },
+    runtime_metadata: { ...runtimeMetadata(env), ...runtimeMetadataOf(runtime) },
   });
   const session = storedSessionFromStart(baseUrl, localInstanceKey, payload);
   await writeSession(paths, session);
