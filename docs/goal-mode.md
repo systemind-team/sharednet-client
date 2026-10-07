@@ -64,8 +64,9 @@ sharednet goal run TASK.md --agent codex --agent codex --agent codex \
    result in your workspace, and the full record in `runs/rom_…/`.
 
 `--agent` takes `codex` or `claude-code`, optionally with a model: `--agent codex:gpt-6-luna`.
-Repeat it, up to eight agents. Seats are named `codex-1`, `codex-2`, `claude-code-1`, and so
-on.
+Repeat it, up to 50 agents. Seats are named `codex-1`, `codex-2`, `claude-code-1`, and so
+on. Each agent is a container of its own, started and seated one after another, so a large team
+takes longer to start and needs a machine that can hold that many containers at once.
 
 ## End conditions (`--until`)
 

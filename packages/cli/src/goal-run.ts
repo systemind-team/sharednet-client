@@ -29,7 +29,7 @@ export interface AgentSpec {
 }
 
 const DRIVERS: readonly Driver[] = ["codex", "claude-code"];
-const MAX_AGENTS = 8;
+const MAX_AGENTS = 50;
 
 /** `--agent codex`, `--agent codex:gpt-6-luna`, `--agent claude-code:claude-sonnet-5-5`; repeat it for more seats. */
 export function parseAgents(raws: readonly string[]): AgentSpec[] {
