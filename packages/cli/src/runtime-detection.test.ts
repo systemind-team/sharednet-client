@@ -2,9 +2,9 @@
 
 import { describe, expect, it } from "vitest";
 
-import { detectRuntime, runtimeMetadataOf } from "./runtime-detection.ts";
+import { declareRuntime, detectRuntime, runtimeMetadataOf } from "./runtime-detection.ts";
 
-const noParent = { parentProcess: () => null, ancestorDriver: () => null };
+const noParent = { parentProcess: () => null, ancestorDriver: () => null, hostname: () => null };
 
 describe("driver detection", () => {
   it("recognises Claude Code from its own environment, with session, version, and entrypoint", () => {
@@ -141,6 +141,73 @@ describe("driver detection", () => {
     });
     // With no tree to consult, Codex's per-exec id is the safer guess.
     expect(detectRuntime(both, noParent).kind).toBe("codex");
+  });
+
+  it("recognises Muse by the paths its runtime cell exports into every command", () => {
+    // What the cell's rendered guest.env carries, less the proxy and CA lines.
+    const cell = {
+      HOME: "/home/hatch",
+      JARVIS_HOME: "/home/hatch",
+      JARVIS_BIN_DIR: "/opt/hatch/bin",
+      JARVIS_AUTHD_SOCK: "/run/hatch/auth/authd.sock",
+      PATH: "/opt/hatch/bin:/opt/hatch-image/bin:/usr/bin:/bin",
+    };
+    const detected = detectRuntime(cell, noParent);
+    expect(detected).toEqual({ kind: "muse", anchor: null, version: null, entrypoint: null, source: "detected" });
+    expect(runtimeMetadataOf(detected)).toEqual({ runtime_source: "detected" });
+    // Either path alone is the cell's.
+    expect(detectRuntime({ JARVIS_BIN_DIR: "/opt/hatch/bin" }, noParent).kind).toBe("muse");
+
+    // JARVIS_ is nobody's reserved prefix: only the cell's values count.
+    expect(detectRuntime({ JARVIS_HOME: "/Users/someone/jarvis" }, noParent).kind).toBe("custom");
+  });
+
+  it("recognises Muse by the cell's machine name when its environment is not there", () => {
+    // htch-runtime is what the three Muse seats taken before this reported.
+    expect(detectRuntime({}, { ...noParent, hostname: () => "htch-runtime" })).toEqual({
+      kind: "muse",
+      anchor: null,
+      version: null,
+      entrypoint: null,
+      source: "detected",
+    });
+    expect(detectRuntime({}, { ...noParent, hostname: () => "htch-runtime-2" }).kind).toBe("custom");
+    // A driver that left its variables still names the seat on the cell's machine.
+    expect(detectRuntime({ CLAUDECODE: "1" }, { ...noParent, hostname: () => "htch-runtime" }).kind).toBe("claude-code");
+  });
+
+  it("lets a driver with its own session id inside the cell outrank the cell's markers", () => {
+    const codexInCell = { JARVIS_HOME: "/home/hatch", CODEX_SESSION_ID: "s-codex" };
+    expect(detectRuntime(codexInCell, noParent)).toMatchObject({ kind: "codex", anchor: "s-codex" });
+  });
+
+  it("names the seat for a harness that declares itself, and keeps the driver it found as evidence only", () => {
+    // Dot runs `codex exec` in a container and sets SHAREDNET_RUNTIME=dot.
+    const codex = detectRuntime({ CODEX_SESSION_ID: "s-codex", CODEX_VERSION: "0.0.0", CODEX_CI: "1" }, noParent);
+    const dot = declareRuntime(codex, { kind: "dot", version: null });
+    expect(dot).toEqual({
+      kind: "dot",
+      // Codex's session is not Dot's: no anchor, so no session key either.
+      anchor: null,
+      version: null,
+      entrypoint: null,
+      source: "declared",
+      detectedDriver: "codex",
+    });
+    // Codex's version and entrypoint are not lent to Dot.
+    expect(runtimeMetadataOf(dot)).toEqual({ runtime_source: "declared", detected_driver: "codex" });
+
+    // A version comes only from the declaration itself.
+    expect(runtimeMetadataOf(declareRuntime(codex, { kind: "dot", version: "2.1" }))).toEqual({
+      runtime_source: "declared",
+      driver_version: "2.1",
+      detected_driver: "codex",
+    });
+    // Declaring what was detected changes nothing, session included.
+    expect(declareRuntime(codex, { kind: "codex", version: "9.9" })).toBe(codex);
+    // With nothing detected underneath, there is no driver to keep.
+    const declaredOverNothing = declareRuntime(detectRuntime({}, noParent), { kind: "dot", version: null });
+    expect(runtimeMetadataOf(declaredOverNothing)).toEqual({ runtime_source: "declared" });
   });
 
   it("keeps reported strings printable and bounded", () => {

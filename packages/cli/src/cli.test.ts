@@ -456,3 +456,82 @@ describe("reach: forming a group from the account CLI", () => {
     expect(sentBody(denied.requests[0]!)).toEqual({ resolution: "denied" });
   });
 });
+
+describe("the runtime a session reports", () => {
+  // What Muse's runtime cell exports into every command it runs, with no
+  // coding driver underneath: the harness's Codex variables are blanked.
+  const MUSE_CELL = {
+    JARVIS_HOME: "/home/hatch",
+    JARVIS_BIN_DIR: "/opt/hatch/bin",
+    CODEX_SESSION_ID: "",
+    CODEX_THREAD_ID: "",
+  };
+
+  it("registers a session in Muse's runtime cell as muse, detected, and fresh because the cell has no session id", async () => {
+    const bare = await harness(["session", "start", "--json"], [], MUSE_CELL);
+    expect(bare.exitCode).toBe(2);
+    expect(bare.stderr.join(" ")).toContain("runtime_session_not_detected");
+    expect(bare.requests).toEqual([]);
+
+    const fresh = await harness(["session", "start", "--new", "--json"], [registered("i_museSeat01")], MUSE_CELL);
+    expect(fresh.exitCode).toBe(0);
+    const body = sentBody(fresh.requests[0]!);
+    expect(body.runtime_kind).toBe("muse");
+    expect(body).not.toHaveProperty("local_instance_key");
+    expect(body.runtime_metadata).toMatchObject({ runtime_source: "detected" });
+    expect(body.runtime_metadata).not.toHaveProperty("driver_version");
+    // The cell's paths stay on the machine; only the workspace's last segment goes.
+    expect(JSON.stringify(body)).not.toContain("/opt/hatch/bin");
+  });
+
+  it("names a session for the harness that sets SHAREDNET_RUNTIME, as declared, with the driver it runs kept as evidence", async () => {
+    // A harness running `codex exec` whose environment says what it is.
+    const dot = { SHAREDNET_RUNTIME: "dot", CODEX_VERSION: "0.0.0", CODEX_CI: "1" };
+    const result = await harness(["session", "start", "--new", "--json"], [registered("i_dotSeat001")], dot);
+    expect(result.exitCode).toBe(0);
+    const body = sentBody(result.requests[0]!);
+    expect(body.runtime_kind).toBe("dot");
+    expect(body.runtime_metadata).toMatchObject({ runtime_source: "declared", detected_driver: "codex" });
+    // Codex's version and entrypoint describe Codex, not the harness.
+    expect(body.runtime_metadata).not.toHaveProperty("driver_version");
+    expect(body.runtime_metadata).not.toHaveProperty("entrypoint");
+    expect(body).not.toHaveProperty("local_instance_key");
+    expect(JSON.stringify(body)).not.toContain("provider-session-must-remain-local");
+
+    // Like --runtime, a name other than the detected driver's comes without
+    // that driver's session, so a keyed start is refused rather than guessed.
+    const keyed = await harness(["session", "start", "--json"], [], dot);
+    expect(keyed.exitCode).toBe(2);
+    expect(keyed.stderr.join(" ")).toContain("runtime_session_not_detected");
+  });
+
+  it("takes a version after @, lets --runtime win over the environment, and refuses a malformed declaration before any request", async () => {
+    const versioned = await harness(["session", "start", "--new", "--json"], [registered("i_dotSeat002")], {
+      SHAREDNET_RUNTIME: "Dot@2.1",
+    });
+    expect(sentBody(versioned.requests[0]!)).toMatchObject({
+      runtime_kind: "dot",
+      runtime_metadata: { runtime_source: "declared", driver_version: "2.1", detected_driver: "codex" },
+    });
+
+    const flagged = await harness(["session", "start", "--new", "--runtime", "muse", "--json"], [registered("i_flagSeat01")], {
+      SHAREDNET_RUNTIME: "dot",
+    });
+    expect(sentBody(flagged.requests[0]!).runtime_kind).toBe("muse");
+
+    const sameAsDetected = await harness(["session", "start", "--json"], [registered("i_codexSeat1")], {
+      SHAREDNET_RUNTIME: "codex",
+    });
+    // Declaring the driver that is running keeps its session key and its details.
+    expect(sentBody(sameAsDetected.requests[0]!).local_instance_key).toMatch(HEX_64);
+    expect(sentBody(sameAsDetected.requests[0]!).runtime_metadata).toMatchObject({ runtime_source: "detected" });
+
+    for (const malformed of ["Dot Agent", "dot@", "@2.1", "dot@\u0007"]) {
+      const refused = await harness(["session", "start", "--new", "--json"], [], { SHAREDNET_RUNTIME: malformed });
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr.join(" ")).toContain("invalid_runtime");
+      expect(refused.stderr.join(" ")).toContain("SHAREDNET_RUNTIME");
+      expect(refused.requests).toEqual([]);
+    }
+  });
+});
