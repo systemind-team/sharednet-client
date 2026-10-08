@@ -224,7 +224,7 @@ describe("prepareRun", () => {
 });
 
 describe("runGoal", () => {
-  it("runs every seat in turns until the budget is spent, keeps each Agent's trace, and never hands the owner's key to the container", async () => {
+  it.each(["board", "compiled"] as const)("runs every %s seat with current state until the budget is spent and keeps credentials private", async (roomType) => {
     const out = await temporary();
     const workspace = await temporary();
     const plan: RunPlan = {
@@ -243,6 +243,7 @@ describe("runGoal", () => {
         const name = command[command.indexOf("--name") + 1]!;
         return { stdout: JSON.stringify({ member_id: name === "codex-1" ? "i_CodexOne01" : "i_CodexTwo02" }) };
       }
+      if (command[0] === "sharednet" && command[1] === "open") return { stdout: JSON.stringify({ protocol_version: "rac/1", sequence: (turnsTaken.get(seat!) ?? 0) + 1, digest: "abc", projection: { work: {} }, obligations: `Personal obligation for ${seat}`, events: [] }) };
       if (command[2] === "codex") {
         const resumed = command[4] === "resume";
         const turn = (turnsTaken.get(seat!) ?? 0) + 1;
@@ -291,7 +292,8 @@ describe("runGoal", () => {
     const client = {
       async request(method: string, path: string, token: string, body?: unknown) {
         requests.push(`${method} ${path} ${token}`);
-        if (method === "GET" && path === `/rooms/${ROOM}`) return { room: { id: ROOM, state: "open", goal }, memberships: [] };
+        if (method === "GET" && path === `/rooms/${ROOM}`) return { room: { id: ROOM, type: roomType, state: "open", goal }, memberships: [] };
+        if (method === "GET" && path === `/rooms/${ROOM}/state`) return { protocol_version: "rac/1", sequence: 2, digest: "final-digest", projection: { work: {} }, obligations: "none", events: [{ seq: 1 }, { seq: 2 }] };
         if (method === "GET" && path.startsWith(`/rooms/${ROOM}/wait?`)) {
           await new Promise((resolve) => setTimeout(resolve, 5));
           return { items: [] };
@@ -308,7 +310,7 @@ describe("runGoal", () => {
       client,
       "sni_owner-seat",
       OWNER_KEY,
-      { plan, roomId: ROOM, inviteToken: INVITE, goal: "Make it pass.", goalSequence: 1, until: goal.until, baseUrl: "http://127.0.0.1:3117", out, checkEveryMs: 60_000, quietChecks: false },
+      { plan, roomType, roomId: ROOM, inviteToken: INVITE, goal: "Make it pass.", goalSequence: 1, until: goal.until, baseUrl: "http://127.0.0.1:3117", out, checkEveryMs: 60_000, quietChecks: false },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
     );
 
@@ -316,6 +318,10 @@ describe("runGoal", () => {
     expect(result.ended_by).toMatchObject({ trigger: "budget 1k tokens", detail: "1200 tokens" });
     // The record then takes each session's own file: codex-1's saw a cut turn (1,300), codex-2's matches its stream (600).
     expect(result.tokens).toBe(1_900);
+    if (roomType === "compiled") {
+      expect(JSON.parse(await readFile(join(out, "state.json"), "utf8"))).toMatchObject({ digest: "final-digest", sequence: 2 });
+      expect((await readFile(join(out, "acts.ndjson"), "utf8")).trim().split("\n")).toHaveLength(2);
+    }
     expect(result.agents.map((seat) => [seat.name, seat.tokens, seat.usage])).toEqual([
       ["codex-1", 1_300, { input: 1_000, cached: 4_000, output: 300 }],
       ["codex-2", 600, { input: 400, cached: 1_600, output: 200 }],
@@ -330,6 +336,16 @@ describe("runGoal", () => {
     expect(turns.filter((call) => call.args.includes("resume") && call.args.includes("thread-i_CodexOne01"))).toHaveLength(1);
     // Every turn carries SHAREDNET_WAKE=off, so an agent's own `sharednet join` mid-turn starts no wake service.
     expect(turns.length).toBeGreaterThan(0);
+    const opens = calls.filter((call) => call.args.includes("open"));
+    expect(opens).toHaveLength(roomType === "compiled" ? turns.length : 0);
+    if (roomType === "compiled") {
+      expect(turns.every((call) => call.args.at(-1)!.includes("Personal obligation for"))).toBe(true);
+      expect(turns[0]!.args.at(-1)).toContain("i_CodexTwo02");
+      expect(turns[0]!.args.at(-1)).toContain("sharednet act --data");
+      expect(turns[0]!.args.at(-1)!.match(/This is a compiled Room/g)).toHaveLength(1);
+      expect(turns[0]!.args.at(-1)).toContain("result_ref");
+    }
+
     expect(turns.every((call) => call.args.join(" ").includes("-e SHAREDNET_WAKE=off"))).toBe(true);
     // Web search is live unless the run turns it off, and the record says which.
     expect(turns.every((call) => call.args.includes('web_search="live"'))).toBe(true);

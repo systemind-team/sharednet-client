@@ -2511,3 +2511,169 @@ describe("sharednet files", () => {
     expect(all.requests[0]!.url).toBe("https://www.sharednet.ai/api/v1/artifacts?limit=20");
   });
 });
+
+
+describe("compiled Room commands", () => {
+  async function joinedSpace() {
+    const space = await workspace();
+    expect((await run(["join", PASTED_INVITE], space, [joined()])).exitCode).toBe(0);
+    return space;
+  }
+  const state = { protocol_version: "rac/1", sequence: 2, digest: "abc", projection: { work: {} }, obligations: "Review W with evidence", events: [] };
+  const accepted = { accepted: true, code: "OK", detail: "admitted", binding: true, seq: 3, digest: "def" };
+  it("opens typed state using this seat's credential", async () => {
+    const space = await joinedSpace();
+    const result = await run(["open", "--json"], space, [{ body: state }]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(state);
+    expect(result.requests[0]!.url).toContain(`/rooms/${ROOM_ID}/state`);
+    expect(result.requests[0]!.init.headers).toMatchObject({ authorization: `Bearer ${MEMBER_TOKEN}` });
+  });
+  it("posts a typed envelope unchanged and preserves a semantic refusal's detail", async () => {
+    const space = await joinedSpace();
+    const envelope = { type: "work.accept", work_id: "W", idempotency_key: "accept-W" };
+    const result = await run(["act", "--data", JSON.stringify(envelope), "--json"], space, [{ status: 422, body: { ...accepted, accepted: false, code: "WRONG_ACTOR", detail: "Only the requested assignee may accept W." } }]);
+    expect(result.exitCode).toBe(4);
+    expect(result.stderr).toContain("WRONG_ACTOR");
+    expect(result.stderr).toContain("Only the requested assignee may accept W.");
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(String(result.requests[0]!.init.body))).toEqual(envelope);
+    expect(result.requests[0]!.url).toContain(`/rooms/${ROOM_ID}/acts`);
+  });
+  it("uploads the actual file into the Room before delivering its stored artifact ID", async () => {
+    const { writeFile } = await import("node:fs/promises");
+    const space = await joinedSpace();
+    const bytes = Buffer.from("diff --git a/a b/a\n+actual patch\n");
+    await writeFile(join(space.project, "fix.patch"), bytes);
+    const result = await run(["deliver", "--work", "W", "--name", "patch", "--file", "fix.patch", "--json"], space, [{ body: { artifact: { id: "art_AbCdEfGhIj" } } }, { body: accepted }]);
+    expect(result.exitCode).toBe(0);
+    expect(Buffer.from(result.requests[0]!.init.body as Uint8Array)).toEqual(bytes);
+    expect(result.requests[0]!.init.headers).toMatchObject({ "x-sharednet-room": ROOM_ID, "x-sharednet-filename": "fix.patch" });
+    expect(JSON.parse(String(result.requests[1]!.init.body))).toMatchObject({ type: "work.result", work_id: "W", artifacts: { patch: "art_AbCdEfGhIj" } });
+    expect(JSON.parse(result.stdout)).toEqual(accepted);
+  });
+  it("reports a failed upload or refused delivery as failure without a success receipt", async () => {
+    const { writeFile } = await import("node:fs/promises");
+    const space = await joinedSpace();
+    await writeFile(join(space.project, "fix.patch"), "patch");
+    for (const responses of [
+      [{ status: 403, body: { error: { code: "forbidden" } } }],
+      [{ body: { artifact: { id: "art_AbCdEfGhIj" } } }, { status: 422, body: { ...accepted, accepted: false, code: "BAD_STATE", detail: "Accept W first." } }],
+    ]) {
+      const result = await run(["deliver", "--work", "W", "--name", "patch", "--file", "fix.patch", "--json"], space, responses);
+      expect(result.exitCode).toBe(4);
+      expect(result.stdout).toBe("");
+    }
+  });
+  it("rejects malformed multi-file forms before uploading anything", async () => {
+    const space = await workspace();
+    for (const args of [
+      ["--artifact", "patch=a", "--name", "patch", "--file", "b"],
+      ["--artifact", "patch=a", "--name", "patch"],
+      ["--artifact", "patch=a", "--file", "b"],
+      ["--artifact", "patch=a", "--artifact", "patch=b"],
+      ["--artifact", "patch=a", "--artifact", " patch =b"],
+      ["--artifact", "=a"], ["--artifact", "patch="],
+      ["--artifact", " =a"], ["--artifact", "patch= "],
+      ["--artifact", "patch"],
+      ["--name", " ", "--file", "a"], ["--name", "patch", "--file", " "],
+    ]) {
+      const result = await run(["deliver", "--work", "W", ...args, "--json"], space, []);
+      expect(result.exitCode, JSON.stringify(args)).toBe(2);
+      expect(JSON.parse(result.stderr).error.code).toBe("invalid_arguments");
+      expect(result.requests).toHaveLength(0);
+    }
+  });
+  it.each(["upload", "act"])("reports multi-file %s failure without a success receipt or partial result", async (failure) => {
+    const { writeFile } = await import("node:fs/promises");
+    const space = await joinedSpace();
+    await writeFile(join(space.project, "patch.txt"), "patch");
+    await writeFile(join(space.project, "report.txt"), "report");
+    const result = await run(["deliver", "--work", "W", "--artifact", "patch=patch.txt", "--artifact", "report=report.txt", "--json"], space, [
+      { body: { artifact: { id: "art_AbCdEfGhIj" } } },
+      ...(failure === "act" ? [{ body: { artifact: { id: "art_0123456789" } } }, { status: 422, body: { ...accepted, accepted: false, code: "BAD_STATE", detail: "Accept W first." } }] : [{ status: 403, body: { error: { code: "forbidden" } } }]),
+    ]);
+    expect(result.exitCode).toBe(4);
+    expect(result.stdout).toBe("");
+    expect(result.requests).toHaveLength(failure === "upload" ? 2 : 3);
+    expect(result.requests.slice(0, 2).every((request) => request.url.endsWith("/artifacts"))).toBe(true);
+    if (failure === "act") expect(JSON.parse(String(result.requests[2]!.init.body))).toMatchObject({ artifacts: { patch: "art_AbCdEfGhIj", report: "art_0123456789" } });
+  });
+  it("puts current personal obligations into each compiled watch invocation", async () => {
+    const space = await workspace();
+    const admission = joined();
+    Object.assign(admission.body.room, { type: "compiled" });
+    expect((await run(["join", PASTED_INVITE], space, [admission])).exitCode).toBe(0);
+    let input: unknown;
+    const result = await run(["watch", "--on", "message", "--run", "driver", "--max-runs", "1", "--json"], space, [page([message(1, "act admitted")]), { body: state }], {}, { exec: async (_command, value) => { input = JSON.parse(value); return { exitCode: 0, stdout: "", stderr: "" }; } });
+    expect(result.exitCode).toBe(0);
+    expect(input).toMatchObject({ compiled: state });
+  });
+});
+
+
+it("includes obligations in a compiled serve command's JSON input", async () => {
+  const space = await workspace();
+  const admission = joined();
+  Object.assign(admission.body.room, { type: "compiled" });
+  await run(["join", PASTED_INVITE, "--no-wake"], space, [admission]);
+  const state = { protocol_version: "rac/1", sequence: 1, digest: "abc", projection: {}, obligations: "Accept W", events: [] };
+  const { exec, calls } = recorder({ exitCode: 0, stdout: "" });
+  const result = await run(["serve", "--run", "driver", "--json"], space, [page([message(2, "act admitted")]), { body: state }, revoked()], {}, { exec, service: { delivered_through: 1, acked_through: 1 } });
+  expect(result.exitCode).toBe(0);
+  expect(calls).toHaveLength(1);
+  expect(calls[0]!.input).toMatchObject({ compiled: state });
+});
+
+it("reads personal compiled state before resuming a seat's own session", async () => {
+  const space = await workspace();
+  const codeEnv = { CLAUDE_SESSION_ID: "", CODEX_SESSION_ID: "compiled-driver-thread", CODEX_HOME: "/codex-home", PATH: "" };
+  const admission = joined([message(1, "Welcome")]);
+  Object.assign(admission.body.room, { type: "compiled" });
+  await run(["join", PASTED_INVITE], space, [admission], codeEnv);
+  const addressed = { ...message(2, "@codex review W"), mentions: [MEMBER_ID] };
+  const state = { protocol_version: "rac/1", sequence: 3, digest: "abc", projection: { work: {} }, obligations: "Review W with the current result", events: [] };
+  const turns: TurnSpec[] = [];
+  const result = await run(["serve", "--json"], space, [page([addressed]), page([addressed]), { body: state }, revoked()], codeEnv, {
+    service: { delivered_through: 1, acked_through: 1 },
+    runTurn: async (spec) => {
+      turns.push(spec);
+      return { exitCode: 0, stdout: [JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "(no reply)" } }), JSON.stringify({ type: "turn.completed", usage: {} })].join("\n"), stderr: "", timedOut: false };
+    },
+  });
+  expect(result.exitCode).toBe(0);
+  expect(turns).toHaveLength(1);
+  expect(turns[0]!.input).toContain(state.obligations);
+  expect(turns[0]!.input).toContain("sharednet act --data");
+  expect(result.requests[2]!.url).toContain(`/rooms/${ROOM_ID}/state`);
+  expect(header(result.requests[2]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+});
+
+
+it.each(["watch", "serve"])("hydrates a legacy compiled credential before %s invokes a driver and remembers the mode", async (verb) => {
+  const { writeFile } = await import("node:fs/promises");
+  const space = await workspace();
+  const admission = joined([message(1, "Welcome")]);
+  Object.assign(admission.body.room, { type: "compiled" });
+  await run(["join", PASTED_INVITE, "--no-wake"], space, [admission]);
+  const file = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, `${MEMBER_ID}.json`);
+  const credential = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+  delete credential.room_type;
+  await writeFile(file, JSON.stringify(credential));
+  const state = { protocol_version: "rac/1", sequence: 1, digest: "abc", projection: {}, obligations: "Accept W", events: [] };
+  const { exec, calls } = recorder({ exitCode: 0, stdout: "" });
+  const mode = roomState("open");
+  Object.assign(mode.body.room, { type: "compiled" });
+  const command = verb === "watch" ? ["watch", "--on", "message", "--run", "driver", "--max-runs", "1", "--json"] : ["serve", "--run", "driver", "--json"];
+  const responses = [mode, page([message(2, "act admitted")]), { body: state }, ...(verb === "serve" ? [revoked()] : [])];
+  const result = await run(command, space, responses, {}, { exec, service: { delivered_through: 1, acked_through: 1 } });
+  expect(result.exitCode, result.stderr).toBe(0);
+  expect(result.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}`);
+  expect(header(result.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+  expect(calls[0]!.input).toMatchObject({ compiled: state });
+  expect(JSON.parse(await readFile(file, "utf8")).room_type).toBe("compiled");
+  // A later watch needs only its new messages and per-seat state, no second mode request.
+  const again = await run(["watch", "--on", "message", "--run", "driver", "--max-runs", "1", "--json"], space, [page([message(3, "next act")]), { body: state }], {}, { exec, service: { delivered_through: 2, acked_through: 2 } });
+  expect(again.exitCode, again.stderr).toBe(0);
+  expect(again.requests).toHaveLength(2);
+});

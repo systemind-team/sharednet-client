@@ -1,3 +1,4 @@
+import { compiledPrompt, COMPILED_HELP, type CompiledState } from "./compiled.ts";
 import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -233,8 +234,8 @@ export interface WakeShape {
 }
 
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
-export function openingPrompt(input: { seat: AgentSpec; seats: AgentSpec[]; roomId: string; goal: string; goalSequence: number; until: string[] }): string {
-  const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => seat.name);
+export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[] }): string {
+  const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
   return [
     `You are ${input.seat.name}, one of ${input.seats.length} agents working on one goal in SharedNet Room ${input.roomId}.${others.length > 0 ? ` The others: ${others.join(", ")}.` : ""}`,
@@ -250,6 +251,7 @@ export function openingPrompt(input: { seat: AgentSpec; seats: AgentSpec[]; room
     `You share this directory (${CONTAINER_WORKSPACE}) with the others, and only this one: each of you works in its own container, so what you install elsewhere is yours alone. Talk to them only through the Room, with the sharednet command:`,
     "  sharednet read --last 30 --json    what has been said",
     '  sharednet say "…" --json          say something; keep it short',
+    ...(input.roomType === "compiled" ? [COMPILED_HELP] : []),
     "Do not run `sharednet wait` or `sharednet watch`: when your turn ends, you are woken with whatever is said next.",
     "Lines from `runner` are the goal's machinery, such as a check's result, not a person.",
     "Agree in the Room who does what, do your part, and end your turn when there is nothing more to do now.",
@@ -397,6 +399,7 @@ export interface SeatRecord {
 export interface GoalRunInput {
   plan: RunPlan;
   roomId: string;
+  roomType?: "board" | "compiled";
   inviteToken: string;
   goal: string;
   goalSequence: number;
@@ -565,6 +568,16 @@ export async function runGoal(
     }
 
     const runTurn = async (seat: SeatRecord, prompt: string, wake: WakeShape | null) => {
+      if (input.roomType === "compiled") {
+        // The CLI inside the seat's container holds its own credential; the owner cannot render its obligations.
+        const opened = await exec(seat, ["sharednet", "open", "--json"]);
+        if (opened.code !== 0) throw localError("state_unavailable", "Could not read this seat's compiled Room state.");
+        let state: CompiledState;
+        try { state = JSON.parse(opened.stdout) as CompiledState; }
+        catch { throw localError("invalid_server_response", "The compiled Room state was not JSON."); }
+        if (typeof state.obligations !== "string") throw localError("invalid_server_response", "The compiled Room state has no personal obligations.");
+        prompt += `\n\n${compiledPrompt(state, false)}`;
+      }
       seat.turns += 1;
       const number = String(seat.turns).padStart(3, "0");
       const directory = join(input.out, "agents", seat.name);
@@ -613,7 +626,7 @@ export async function runGoal(
 
     // One policy for every seat: woken by anything another member says, merged over 2 s, until the Room closes.
     const seatLoop = async (seat: SeatRecord) => {
-      let prompt = openingPrompt({ seat, seats: plan.agents, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until });
+      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until });
       let wake: WakeShape | null = null;
       let failedInARow = 0;
       while (!ended) {

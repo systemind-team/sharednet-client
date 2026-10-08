@@ -5,21 +5,25 @@
       "source": "packages/cli/src/cli.test.ts",
       "sourceSha256": "930331cc2605b4666acc97eca8b31cc359ee19fe21f4ba37cf24056c6a2af498",
       "changes": [
-        "Port hosted runtime declarations and Muse detection from SharedNet #163; real handler coverage remains in the service repository."
+        "Port hosted runtime declarations and Muse detection from SharedNet #163; real handler coverage remains in the service repository.",
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
       ]
     },
     "packages/cli/src/goal.test.ts": {
       "source": "packages/cli/src/goal.test.ts",
       "sourceCommit": "23c45afaa93a64bb9a68d7b5b1b4a4401259c10c",
       "sourceSha256": "e5ff1d43ae2dadb5b22cdf86c307e8b2304164c9ee6c5a70d790b347d6fba6f7",
-      "changes": []
+      "changes": [
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
+      ]
     },
     "packages/cli/src/goal-run.test.ts": {
       "source": "packages/cli/src/goal-run.test.ts",
       "sourceCommit": "23c45afaa93a64bb9a68d7b5b1b4a4401259c10c",
       "sourceSha256": "bb0651544baba907d326a8a326f3b3388aaf539c6e8179bf15a4688874d1a668",
       "changes": [
-        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is fc50fc7ff95bb6326d186f0f395b17a3b47c53fe373f35510ecfa29b0a72f1b0."
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is fc50fc7ff95bb6326d186f0f395b17a3b47c53fe373f35510ecfa29b0a72f1b0.",
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
       ]
     },
     "packages/cli/src/guest.test.ts": {
@@ -28,7 +32,8 @@
       "changes": [
         "Remove private server imports; retain all pure client tests.",
         "Updated to SharedNet 3d66c5ebdd3d (#183\u2013#191), whose sha256 is 55c7938dc015295f871932f97fac9a79ab8995c5ce68642c27208c45d432120d, with the same removal: the private server's imports, and every test that needs it (two more, listed under privateTestsRetainedAtSource).",
-        "Port hosted runtime declarations and Muse detection from SharedNet #163; real handler coverage remains in the service repository."
+        "Port hosted runtime declarations and Muse detection from SharedNet #163; real handler coverage remains in the service repository.",
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
       ]
     },
     "packages/cli/src/instance-computation.test.ts": {
@@ -71,13 +76,16 @@
     "packages/cli/src/api-client.ts": {
       "source": "packages/cli/src/api-client.ts",
       "sourceSha256": "840d37ed7e9099f3f08fcafec26a2ff48020a4226ed305f98f03c616d288f2f4",
-      "changes": []
+      "changes": [
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
+      ]
     },
     "packages/cli/src/cli.ts": {
       "source": "packages/cli/src/cli.ts",
       "sourceSha256": "9062dc6877d203ad5aa23ac6568567d4d55efe8b8f1a5c25fc63b76557966ac2",
       "changes": [
-        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 0c43b38027c8ee5039a14e0f324897e7da46b2592becbe7c4eec12ff0d06dca8."
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 0c43b38027c8ee5039a14e0f324897e7da46b2592becbe7c4eec12ff0d06dca8.",
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
       ]
     },
     "packages/cli/src/errors.ts": {
@@ -89,14 +97,17 @@
       "source": "packages/cli/src/goal.ts",
       "sourceCommit": "23c45afaa93a64bb9a68d7b5b1b4a4401259c10c",
       "sourceSha256": "f237360e6e3f059e232e02e9875ff23edec4694a5edc43d704517df1e8848b5c",
-      "changes": []
+      "changes": [
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
+      ]
     },
     "packages/cli/src/goal-run.ts": {
       "source": "packages/cli/src/goal-run.ts",
       "sourceCommit": "23c45afaa93a64bb9a68d7b5b1b4a4401259c10c",
       "sourceSha256": "77fbfac18209c69b8f501d0fb86c0e5e2721d8cd489a8c098d1de0e3653f6c70",
       "changes": [
-        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 2711a04c434c30410f1d050999b8b2bb3ac45622bec785890ff4ad7ce24f165b."
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 2711a04c434c30410f1d050999b8b2bb3ac45622bec785890ff4ad7ce24f165b.",
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
       ]
     },
     "packages/cli/src/guest.ts": {
@@ -104,7 +115,8 @@
       "sourceSha256": "f25dff24e8aed7f076e931b18e3e09ceda0b10537304004e323fe76989c952b5",
       "changes": [
         "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is a143227d6f7e0ff9c81c6639330cd600e94cec4e8d626fa4a40d769336c07e7b.",
-        "Port hosted runtime declarations and Muse detection from SharedNet #163; real handler coverage remains in the service repository."
+        "Port hosted runtime declarations and Muse detection from SharedNet #163; real handler coverage remains in the service repository.",
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
       ]
     },
     "packages/cli/src/instance-computation.ts": {
@@ -142,7 +154,8 @@
       "source": "packages/cli/src/storage.ts",
       "sourceSha256": "963c046a4bfdf7fac66900321eb24282a38ad3d03534bc8c516066df09ca7031",
       "changes": [
-        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 997d20b8d94032a786c4f0adf85482d3149b8020b5c8ef35528ecd7a2b22e63e."
+        "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is 997d20b8d94032a786c4f0adf85482d3149b8020b5c8ef35528ecd7a2b22e63e.",
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
       ]
     },
     "packages/cli/src/triggers.ts": {
@@ -171,7 +184,8 @@
       "source": "packages/cli/package.json",
       "sourceSha256": "d91fe24ce97732b81c0f4a9547f788da03f0d432ff2bd2ea5abfc002647e3f5d",
       "changes": [
-        "Update source/issue URLs and add a typecheck script; retain version and runtime dependency policy."
+        "Update source/issue URLs and add a typecheck script; retain version and runtime dependency policy.",
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
       ]
     },
     "packages/cli/README.md": {
@@ -243,6 +257,14 @@
       "source": "packages/cli/LICENSE",
       "sourceSha256": "b00def07d3c6748465930e8216fb39d8cad160283e55b511f3c6402eb4a5ff77",
       "changes": []
+    },
+    "packages/cli/src/compiled.ts": {
+      "source": "packages/cli/src/compiled.ts",
+      "sourceSha256": "d6df549871a28a842a7a1440289b0914a3b7eb4ab2cd58d9394a5752afe694b1",
+      "changes": [
+        "Compiled Room command help and wire state; imported with the compiled Rooms integration."
+      ],
+      "sourceCommit": "a145d587528d32bf0b658b3a3a4617990f5ae137"
     }
   },
   "privateTestsRetainedAtSource": [
@@ -277,6 +299,10 @@
     {
       "file": "packages/cli/src/guest.test.ts",
       "test": "seats Muse and Dot under their own names on the server the CLI ships, by both doors"
+    },
+    {
+      "file": "packages/cli/src/compiled.test.ts",
+      "test": "entire real-handler single- and multi-artifact lifecycle suite"
     }
   ],
   "repositoryFiles": [

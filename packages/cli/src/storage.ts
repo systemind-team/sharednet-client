@@ -42,6 +42,7 @@ export interface StoredRoomCredential {
   name: string;
   member_token: string;
   joined_at: string;
+  room_type?: "board" | "compiled";
   /** The session that took the seat, which `serve` resumes when the seat is addressed. */
   wake?: SeatWake;
 }
@@ -454,6 +455,7 @@ function parseRoomCredential(raw: string): StoredRoomCredential {
     name: requireString(value.name, source),
     member_token: requireString(value.member_token, source),
     joined_at: requireString(value.joined_at, source),
+    ...(value.room_type === "board" || value.room_type === "compiled" ? { room_type: value.room_type } : {}),
     ...(wake ? { wake } : {}),
   };
 }
