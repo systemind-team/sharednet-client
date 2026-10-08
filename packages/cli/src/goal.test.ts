@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { ApiClient } from "./api-client.ts";
 import { CliError } from "./errors.ts";
-import { goalWatch, parseUntil, parseUntilList, withRequestLimit, workspaceSnapshots } from "./goal.ts";
+import { goalExport, goalWatch, parseUntil, parseUntilList, withRequestLimit, workspaceSnapshots } from "./goal.ts";
 
 const ROOM = "rom_AbCdEfGhIj";
 const HUMAN = "i_HumanSeat01";
@@ -334,5 +334,20 @@ describe("requests", () => {
       });
     const client = new ApiClient("http://127.0.0.1:3001", withRequestLimit(hanging, 20));
     await expect(client.request("GET", `/rooms/${ROOM}/wait?after=0&timeout=25`, "sni_member")).rejects.toMatchObject({ code: "service_unavailable" });
+  });
+});
+
+
+describe("compiled exports", () => {
+  it("keeps the canonical log and final projection beside the conversation", async () => {
+    const out = await temporary();
+    const state = { protocol_version: "rac/1", sequence: 1, digest: "abc", projection: { work: {} }, obligations: "none", events: [{ seq: 1, hash: "abc", type: "work.request" }] };
+    const client = new ApiClient("http://127.0.0.1:3001", async (url) => {
+      const path = new URL(String(url)).pathname;
+      return Response.json(path.endsWith("/state") ? state : path.endsWith("/messages") ? { items: [] } : { room: { type: "compiled", state: "closed" } });
+    });
+    await goalExport(client, "sni_test", ROOM, out);
+    expect(JSON.parse(await readFile(join(out, "state.json"), "utf8"))).toEqual(state);
+    expect(JSON.parse((await readFile(join(out, "acts.ndjson"), "utf8")).trim())).toEqual(state.events[0]);
   });
 });

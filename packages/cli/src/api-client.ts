@@ -3,6 +3,9 @@ import { CliError, asCliError, localError } from "./errors.ts";
 type Fetch = typeof globalThis.fetch;
 
 interface ApiErrorEnvelope {
+  accepted?: unknown;
+  code?: unknown;
+  detail?: unknown;
   error?: {
     code?: unknown;
     message?: unknown;
@@ -155,6 +158,12 @@ export class ApiClient {
       envelope = (await response.json()) as ApiErrorEnvelope;
     } catch {
       // Status and a bounded local message are enough; never echo arbitrary bodies.
+    }
+    // Typed semantic refusals are the compiler's structured answer, not an API envelope.
+    if (response.status === 422 && envelope.accepted === false &&
+        typeof envelope.code === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(envelope.code) &&
+        typeof envelope.detail === "string") {
+      throw new CliError(envelope.code, envelope.detail.slice(0, 4_000), 4);
     }
     const code = safeErrorCode(envelope.error?.code);
     const requestId =

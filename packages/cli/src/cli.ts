@@ -105,8 +105,18 @@ const optionValueNames = new Set([
   "image",
   "web-search",
   "turn-limit",
+  "type",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks"]);
+
+/** Room mode is fixed at creation. Omission retains the service default. */
+function roomType(parsed: ParsedArguments): "board" | "compiled" | undefined {
+  const value = option(parsed, "type");
+  if (value !== undefined && value !== "board" && value !== "compiled") {
+    throw localError("invalid_option", "--type is board or compiled.");
+  }
+  return value;
+}
 
 /** `--with i_a,i_b`: the Instances to seat, as the API takes them. */
 function instanceList(value: string | undefined): string[] | undefined {
@@ -297,7 +307,8 @@ async function roomCommand(
   const parsed = parseArguments(commandArgs);
   if (action === "create") {
     assertPositionals(parsed, 0);
-    assertOnlyOptions(parsed, ["name", "description", "with", "goal", "until"]);
+    assertOnlyOptions(parsed, ["name", "description", "with", "goal", "until", "type"]);
+    const type = roomType(parsed);
     const name = requiredOption(parsed, "name");
     const description = option(parsed, "description");
     const withIds = instanceList(option(parsed, "with"));
@@ -317,6 +328,7 @@ async function roomCommand(
     return withSelectedSession(globals, dependencies, async (client, session) => {
       const created = await client.request<{ room?: { id?: string }; [key: string]: unknown }>("POST", "/rooms", session.instance_token, {
         name,
+        ...(type === undefined ? {} : { type }),
         ...(description === undefined ? {} : { description }),
         ...(withIds === undefined ? {} : { with: withIds }),
       }, { "idempotency-key": randomUUID() });
@@ -478,8 +490,16 @@ async function goalCommand(
 ): Promise<unknown> {
   const parsed = parseArguments(commandArgs);
   if (action === "run") return goalRunCommand(parsed, globals, dependencies);
+  if (action === "start") {
+    assertOnlyOptions(parsed, ["name", "description", "with", "until", "type"]);
+    assertPositionals(parsed, 1);
+    const args = [...parsed.options].flatMap(([name, value]) =>
+      (parsed.repeated.get(name) ?? [String(value)]).flatMap((item) => [`--${name}`, item]),
+    );
+    return roomCommand("create", [...args, "--goal", parsed.positionals[0]!, ...(option(parsed, "name") ? [] : ["--name", basename(parsed.positionals[0]!)])], globals, dependencies);
+  }
   const usage =
-    "Use goal run <goal file> --agent codex[:model] --until <trigger> [...], goal watch <rom_…> [--workspace <dir>] [--out <dir>] [--check-every 1m] [--quiet-checks], or goal export <rom_…> [--out <dir>].";
+    "Use goal start <goal file> [--type board|compiled] --until <trigger>, goal run <goal file> [--type board|compiled] --agent codex[:model] --until <trigger> [...], goal watch <rom_…> [--workspace <dir>] [--out <dir>] [--check-every 1m] [--quiet-checks], or goal export <rom_…> [--out <dir>].";
   const roomId = parsed.positionals[0];
   if ((action !== "watch" && action !== "export") || parsed.positionals.length !== 1 || !/^rom_[0-9A-Za-z]{10}$/.test(roomId ?? "")) {
     throw localError("unknown_command", usage);
@@ -527,11 +547,12 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type"]);
+  const type = roomType(parsed);
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m]",
     );
   }
   const webSearch = option(parsed, "web-search") ?? "live";
@@ -571,7 +592,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
       "POST",
       "/rooms",
       session.instance_token,
-      { name: option(parsed, "name") ?? basename(workspace) },
+      { name: option(parsed, "name") ?? basename(workspace), ...(type === undefined ? {} : { type }) },
       { "idempotency-key": randomUUID() },
     );
     const roomId = created.room?.id;
@@ -598,6 +619,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
         apiKey,
         {
           plan,
+          roomType: type ?? "board",
           roomId,
           inviteToken: invite.token,
           goal: content,
@@ -652,7 +674,7 @@ async function execute(
   }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach/timer, balance/redeem/pay/ledger, upload/download/files, or session start/status, room create/list/invite/add/join/post/messages, goal run/watch/export, and decision list/approve/deny.",
+    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach/timer, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/watch/export, and decision list/approve/deny.",
   );
 }
 

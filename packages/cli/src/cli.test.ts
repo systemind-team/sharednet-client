@@ -535,3 +535,28 @@ describe("the runtime a session reports", () => {
     }
   });
 });
+
+
+describe("compiled Room selection", () => {
+  it("sends an explicit compiled Room mode and rejects unknown modes before a request", async () => {
+    const result = await harnessAfterStart(["room", "create", "--name", "Typed", "--type", "compiled", "--json"], [{ body: { room: { id: "rom_AbCdEfGhIj", type: "compiled" } } }]);
+    expect(result.exitCode).toBe(0);
+    expect(sentBody(result.requests[0]!)).toEqual({ name: "Typed", type: "compiled" });
+    const invalid = await harness(["room", "create", "--name", "Typed", "--type", "other"]);
+    expect(invalid.exitCode).toBe(2);
+    expect(invalid.requests).toHaveLength(0);
+  });
+});
+
+
+it("goal start selects a compiled Room before posting the goal", async () => {
+  const { writeFile } = await import("node:fs/promises");
+  const root = await mkdtemp(join(tmpdir(), "sharednet-goal-start-"));
+  cleanup.push(root);
+  const file = join(root, "goal.txt");
+  await writeFile(file, "Deliver a checked patch.");
+  const result = await harnessAfterStart(["goal", "start", "--name", file, file, "--type", "compiled", "--until", "after 1h", "--json"], [{ body: { room: { id: "rom_AbCdEfGhIj", type: "compiled" } } }, { body: { room: { id: "rom_AbCdEfGhIj" }, message: { sequence: 1 } } }]);
+  expect(result.exitCode).toBe(0);
+  expect(sentBody(result.requests[0]!)).toMatchObject({ name: file, type: "compiled" });
+  expect(sentBody(result.requests[1]!)).toEqual({ content: "Deliver a checked patch.", until: ["after 1h"] });
+});

@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
+import type { CompiledState } from "./compiled.ts";
 import type { ApiClient } from "./api-client.ts";
 import { CliError, localError } from "./errors.ts";
 import { mentions, parseTrigger, saidIn, type Trigger } from "./triggers.ts";
@@ -113,7 +114,7 @@ interface GoalShape {
 }
 
 interface RoomShape {
-  room?: { id?: string; state?: string; goal?: GoalShape | null };
+  room?: { id?: string; type?: "board" | "compiled"; state?: string; goal?: GoalShape | null };
   memberships?: Array<{ member_id?: string; name?: string | null; runtime_kind?: string }>;
 }
 
@@ -494,6 +495,7 @@ export async function goalWatch(
     }
   }
   await takeSnapshot("end");
+  if (view.room?.type === "compiled") await exportCompiled(client, memberToken, options.roomId, options.out);
   const budget = spend ? [] : triggers.filter((trigger) => trigger.kind === "budget").map((trigger) => trigger.label);
   const result: GoalWatchResult = { room_id: options.roomId, ended_by: endedBy, messages, checks: checkCount, snapshots, out: options.out };
   await writeFile(
@@ -531,6 +533,7 @@ export async function goalExport(client: ApiClient, memberToken: string, roomId:
     }
     if (!page?.has_more || items.length === 0) break;
   }
+  if (view.room?.type === "compiled") await exportCompiled(client, memberToken, roomId, out);
   await writeFile(join(out, "room.ndjson"), lines.length ? `${lines.join("\n")}\n` : "");
   await writeFile(
     join(out, "episode.json"),
@@ -549,4 +552,11 @@ export async function readGoalFile(cwd: string, path: string): Promise<string> {
     if (error instanceof CliError) throw error;
     throw localError("invalid_arguments", `--goal names a file that could not be read: ${path}`);
   }
+}
+
+/** Keep the authoritative typed state and canonical replay log alongside the prose export. */
+async function exportCompiled(client: ApiClient, token: string, roomId: string, out: string): Promise<void> {
+  const state = await client.request<CompiledState>("GET", `/rooms/${encodeURIComponent(roomId)}/state`, token);
+  await writeFile(join(out, "state.json"), `${JSON.stringify(state, null, 2)}\n`);
+  await writeFile(join(out, "acts.ndjson"), state.events.map((event) => `${JSON.stringify(event)}\n`).join(""));
 }

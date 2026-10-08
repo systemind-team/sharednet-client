@@ -4,6 +4,7 @@ import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join as joinPath, resolve as resolvePathFrom } from "node:path";
 
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
+import { compiledPrompt, type CompiledState } from "./compiled.ts";
 import { storeAccountCredential } from "./login.ts";
 import { CliError, localError } from "./errors.ts";
 import { computeLocalInstanceKey } from "./instance-computation.ts";
@@ -109,9 +110,9 @@ const INVITE_TOKEN_PATTERN = /^rit_[A-Za-z0-9_-]{43}$/;
 /** The server caps one wait at this; the client loops. */
 const WAIT_MAX_SECONDS = 25;
 
-const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen"]);
+const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file"]);
 /** Options that may be given more than once; every value is kept, in order. */
-const REPEATABLE_OPTIONS = new Set(["on"]);
+const REPEATABLE_OPTIONS = new Set(["on", "artifact"]);
 const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake"]);
 
 function parseGuestArguments(args: string[]): ParsedGuestArguments {
@@ -389,6 +390,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     name,
     member_token: memberToken,
     joined_at: dependencies.now().toISOString(),
+    room_type: payload.room.type === "compiled" ? "compiled" : "board",
     ...(wake ? { wake } : {}),
   };
   await writeRoomCredential(paths, credential);
@@ -509,6 +511,7 @@ async function enterAsSeat(
     room_id: payload.room.id,
     member_id: payload.membership.member_id,
     joined_at: dependencies.now().toISOString(),
+    room_type: payload.room.type === "compiled" ? "compiled" : "board",
     ...(wake ? { wake } : {}),
   };
   await writeRoomCredential(paths, entered);
@@ -588,6 +591,7 @@ async function joinAsAccount(
     name,
     member_token: session.instance_token,
     joined_at: dependencies.now().toISOString(),
+    room_type: payload.room.type === "compiled" ? "compiled" : "board",
     ...(wake ? { wake } : {}),
   };
   await writeRoomCredential(paths, credential);
@@ -1041,6 +1045,15 @@ function triggersFrom(parsed: ParsedGuestArguments, now: number): Trigger[] {
   return triggers;
 }
 
+/** Older clients stored no mode. Learn the immutable mode once with this seat's credential. */
+async function hydrateRoomMode(client: ApiClient, credential: StoredRoomCredential, dependencies: GuestDependencies): Promise<void> {
+  if (credential.room_type !== undefined) return;
+  const view = await client.request<{ room?: { type?: string } }>("GET", `/rooms/${encodeURIComponent(credential.room_id)}`, credential.member_token);
+  if (!view.room || (view.room.type !== undefined && view.room.type !== "board" && view.room.type !== "compiled")) throw invalidServerResponse();
+  credential.room_type = view.room.type === "compiled" ? "compiled" : "board";
+  await writeRoomCredential(getStoragePaths(dependencies.env), credential);
+}
+
 async function roomView(
   client: ApiClient,
   roomId: string,
@@ -1162,6 +1175,7 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
   const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const exec = dependencies.exec ?? defaultExec;
   const log = dependencies.stderr ?? (() => undefined);
+  if (command) await hydrateRoomMode(client, credential, dependencies);
   const me = await whoAmI(client, state, credential);
   const iso = (ms: number) => new Date(ms).toISOString();
   // A wait that wakes only when addressed asks the service for those lines alone (wait PR 8): one
@@ -1416,7 +1430,10 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
     // A reply the command already produced but the Room never received is
     // posted first, without running the command again.
     if (pending.reply === null) {
-      const input = `${JSON.stringify(wake)}\n`;
+      const compiled = credential.room_type === "compiled"
+        ? await client.request<CompiledState>("GET", `/rooms/${encodeURIComponent(state.room_id)}/state`, credential.member_token)
+        : undefined;
+      const input = `${JSON.stringify({ ...wake, ...(compiled ? { compiled } : {}) })}\n`;
       const result = await exec(command, input, {
         SHAREDNET_ROOM_ID: state.room_id,
         SHAREDNET_MEMBER_ID: state.member_id,
@@ -1993,6 +2010,56 @@ function safeBasename(value: string): string {
   return name;
 }
 
+async function compiledCommand(verb: "act" | "open" | "deliver", args: string[], dependencies: GuestDependencies): Promise<unknown> {
+  const parsed = parseGuestArguments(args);
+  assertOnlyOptions(parsed, verb === "act" ? ["data", "as"] : verb === "deliver" ? ["work", "name", "file", "artifact", "as"] : ["as"]);
+  if (parsed.positionals.length > 0) throw localError("invalid_arguments", `sharednet ${verb} uses the Room joined in this directory.`);
+  let envelope: unknown;
+  if (verb === "act") {
+    try { envelope = JSON.parse(stringOption(parsed, "data") ?? ""); }
+    catch { throw localError("invalid_arguments", "Usage: sharednet act --data '<JSON envelope>' [--as i_…]"); }
+    if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) throw localError("invalid_arguments", "--data must be a JSON object.");
+  }
+  const work = stringOption(parsed, "work");
+  const name = stringOption(parsed, "name");
+  const file = stringOption(parsed, "file");
+  const files: Array<{ name: string; path: string }> = [];
+  if (verb === "deliver") {
+    const usage = "Use deliver --work W --name patch --file PATH, or --artifact patch=PATH --artifact report=PATH. Do not mix the two forms.";
+    const artifacts = parsed.repeated.get("artifact") ?? [];
+    if (!work?.trim() || (artifacts.length > 0 && (name !== undefined || file !== undefined))) throw localError("invalid_arguments", usage);
+    if (artifacts.length > 0) {
+      for (const artifact of artifacts) {
+        const separator = artifact.indexOf("=");
+        if (separator < 0) throw localError("invalid_arguments", "--artifact takes NAME=PATH.");
+        files.push({ name: artifact.slice(0, separator).trim(), path: artifact.slice(separator + 1) });
+      }
+    } else {
+      files.push({ name: name?.trim() ?? "", path: file ?? "" });
+    }
+    const names = new Set<string>();
+    for (const item of files) {
+      if (!item.name || !item.path.trim() || names.has(item.name)) throw localError("invalid_arguments", "Every artifact needs a unique nonempty name and a nonempty file path.");
+      names.add(item.name);
+    }
+  }
+  const { client, state, credential } = await currentSeat(dependencies, stringOption(parsed, "as"));
+  const path = `/rooms/${encodeURIComponent(state.room_id)}`;
+  if (verb === "open") return client.request("GET", `${path}/state`, credential.member_token);
+  if (verb === "deliver") {
+    // Require a Room seat first: upload must never silently fall back to an account-only artifact.
+    const artifacts: Array<[string, string]> = [];
+    for (const item of files) {
+      const uploaded = await upload([item.path, "--as", state.member_id], dependencies) as { artifact?: { id?: string } };
+      if (!uploaded.artifact?.id) throw invalidServerResponse();
+      artifacts.push([item.name, uploaded.artifact.id]);
+    }
+    // Publish one result only after every upload succeeds; partial uploads never become a result.
+    envelope = { type: "work.result", work_id: work, artifacts: Object.fromEntries(artifacts), idempotency_key: randomUUID() };
+  }
+  return client.request("POST", `${path}/acts`, credential.member_token, envelope);
+}
+
 async function upload(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
   assertOnlyOptions(parsed, ["name", "as"]);
@@ -2379,6 +2446,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     // current end, so a first start does not hand over the whole history as if it were new.
     let cursor: number;
     try {
+      await hydrateRoomMode(client, seat, dependencies);
       const mirrored = await readServeCursor(paths, seat.room_id, seat.member_id);
       const kept = await keptPlace(client, seat.room_id, seat.member_token, mirrored ?? 0, sleep, dependencies);
       // A driven seat's join counted the history as handled, so its place is exact from then on, and
@@ -2421,7 +2489,11 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       turns.push(dependencies.now().getTime());
       // The seat file names the session to resume; a later join from another session replaces it.
       const wake = (await readRoomCredential(paths, seat.room_id, seat.member_id).catch(() => null))?.wake ?? seat.wake!;
-      const prompt = wakeTurnPrompt({ roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through });
+      let prompt = wakeTurnPrompt({ roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through });
+      if (seat.room_type === "compiled") {
+        const state = await client.request<CompiledState>("GET", `/rooms/${encodeURIComponent(seat.room_id)}/state`, seat.member_token);
+        prompt += `\n\n${compiledPrompt(state)}`;
+      }
       dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed; resuming ${wake.driver} session ${wake.session} with #${from + 1}..#${through}\n`);
       const outcome = await drive(turnSpec(wake, prompt, dependencies.env, seat.member_id, TURN_LIMIT_MS));
       const summary = turnSummary(wake.driver, outcome.stdout);
@@ -2506,7 +2578,10 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       if (others.length === 0) continue;
       dependencies.stderr?.(`serve: ${seat.room_id} woke on ${others.length} message(s) through sequence ${cursor}\n`);
       if (!command) continue;
-      const input = `${JSON.stringify({ room_id: seat.room_id, member_id: seat.member_id, trigger: "message", messages: others })}\n`;
+      const compiled = seat.room_type === "compiled"
+        ? await client.request<CompiledState>("GET", `/rooms/${encodeURIComponent(seat.room_id)}/state`, seat.member_token)
+        : undefined;
+      const input = `${JSON.stringify({ room_id: seat.room_id, member_id: seat.member_id, trigger: "message", messages: others, ...(compiled ? { compiled } : {}) })}\n`;
       const result = await exec(command, input, {
         SHAREDNET_ROOM_ID: seat.room_id,
         SHAREDNET_MEMBER_ID: seat.member_id,
@@ -2734,6 +2809,9 @@ export type GuestVerb =
   | "redeem"
   | "pay"
   | "ledger"
+  | "act"
+  | "open"
+  | "deliver"
   | "upload"
   | "download"
   | "files"
@@ -2759,6 +2837,7 @@ export function isGuestVerb(value: string | undefined): value is GuestVerb {
     value === "redeem" ||
     value === "pay" ||
     value === "ledger" ||
+    value === "act" || value === "open" || value === "deliver" ||
     value === "upload" ||
     value === "download" ||
     value === "files" ||
@@ -2777,6 +2856,7 @@ export async function runGuestVerb(
   args: string[],
   dependencies: GuestDependencies,
 ): Promise<unknown> {
+  if (verb === "act" || verb === "open" || verb === "deliver") return compiledCommand(verb, args, dependencies);
   if (verb === "timer") return timer(args, dependencies);
   if (verb === "serve") return serve(args, dependencies);
   if (verb === "whoami") return whoami(args, dependencies);
