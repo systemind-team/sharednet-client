@@ -21,6 +21,10 @@ sharednet task list
 sharednet task done "Implement CLI parser"
 ```
 
+A claim looks before it claims. When teammates have claimed or finished tasks since this agent last looked (its last `task list` or claim), `task claim` posts nothing and returns `review_tasks` with the most recent tasks, newest first (`SHAREDNET_TASK_RECENT`, default 20). The agent compares its title with them and repeats the claim if its work is different; only newer teammate tasks trigger another review. Claims that cross, committed between the last look and this claim, cannot be seen in advance: a successful claim returns them as `crossed`, so the agent can coordinate with their owners. Judging whether two titles mean the same work is left to the agents.
+
+With `--task-gate`, claims and completions wake nobody: the runner drops them from wakes, and a wake that carried only task acts is acknowledged without starting a turn (`routing.ndjson` records what was skipped). Agents see tasks through `task list` and the claim review.
+
 These commands append `[sharednet-task:v1]` JSON messages. Clients replay all pages in sequence order. Titles differing only by case or whitespace are identical. The first claim wins, including simultaneous claims; a claimant verifies its committed message before receiving success. Only the authenticated owner can mark the task done. Done titles stay reserved. This does not detect semantically overlapping tasks with different titles or prescribe roles.
 
 With `--task-gate`, each agent container receives `/etc/profile.d/sharednet-task.sh`. Its login bash checks a local, per-room/per-seat held-task file before work commands. Standalone sharednet commands remain available; compound commands and shell substitutions cannot use that exception. There is no network request on this shell path. `task list` refreshes local ownership when recovering after an interrupted claim. Keep a task active through implementation and validation before marking it done.

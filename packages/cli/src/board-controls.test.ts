@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { claimTask, projectTasks, taskMessage, pendingMentions, controlPaths, noteRead, readThrough, withControlLock } from "./board-controls.ts";
+import { claimTask, projectTasks, taskMessage, pendingMentions, latestForeignTaskSequence, recentTasks, isTaskMessage, controlPaths, noteRead, readThrough, withControlLock } from "./board-controls.ts";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -43,6 +43,16 @@ describe("task title ownership", () => {
   it("does not grant a claim when replay has not reached its committed sequence", async () => {
     const board = { list: async () => [], post: async (content: string) => msg(8, "A", content) };
     await expect(claimTask(board, "A", "build")).rejects.toThrow(/incomplete/i);
+  });
+});
+
+describe("looking before a claim", () => {
+  it("counts only teammates' task acts and lists the most recently touched tasks first", () => {
+    const history = [msg(1, "A", taskMessage("claim", "Survey")), msg(2, "B", taskMessage("claim", "Parser")), msg(3, "A", taskMessage("done", "Survey")), msg(4, "B", "plain text"), msg(5, "A", taskMessage("claim", "Renderer"))];
+    expect(latestForeignTaskSequence(history, "A")).toBe(2);
+    expect(latestForeignTaskSequence(history, "B")).toBe(5);
+    expect(recentTasks(projectTasks(history), 2).map(t => t.title)).toEqual(["Renderer", "Survey"]);
+    expect(isTaskMessage(history[3]!.content)).toBe(false);
   });
 });
 

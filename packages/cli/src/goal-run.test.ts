@@ -20,6 +20,7 @@ import {
   parseAgents,
   prepareRun,
   routeWake,
+  withoutTaskActs,
   runContainers,
   runGoal,
   scrubHome,
@@ -50,6 +51,15 @@ describe("optional mention routing", () => {
     const wake = { wake_id: "w1", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: content as string }] };
     expect(seats.filter(s => routeWake(wake, s, seats, "mentions").messages.length).map(s => s.name)).toEqual(names);
     expect(routeWake(wake, seats[0]!, seats, "broadcast")).toBe(wake);
+  });
+});
+
+describe("task acts in wakes", () => {
+  it("drops claims and completions, so a wake of task acts alone wakes nobody", () => {
+    const act = '[sharednet-task:v1] {"op":"claim","title":"Parser"}';
+    const wake = { wake_id: "w1", fired: ["message"], from: 1, through: 3, events: [], messages: [{ sequence: 2, content: act }, { sequence: 3, content: "build is green" }] };
+    expect(withoutTaskActs(wake).messages.map(m => m.sequence)).toEqual([3]);
+    expect(withoutTaskActs({ ...wake, messages: [wake.messages[0]!] }).messages).toEqual([]);
   });
 });
 
