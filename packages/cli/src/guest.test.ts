@@ -689,6 +689,35 @@ describe("sharednet say and wait", () => {
     expect(await readFile(paths.tasks, "utf8")).toBe("");
   });
 
+  it("shows teammates' unseen tasks instead of claiming, then claims on the repeated command", async () => {
+    const space = await joinedSpace();
+    const { taskMessage } = await import("./board-controls.ts");
+    const theirs = { ...message(2, taskMessage("claim", "CLI behavior survey")), sender: { member_id: "i_Other00001", kind: "guest", name: "codex-3" } };
+    const reviewed = await run(["task", "claim", "CLI reconnaissance", "--json"], space, [page([theirs])]);
+    expect(reviewed.exitCode).toBe(2);
+    expect(reviewed.stderr).toContain("review_tasks");
+    expect(reviewed.stderr).toContain("CLI behavior survey");
+    expect(reviewed.requests.every(r => r.init.method === "GET")).toBe(true);
+    const mine = own(3, taskMessage("claim", "Parser"));
+    const claimed = await run(["task", "claim", "Parser", "--json"], space, [page([theirs]), page([theirs]), { body: { message: mine } }, page([theirs, mine])]);
+    expect(claimed.exitCode).toBe(0);
+    expect(JSON.parse(claimed.stdout).task).toMatchObject({ title: "Parser", owner: MEMBER_ID });
+  });
+
+  it("claims at once when nothing new exists, and reports a claim that crossed it", async () => {
+    const space = await joinedSpace();
+    const { taskMessage } = await import("./board-controls.ts");
+    const theirs = { ...message(2, taskMessage("claim", "CLI behavior survey")), sender: { member_id: "i_Other00001", kind: "guest", name: "codex-3" } };
+    const mine = own(3, taskMessage("claim", "CLI reconnaissance"));
+    const result = await run(["task", "claim", "CLI reconnaissance", "--json"], space, [page([]), page([]), { body: { message: mine } }, page([theirs, mine])]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).crossed).toEqual([{ title: "CLI behavior survey", owner: "codex-3", status: "claimed" }]);
+    // Having claimed, it has seen that board; the next claim asks for no new review.
+    const next = own(4, taskMessage("claim", "Renderer"));
+    const again = await run(["task", "claim", "Renderer", "--json"], space, [page([theirs, mine]), page([theirs, mine]), { body: { message: next } }, page([theirs, mine, next])]);
+    expect(again.exitCode).toBe(0);
+  });
+
   it("blocks task claim on an unread mention before publishing its marker", async () => {
     const space = await joinedSpace();
     const result = await run(["task", "claim", "parser", "--json"], space, [

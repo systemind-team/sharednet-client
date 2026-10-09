@@ -5,7 +5,7 @@ import { isAbsolute, join as joinPath, resolve as resolvePathFrom } from "node:p
 
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
 import { compiledPrompt, type CompiledState } from "./compiled.ts";
-import { claimTask, controlEvent, controlPaths, noteRead, noteTasks, pendingMentions, projectTasks, readThrough, taskMessage, withControlLock, type BoardMessage } from "./board-controls.ts";
+import { claimTask, controlEvent, controlPaths, latestForeignTaskSequence, noteRead, noteTasks, noteTasksSeen, pendingMentions, projectTasks, readMark, readThrough, recentTasks, taskMessage, withControlLock, type BoardMessage } from "./board-controls.ts";
 import { storeAccountCredential } from "./login.ts";
 import { CliError, localError } from "./errors.ts";
 import { computeLocalInstanceKey } from "./instance-computation.ts";
@@ -774,6 +774,12 @@ async function beforeSay(client: ApiClient, state: ProjectRoomState, credential:
   throw localError("unread_mentions", "Nothing was posted. These addressed messages are now supplied to you. Consider them, then explicitly retry or revise your post; no reply is required.\n" + JSON.stringify(pending));
 }
 
+/** How many recent tasks a claimant is shown before its claim: SHAREDNET_TASK_RECENT, default 20. */
+function taskReviewCount(env: GuestDependencies["env"]): number {
+  const n = Number(env.SHAREDNET_TASK_RECENT ?? 20);
+  return Number.isSafeInteger(n) && n > 0 ? n : 20;
+}
+
 async function task(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
   assertOnlyOptions(parsed, ["as"]);
@@ -795,17 +801,33 @@ async function task(args: string[], dependencies: GuestDependencies): Promise<un
     if (action === "list") {
       const tasks = projectTasks(await list());
       await noteTasks(paths, tasks, state.member_id);
+      await noteTasksSeen(paths, latestForeignTaskSequence(history, state.member_id));
       return { room_id: state.room_id, member_id: state.member_id, tasks };
     }
     // Validate the title before any network side effect.
     const content = taskMessage(action as "claim" | "done", title!);
     await beforeSay(client, state, credential, dependencies);
     if (action === "claim") {
+      // Look before claiming: teammates' newer tasks are shown first, and nothing is claimed until the claim is repeated.
+      const latest = latestForeignTaskSequence(await list(), state.member_id);
+      const seen = await readMark(paths.taskSeen);
+      if (latest > seen) {
+        const recent = recentTasks(projectTasks(history), taskReviewCount(dependencies.env))
+          .map(t => ({ title: t.title, owner: t.owner_name ?? t.owner, status: t.status }));
+        await controlEvent(paths, { kind: "claim_review", title: title!, latest, shown: recent.length });
+        await noteTasksSeen(paths, latest);
+        throw localError("review_tasks", "Nothing was claimed. Compare your title with these recent tasks, newest first. If your work is the same as one of them, do not claim it: pick other work, or coordinate with its owner. Otherwise run the same claim again.\n" + JSON.stringify(recent));
+      }
       try {
         const claimed = await claimTask({ list, post }, state.member_id, title!);
-        await noteTasks(paths, projectTasks(history), state.member_id);
-        await controlEvent(paths, { kind: "task_claimed", task: claimed });
-        return { room_id: state.room_id, task: claimed };
+        const tasks = projectTasks(history);
+        await noteTasks(paths, tasks, state.member_id);
+        // Claims committed between the last look and this one crossed it: the claimant could not have seen them.
+        const crossed = tasks.filter(t => t.owner !== state.member_id && t.claim_sequence > seen && t.claim_sequence < claimed.claim_sequence)
+          .map(t => ({ title: t.title, owner: t.owner_name ?? t.owner, status: t.status }));
+        await noteTasksSeen(paths, claimed.claim_sequence);
+        await controlEvent(paths, { kind: "task_claimed", task: claimed, crossed: crossed.length });
+        return { room_id: state.room_id, task: claimed, ...(crossed.length ? { crossed, note: "These tasks were claimed just before yours, unseen by you. If one is the same work, coordinate with its owner." } : {}) };
       } catch (error) {
         // Never grant shell access from an unconfirmed claim. `task list` can recover it.
         await controlEvent(paths, { kind: "task_claim_refused", title: title!, code: error instanceof CliError ? error.code : "service_unavailable" });

@@ -1,5 +1,5 @@
 import { compiledPrompt, COMPILED_HELP, type CompiledState } from "./compiled.ts";
-import { controlPaths } from "./board-controls.ts";
+import { controlPaths, isTaskMessage } from "./board-controls.ts";
 import { TASK_HELP, MENTION_HELP, TASK_PROFILE, TASK_HOOK, TASK_HOOK_SETTINGS } from "./task-guard.ts";
 import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
@@ -245,6 +245,11 @@ export function routeWake(wake: WakeShape, seat: { name: string }, seats: Array<
     const recipients = seats.filter(other => mentions(message.content, { memberId: other.member_id ?? "", name: other.name }));
     return recipients.length === 0 || recipients.some(other => other.name === seat.name);
   }) };
+}
+
+/** Task claims and completions are state, not news: a wake drops them, and `task list` shows them. */
+export function withoutTaskActs(wake: WakeShape): WakeShape {
+  return { ...wake, messages: wake.messages.filter(message => !isTaskMessage(message.content)) };
 }
 
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
@@ -690,9 +695,10 @@ export async function runGoal(
           try { raw = JSON.parse(waited.stdout) as WakeShape; } catch { return; }
           if (raw.fired.includes("closed")) return;
           wake = routeWake(raw, seat, records, messageRouting);
+          if (input.taskGate) wake = withoutTaskActs(wake);
           const delivered = wake.messages.map(message => message.sequence);
-          if (messageRouting === "mentions") await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
-          if (delivered.length > 0 || messageRouting === "broadcast") break;
+          if (messageRouting === "mentions" || input.taskGate) await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
+          if (delivered.length > 0 || (messageRouting === "broadcast" && !input.taskGate)) break;
           if (raw.wake_id) await exec(seat, ["sharednet", "ack", raw.wake_id, "--json"]);
         }
         if (ended || !wake) return;
