@@ -86,7 +86,7 @@ async function workspace() {
 async function run(
   argv: string[],
   space: Awaited<ReturnType<typeof workspace>>,
-  responses: Array<{ status?: number; body?: unknown; error?: Error; raw?: Response; hang?: true }>,
+  responses: Array<{ status?: number; body?: unknown; error?: Error; raw?: Response; hang?: true; entered?: () => void; wait?: Promise<void> }>,
   environment: Record<string, string> = {},
   overrides: {
     exec?: CommandRunner;
@@ -124,6 +124,8 @@ async function run(
     requests.push({ url: String(input), init });
     const next = responses.shift();
     if (!next) throw new Error("Unexpected fetch");
+    next.entered?.();
+    await next.wait;
     if (next.error) throw next.error;
     // A server that takes the request and never answers: only the caller's own signal ends it.
     if (next.hang) {
@@ -593,6 +595,138 @@ describe("sharednet say and wait", () => {
     expect(JSON.parse(result.stdout).message.sequence).toBe(2);
     // A message of one's own is not "seen": anything said before it still arrives.
     expect(await cursorOf(space)).toBe(1);
+  });
+
+  it("returns unseen mentions instead of posting, then permits an explicit retry without moving the wait cursor", async () => {
+    const space = await joinedSpace();
+    const addressed = { ...message(4, "@claude-code Please use the new interface."), mentions: [MEMBER_ID] };
+    const refused = await run(["say", "old plan", "--json"], space, [
+      { body: { items: [addressed], has_more: false, next_cursor: null } },
+    ], { SHAREDNET_MENTION_GATE: "1", SHAREDNET_TURN_THROUGH: "1" });
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("unread_mentions");
+    expect(refused.stderr).toContain("Please use the new interface");
+    expect(refused.requests.every(r => r.init.method === "GET")).toBe(true);
+    const retried = await run(["say", "revised plan", "--json"], space, [
+      { body: { items: [], has_more: false, next_cursor: null } },
+      { status: 201, body: { message: message(5, "revised plan") } },
+    ], { SHAREDNET_MENTION_GATE: "1", SHAREDNET_TURN_THROUGH: "1" });
+    expect(retried.exitCode).toBe(0);
+    expect(retried.requests[0]!.url).toContain("after=4");
+    expect(await cursorOf(space)).toBe(1);
+  });
+
+  it("accounts for an explicit read and the runner watermark before checking say", async () => {
+    const space = await joinedSpace();
+    const env = { SHAREDNET_MENTION_GATE: "1", SHAREDNET_TURN_THROUGH: "9" };
+    expect((await run(["read", "--last", "2", "--json"], space, [
+      { body: { items: [message(5, "@claude-code earlier")], has_more: false, next_cursor: null } },
+    ], env)).exitCode).toBe(0);
+    const result = await run(["say", "answer", "--json"], space, [
+      { body: { items: [], has_more: false, next_cursor: null } },
+      { status: 201, body: { message: message(10, "answer") } },
+    ], env);
+    expect(result.exitCode).toBe(0);
+    expect(result.requests[0]!.url).toContain("after=9");
+    expect(await cursorOf(space)).toBe(1);
+  });
+
+  it("does not consume a mention when its audit cannot be written", async () => {
+    const space = await joinedSpace();
+    const { controlPaths, readThrough } = await import("./board-controls.ts");
+    const { mkdir, rm } = await import("node:fs/promises");
+    const paths = controlPaths(space.env, { base_url: "https://www.sharednet.ai", room_id: ROOM_ID, member_id: MEMBER_ID });
+    await mkdir(paths.events, { recursive: true });
+    const addressed = message(2, "@claude-code changed interface");
+    const env = { SHAREDNET_MENTION_GATE: "1" };
+    const failed = await run(["say", "old interface", "--json"], space, [page([addressed])], env);
+    expect(failed.exitCode).not.toBe(0);
+    expect(await readThrough(paths)).toBe(0);
+    expect(failed.requests.every(r => r.init.method === "GET")).toBe(true);
+    await rm(paths.events, { recursive: true });
+    const retried = await run(["say", "old interface", "--json"], space, [page([addressed])], env);
+    expect(retried.stderr).toContain("changed interface");
+    expect(retried.stderr).toContain("unread_mentions");
+    expect(retried.requests.every(r => r.init.method === "GET")).toBe(true);
+  });
+
+  it("serializes task snapshots so a delayed list cannot restore a completed task", async () => {
+    const space = await joinedSpace();
+    const { controlPaths, taskMessage } = await import("./board-controls.ts");
+    const paths = controlPaths(space.env, { base_url: "https://www.sharednet.ai", room_id: ROOM_ID, member_id: MEMBER_ID });
+    const claim = own(2, taskMessage("claim", "Build")), done = own(3, taskMessage("done", "Build"));
+    await run(["task", "list", "--json"], space, [page([claim])]);
+    let release!: () => void, entered!: () => void;
+    const wait = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const old = run(["task", "list", "--json"], space, [{ ...page([claim]), wait, entered }]);
+    await started;
+    let completionRequested = false;
+    const finishing = run(["task", "done", "Build", "--json"], space, [
+      { ...page([claim]), entered: () => { completionRequested = true; } },
+      { body: { message: done } }, page([claim, done]),
+    ]);
+    // A task operation must acquire the local lock before taking its snapshot.
+    await new Promise(resolve => setTimeout(resolve, 40));
+    const overlapped = completionRequested;
+    release();
+    const results = await Promise.all([old, finishing]);
+    expect(results.map(r => r.exitCode)).toEqual([0, 0]);
+    expect(overlapped).toBe(false);
+    expect(await readFile(paths.tasks, "utf8")).toBe("");
+  });
+
+  it("revokes a finishing task even when the committed completion cannot be replayed", async () => {
+    const space = await joinedSpace();
+    const { controlPaths, taskMessage } = await import("./board-controls.ts");
+    const paths = controlPaths(space.env, { base_url: "https://www.sharednet.ai", room_id: ROOM_ID, member_id: MEMBER_ID });
+    const claim = own(2, taskMessage("claim", "Build")), done = own(3, taskMessage("done", "Build"));
+    await run(["task", "list", "--json"], space, [page([claim])]);
+    const result = await run(["task", "done", "Build", "--json"], space, [
+      page([claim]), { body: { message: done } }, { error: Error("replay unavailable") },
+    ]);
+    expect(result.exitCode).not.toBe(0);
+    expect(await readFile(paths.tasks, "utf8")).toBe("");
+  });
+
+  it("blocks task claim on an unread mention before publishing its marker", async () => {
+    const space = await joinedSpace();
+    const result = await run(["task", "claim", "parser", "--json"], space, [
+      { body: { items: [message(3, "@claude-code Stop using old parser")], has_more: false, next_cursor: null } },
+    ], { SHAREDNET_MENTION_GATE: "1" });
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("unread_mentions");
+    expect(result.requests.every(r => r.init.method === "GET")).toBe(true);
+  });
+
+  it("replays task history across pages and allows only the owner to finish", async () => {
+    const space = await joinedSpace();
+    const claim = { ...message(2, '[sharednet-task:v1] {"op":"claim","title":"Parser"}'), sender: { member_id: MEMBER_ID, kind: "guest", name: "claude-code" } };
+    const listed = await run(["task", "list", "--json"], space, [
+      { body: { items: [message(1, "goal")], has_more: true, next_cursor: "1" } },
+      { body: { items: [claim], has_more: false, next_cursor: null } },
+    ]);
+    expect(listed.exitCode).toBe(0);
+    expect(JSON.parse(listed.stdout).tasks[0]).toMatchObject({ title: "Parser", owner: MEMBER_ID, status: "claimed" });
+    expect(listed.requests[1]!.url).toContain("after=1");
+    const denied = await run(["task", "done", "other", "--json"], space, [
+      { body: { items: [message(2, '[sharednet-task:v1] {"op":"claim","title":"other"}')], has_more: false, next_cursor: null } },
+    ]);
+    expect(denied.exitCode).toBe(2);
+    expect(denied.stderr).toContain("task_not_owned");
+    expect(denied.requests.every(r => r.init.method === "GET")).toBe(true);
+  });
+
+  it("refuses malformed task history instead of granting ownership", async () => {
+    for (const body of [
+      { items: [own(2, '[sharednet-task:v1] {"op":"claim","title":"Build"}')] },
+      { items: [message(2, "later"), message(1, "earlier")], has_more: false },
+      { items: [], has_more: true },
+    ]) {
+      const space = await joinedSpace();
+      const result = await run(["task", "list", "--json"], space, [{ body }]);
+      expect(result.stderr).toContain("task_state_incomplete");
+    }
   });
 
   it("threads a reply with --reply-to and refuses anything that is not a message id", async () => {

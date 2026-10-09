@@ -340,6 +340,20 @@ describe("reach: forming a group from the account CLI", () => {
     expect(refused.requests).toEqual([]);
   });
 
+  it("accepts independent board gates before validating the rest of a run", async () => {
+    for (const flags of [["--mention-gate"], ["--task-gate"], ["--mention-gate", "--task-gate"]]) {
+      const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after 1h", "--turn-limit", "30s", ...flags], []);
+      expect(refused.stderr.join(" ")).toContain("--turn-limit is at least 1m");
+      expect(refused.requests).toEqual([]);
+    }
+  });
+
+  it("refuses board gates on a compiled Room before creating anything", async () => {
+    const result = await harness(["goal", "run", "TASK.md", "--type", "compiled", "--mention-gate", "--agent", "codex", "--until", "after 1h"], []);
+    expect(result.stderr.join(" ")).toContain("plain board");
+    expect(result.requests).toEqual([]);
+  });
+
   it("opens a goal Room: the Room with the session, then the goal as the owner, and nothing at all for a goal with no bound", async () => {
     const dir = await mkdtemp(join(tmpdir(), "sharednet-goal-file-"));
     cleanup.push(dir);

@@ -1,4 +1,6 @@
 import { compiledPrompt, COMPILED_HELP, type CompiledState } from "./compiled.ts";
+import { controlPaths } from "./board-controls.ts";
+import { TASK_HELP, MENTION_HELP, TASK_PROFILE, TASK_HOOK, TASK_HOOK_SETTINGS } from "./task-guard.ts";
 import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -7,6 +9,7 @@ import { dirname, join, relative } from "node:path";
 import type { ApiClient } from "./api-client.ts";
 import { localError } from "./errors.ts";
 import { goalWatch, type GoalWatchResult } from "./goal.ts";
+import { mentions } from "./triggers.ts";
 
 /**
  * `goal run`: the goal Room, the Agents that work on it, and the runner that
@@ -233,8 +236,19 @@ export interface WakeShape {
   through: number;
 }
 
+export type MessageRouting = "broadcast" | "mentions";
+/** Routing chooses wake recipients, not board visibility. Unknown-only handles broadcast. */
+export function routeWake(wake: WakeShape, seat: { name: string }, seats: Array<{ name: string; member_id?: string | null }>, mode: MessageRouting): WakeShape {
+  if (mode === "broadcast") return wake;
+  return { ...wake, messages: wake.messages.filter(message => {
+    if (mentions(message.content, { memberId: "", name: "all" })) return true;
+    const recipients = seats.filter(other => mentions(message.content, { memberId: other.member_id ?? "", name: other.name }));
+    return recipients.length === 0 || recipients.some(other => other.name === seat.name);
+  }) };
+}
+
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
-export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[] }): string {
+export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting }): string {
   const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
   return [
@@ -252,9 +266,14 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
     "  sharednet read --last 30 --json    what has been said",
     '  sharednet say "…" --json          say something; keep it short',
     ...(input.roomType === "compiled" ? [COMPILED_HELP] : []),
-    "Do not run `sharednet wait` or `sharednet watch`: when your turn ends, you are woken with whatever is said next.",
+    ...(input.messageRouting === "mentions" ? [
+      "Messages mentioning known teammates wake only those teammates. No mention, @all, or unknown-only names broadcast. Explicit board reads still show all messages. Use exact teammate names from the roster.",
+      "Do not run `sharednet wait` or `sharednet watch`: end your turn when waiting; the runner supplies messages routed to you.",
+    ] : ["Do not run `sharednet wait` or `sharednet watch`: when your turn ends, you are woken with whatever is said next."]),
     "Lines from `runner` are the goal's machinery, such as a check's result, not a person.",
     "Agree in the Room who does what, do your part, and end your turn when there is nothing more to do now.",
+    ...(input.mentionGate ? [MENTION_HELP] : []),
+    ...(input.taskGate ? [TASK_HELP] : []),
   ].join("\n");
 }
 
@@ -412,6 +431,10 @@ export interface GoalRunInput {
   webSearch?: WebSearch;
   /** The longest one turn may run; the default is 20 minutes. An experiment may set it to the run's own limit. */
   turnLimitMs?: number;
+  /** Opt-in board controls. Mention gates default to targeted wakes unless overridden. */
+  mentionGate?: boolean;
+  taskGate?: boolean;
+  messageRouting?: MessageRouting;
 }
 
 export interface GoalRunDependencies {
@@ -441,6 +464,8 @@ export async function runGoal(
   const containers = runContainers(input.roomId, plan.agents);
   const turnLimitSeconds = Math.round((input.turnLimitMs ?? TURN_LIMIT_SECONDS * 1000) / 1000);
   const base = input.baseUrl;
+  const messageRouting = input.messageRouting ?? (input.mentionGate ? "mentions" : "broadcast");
+  if (input.roomType === "compiled" && (input.mentionGate || input.taskGate || messageRouting === "mentions")) throw localError("invalid_arguments", "The mention/task controls are for plain board Rooms.");
   await mkdir(input.out, { recursive: true });
   const wakeLog = join(input.out, "wakes.ndjson");
   await writeFile(wakeLog, "");
@@ -486,8 +511,9 @@ export async function runGoal(
     return seat.tokens - before;
   };
   const spend = () => records.reduce((sum, record) => sum + record.tokens, 0);
-  const exec = (seat: SeatRecord | null, command: readonly string[], options: { env?: Record<string, string>; onLine?: (line: string) => void } = {}) => {
+  const exec = (seat: SeatRecord | null, command: readonly string[], options: { env?: Record<string, string>; onLine?: (line: string) => void; through?: number } = {}) => {
     const home = seat ? `${CONTAINER_HOMES}/${seat.name}` : null;
+    const controls = seat?.member_id && home ? controlPaths({ HOME: home }, { base_url: base, room_id: input.roomId, member_id: seat.member_id }) : null;
     const environment = [
       ...(home ? ["-e", `HOME=${home}`] : []),
       ...(home && seat?.driver === "codex" ? ["-e", `CODEX_HOME=${home}/.codex`] : []),
@@ -497,6 +523,9 @@ export async function runGoal(
       // This runner wakes its seats itself. Whatever a seat runs, its join or an agent's own
       // `sharednet join rom_…` in a turn, starts no wake service of its own.
       ...(seat ? ["-e", "SHAREDNET_WAKE=off"] : []),
+      ...(seat && input.mentionGate ? ["-e", "SHAREDNET_MENTION_GATE=1"] : []),
+      ...(seat && options.through !== undefined ? ["-e", `SHAREDNET_TURN_THROUGH=${options.through}`] : []),
+      ...(controls && input.taskGate ? ["-e", "SHAREDNET_TASK_GATE=1", "-e", `SHAREDNET_TASK_FILE=${controls.tasks}`, "-e", `SHAREDNET_TASK_AUDIT=${join(controls.root, "shell-blocks.tsv")}`, "-e", "SHAREDNET_TASK_PROFILE=/etc/profile.d/sharednet-task.sh"] : []),
       ...(seat?.driver === "claude-code" && plan.claudeAuth ? ["-e", plan.claudeAuth] : []),
       ...(seat?.driver === "codex" && plan.codexAuth?.kind === "api-key" ? ["-e", "OPENAI_API_KEY"] : []),
       ...Object.keys(options.env ?? {}).flatMap((name) => ["-e", name]),
@@ -529,6 +558,14 @@ export async function runGoal(
       }
       const installed = await docker(["exec", "--user", "root", "--interactive", container, "sh", "-c", "cat > /usr/local/bin/sharednet && chmod 755 /usr/local/bin/sharednet"], { input: wrapper });
       if (installed.code !== 0) throw localError("container_failed", `The sharednet command could not be put in ${seat.name}'s container: ${installed.stderr.trim()}`);
+      if (input.taskGate) {
+        const guarded = await docker(["exec", "--user", "root", "--interactive", container, "sh", "-c", "mkdir -p /etc/profile.d && cat > /etc/profile.d/sharednet-task.sh && chmod 644 /etc/profile.d/sharednet-task.sh"], { input: TASK_PROFILE });
+        if (guarded.code !== 0) throw localError("container_failed", "Could not install the task shell guard.");
+        if (seat.driver === "claude-code") {
+          const hook = await docker(["exec", "--user", "root", "--interactive", container, "sh", "-c", "mkdir -p /usr/local/lib && cat > /usr/local/lib/sharednet-task-hook.cjs && chmod 644 /usr/local/lib/sharednet-task-hook.cjs"], { input: TASK_HOOK });
+          if (hook.code !== 0) throw localError("container_failed", "Could not install the Claude task hook.");
+        }
+      }
       const home = `${CONTAINER_HOMES}/${seat.name}`;
       const setup =
         seat.driver === "codex"
@@ -552,6 +589,11 @@ export async function runGoal(
       })();
       if (joined.code !== 0 || !memberId) throw localError("join_failed", `${seat.name} could not join the Room: ${(joined.stdout + joined.stderr).trim().slice(0, 400)}`);
       seat.member_id = memberId;
+      if (input.taskGate) {
+        const paths = controlPaths({ HOME: home }, { base_url: base, room_id: input.roomId, member_id: memberId });
+        const made = await exec(seat, ["mkdir", "-p", paths.root]);
+        if (made.code !== 0) throw localError("container_failed", "Could not create local task state.");
+      }
     }
     log(`goal: ${records.map((seat) => `${seat.name} (${seat.member_id})`).join(", ")} joined ${input.roomId}\n`);
   };
@@ -587,7 +629,10 @@ export async function runGoal(
       const reader = new TurnReader(seat.driver);
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
-      const result = await exec(seat, turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds), {
+      const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds);
+      if (input.taskGate && seat.driver === "claude-code") command.splice(command.length - 1, 0, "--settings", TASK_HOOK_SETTINGS);
+      const result = await exec(seat, command, {
+        through: wake?.through ?? input.goalSequence,
         onLine: (line) => {
           reader.line(line);
           writes = writes.then(() => appendFile(stream, `${line}\n`));
@@ -624,9 +669,9 @@ export async function runGoal(
       return failed;
     };
 
-    // One policy for every seat: woken by anything another member says, merged over 2 s, until the Room closes.
+    // Every seat starts once. Subsequent wakes follow the configured routing policy.
     const seatLoop = async (seat: SeatRecord) => {
-      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until });
+      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting });
       let wake: WakeShape | null = null;
       let failedInARow = 0;
       while (!ended) {
@@ -638,14 +683,19 @@ export async function runGoal(
           log(`goal: ${seat.name} failed ${FAILED_TURNS_LIMIT} turns in a row and takes no more; see agents/${seat.name}/\n`);
           break;
         }
-        const waited = await exec(seat, ["sharednet", "wait", "--on", "message", "--on", "closed", "--settle", "2s", "--ack", "manual", "--json"]);
-        if (ended || waited.code !== 0) break;
-        try {
-          wake = JSON.parse(waited.stdout) as WakeShape;
-        } catch {
-          break;
+        while (!ended) {
+          const waited = await exec(seat, ["sharednet", "wait", "--on", "message", "--on", "closed", "--settle", "2s", "--ack", "manual", "--json"]);
+          if (ended || waited.code !== 0) return;
+          let raw: WakeShape;
+          try { raw = JSON.parse(waited.stdout) as WakeShape; } catch { return; }
+          if (raw.fired.includes("closed")) return;
+          wake = routeWake(raw, seat, records, messageRouting);
+          const delivered = wake.messages.map(message => message.sequence);
+          if (messageRouting === "mentions") await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
+          if (delivered.length > 0 || messageRouting === "broadcast") break;
+          if (raw.wake_id) await exec(seat, ["sharednet", "ack", raw.wake_id, "--json"]);
         }
-        if (wake.fired.includes("closed")) break;
+        if (ended || !wake) return;
         prompt = wakePrompt(wake);
       }
     };
@@ -701,6 +751,9 @@ export async function runGoal(
           image: plan.image,
           web_search: input.webSearch ?? "live",
           turn_limit_s: turnLimitSeconds,
+          mention_gate: input.mentionGate ?? false,
+          task_gate: input.taskGate ?? false,
+          message_routing: messageRouting,
           agents: records,
           totals: { ...(episode.totals as object), tokens: spend(), cached_tokens: records.reduce((sum, seat) => sum + seat.usage.cached, 0) },
         },
