@@ -19,6 +19,8 @@ import {
   openingPrompt,
   parseAgents,
   prepareRun,
+  routeWake,
+  withoutTaskActs,
   runContainers,
   runGoal,
   scrubHome,
@@ -35,6 +37,30 @@ const INVITE = "rit_invite-token-travels-by-environment";
 const cleanup: string[] = [];
 afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+});
+
+describe("optional mention routing", () => {
+  const seats = [{ name: "codex-1", member_id: "A" }, { name: "codex-2", member_id: "B" }];
+  it.each([
+    ["@codex-1 check this", ["codex-1"]],
+    ["@B check this", ["codex-2"]],
+    ["@all changed interface", ["codex-1", "codex-2"]],
+    ["new public result", ["codex-1", "codex-2"]],
+    ["@unknown result", ["codex-1", "codex-2"]],
+  ])("routes %s while leaving broadcast available", (content, names) => {
+    const wake = { wake_id: "w1", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: content as string }] };
+    expect(seats.filter(s => routeWake(wake, s, seats, "mentions").messages.length).map(s => s.name)).toEqual(names);
+    expect(routeWake(wake, seats[0]!, seats, "broadcast")).toBe(wake);
+  });
+});
+
+describe("task acts in wakes", () => {
+  it("drops claims and completions, so a wake of task acts alone wakes nobody", () => {
+    const act = '[sharednet-task:v1] {"op":"claim","title":"Parser"}';
+    const wake = { wake_id: "w1", fired: ["message"], from: 1, through: 3, events: [], messages: [{ sequence: 2, content: act }, { sequence: 3, content: "build is green" }] };
+    expect(withoutTaskActs(wake).messages.map(m => m.sequence)).toEqual([3]);
+    expect(withoutTaskActs({ ...wake, messages: [wake.messages[0]!] }).messages).toEqual([]);
+  });
 });
 
 async function temporary() {
@@ -224,7 +250,7 @@ describe("prepareRun", () => {
 });
 
 describe("runGoal", () => {
-  it.each(["board", "compiled"] as const)("runs every %s seat with current state until the budget is spent and keeps credentials private", async (roomType) => {
+  it.each([["board", false, false], ["compiled", false, false], ["board", true, false], ["board", false, true], ["board", true, true]] as const)("runs every %s seat with mention=%s task=%s until the budget is spent and keeps credentials private", async (roomType, mentionGate, taskGate) => {
     const out = await temporary();
     const workspace = await temporary();
     const plan: RunPlan = {
@@ -260,6 +286,10 @@ describe("runGoal", () => {
       if (command[0] === "sharednet" && command[1] === "wait") {
         const count = (waits.get(seat!) ?? 0) + 1;
         waits.set(seat!, count);
+        if (mentionGate && seat === "i_CodexTwo02") {
+          if (count === 1) return { stdout: JSON.stringify({ wake_id: "skip_two", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: "@codex-1 handoff" }] }) };
+          if (count === 2) return { stdout: JSON.stringify({ wake_id: "wk_i_CodexTwo02", fired: ["message"], from: 2, through: 3, events: [], messages: [{ sequence: 3, content: "@all shared result" }] }) };
+        }
         // One wake each, then the Room closes.
         const wake =
           count === 1
@@ -310,7 +340,7 @@ describe("runGoal", () => {
       client,
       "sni_owner-seat",
       OWNER_KEY,
-      { plan, roomType, roomId: ROOM, inviteToken: INVITE, goal: "Make it pass.", goalSequence: 1, until: goal.until, baseUrl: "http://127.0.0.1:3117", out, checkEveryMs: 60_000, quietChecks: false },
+      { plan, roomType, mentionGate, taskGate, roomId: ROOM, inviteToken: INVITE, goal: "Make it pass.", goalSequence: 1, until: goal.until, baseUrl: "http://127.0.0.1:3117", out, checkEveryMs: 60_000, quietChecks: false },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
     );
 
@@ -336,6 +366,22 @@ describe("runGoal", () => {
     expect(turns.filter((call) => call.args.includes("resume") && call.args.includes("thread-i_CodexOne01"))).toHaveLength(1);
     // Every turn carries SHAREDNET_WAKE=off, so an agent's own `sharednet join` mid-turn starts no wake service.
     expect(turns.length).toBeGreaterThan(0);
+    expect(turns.every(call => call.args.includes("SHAREDNET_MENTION_GATE=1") === mentionGate)).toBe(true);
+    expect(turns.every(call => call.args.includes("SHAREDNET_TASK_GATE=1") === taskGate)).toBe(true);
+    expect(turns.filter(call => !call.args.includes("resume")).every(call => call.args.includes("SHAREDNET_TURN_THROUGH=1"))).toBe(true);
+    expect(turns.filter(call => call.args.includes("resume")).every(call => call.args.includes(`SHAREDNET_TURN_THROUGH=${mentionGate && call.args.includes("SHAREDNET_SEAT=i_CodexTwo02") ? 3 : 2}`))).toBe(true);
+    if (mentionGate) {
+      const routing = (await readFile(join(out, "routing.ndjson"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      expect(routing).toContainEqual(expect.objectContaining({ seat: "codex-2", skipped: [2], model_wake: false }));
+      expect(calls.some(call => call.args.includes("ack") && call.args.includes("skip_two"))).toBe(true);
+    }
+    const initial = turns.find(call => !call.args.includes("resume"))!.args.at(-1)!;
+    expect(initial.includes("Before doing work, understand the goal and claim")).toBe(taskGate);
+    expect(initial.includes("Before you say something")).toBe(mentionGate);
+    if (taskGate) {
+      const taskPaths = turns.map(call => call.args.find(arg => arg.startsWith("SHAREDNET_TASK_FILE=")));
+      expect(new Set(taskPaths).size).toBe(2);
+    }
     const opens = calls.filter((call) => call.args.includes("open"));
     expect(opens).toHaveLength(roomType === "compiled" ? turns.length : 0);
     if (roomType === "compiled") {
@@ -440,9 +486,15 @@ describe("a check", () => {
       client,
       "sni_owner-seat",
       OWNER_KEY,
-      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, webSearch: "off", turnLimitMs: 2_700_000 },
+      { plan, taskGate: true, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, webSearch: "off", turnLimitMs: 2_700_000 },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
     );
+
+    const claudeTurn = calls.find(call => call.args.includes("claude"))!;
+    expect(claudeTurn.args).toContain("SHAREDNET_TASK_GATE=1");
+    const settings = JSON.parse(claudeTurn.args[claudeTurn.args.indexOf("--settings") + 1]!);
+    expect(settings.hooks.PreToolUse[0].matcher).toBe("*");
+    expect(calls.some(call => call.input?.includes("permissionDecision: 'deny'"))).toBe(true);
 
     expect(result.ended_by).toMatchObject({ trigger: "check pytest -q" });
     // With web search off, the Claude Code seat's turn denies the web tools; the turn runs up to the run's

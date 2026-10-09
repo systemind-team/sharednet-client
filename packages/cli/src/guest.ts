@@ -5,6 +5,7 @@ import { isAbsolute, join as joinPath, resolve as resolvePathFrom } from "node:p
 
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
 import { compiledPrompt, type CompiledState } from "./compiled.ts";
+import { claimTask, controlEvent, controlPaths, latestForeignTaskSequence, noteRead, noteTasks, noteTasksSeen, pendingMentions, projectTasks, readMark, readThrough, recentTasks, taskMessage, withControlLock, type BoardMessage } from "./board-controls.ts";
 import { storeAccountCredential } from "./login.ts";
 import { CliError, localError } from "./errors.ts";
 import { computeLocalInstanceKey } from "./instance-computation.ts";
@@ -729,6 +730,7 @@ async function say(args: string[], dependencies: GuestDependencies): Promise<unk
     throw localError("invalid_reply_to", "--reply-to must be a message id such as msg_AbCdEfGhIj.");
   }
   const { client, state, credential } = await currentSeat(dependencies, stringOption(parsed, "as"));
+  await beforeSay(client, state, credential, dependencies);
   return client.request(
     "POST",
     `/rooms/${encodeURIComponent(state.room_id)}/messages`,
@@ -736,6 +738,118 @@ async function say(args: string[], dependencies: GuestDependencies): Promise<unk
     { content: parsed.positionals[0]!, ...(replyTo === undefined ? {} : { reply_to_message_id: replyTo }) },
     { "idempotency-key": randomUUID() },
   );
+}
+
+/** Read a complete board suffix; pagination must advance or the caller fails closed. */
+async function boardMessages(client: ApiClient, state: ProjectRoomState, token: string, after = 0): Promise<BoardMessage[]> {
+  const messages: BoardMessage[] = [];
+  while (true) {
+    const page = await client.request<PageShape>("GET", `/rooms/${encodeURIComponent(state.room_id)}/messages?after=${after}&order=asc&limit=100`, token);
+    if (!Array.isArray(page.items) || typeof page.has_more !== "boolean") throw localError("task_state_incomplete", "Board history is incomplete.");
+    let previous = after;
+    for (const message of page.items) {
+      if (!Number.isSafeInteger(message.sequence) || message.sequence <= previous || typeof message.content !== "string") throw localError("task_state_incomplete", "Board history is malformed or out of order.");
+      previous = message.sequence;
+    }
+    messages.push(...page.items);
+    if (!page.has_more) return messages;
+    const next = Math.max(after, ...page.items.map(m => m.sequence));
+    if (next <= after) throw localError("task_state_incomplete", "Board pagination did not advance.");
+    after = next;
+  }
+}
+
+async function beforeSay(client: ApiClient, state: ProjectRoomState, credential: StoredRoomCredential, dependencies: GuestDependencies): Promise<void> {
+  if (dependencies.env.SHAREDNET_MENTION_GATE !== "1") return;
+  const paths = controlPaths(dependencies.env, state);
+  const raw = Number(dependencies.env.SHAREDNET_TURN_THROUGH ?? 0);
+  const through = Number.isSafeInteger(raw) && raw >= 0 ? raw : 0;
+  const read = await readThrough(paths);
+  const messages = await boardMessages(client, state, credential.member_token, Math.max(through, read));
+  const pending = pendingMentions(messages, { memberId: state.member_id, name: credential.name }, through, read);
+  if (!pending.length) return;
+  const maximum = Math.max(...pending.map(m => m.sequence));
+  await controlEvent(paths, { kind: "mention_injected", sequences: pending.map(m => m.sequence), turn_through: through, previous_read: read });
+  await noteRead(paths, maximum);
+  throw localError("unread_mentions", "Nothing was posted. These addressed messages are now supplied to you. Consider them, then explicitly retry or revise your post; no reply is required.\n" + JSON.stringify(pending));
+}
+
+/** How many recent tasks a claimant is shown before its claim: SHAREDNET_TASK_RECENT, default 20. */
+function taskReviewCount(env: GuestDependencies["env"]): number {
+  const n = Number(env.SHAREDNET_TASK_RECENT ?? 20);
+  return Number.isSafeInteger(n) && n > 0 ? n : 20;
+}
+
+async function task(args: string[], dependencies: GuestDependencies): Promise<unknown> {
+  const parsed = parseGuestArguments(args);
+  assertOnlyOptions(parsed, ["as"]);
+  const [action, title] = parsed.positionals;
+  if (!(["claim", "done"].includes(action ?? "") && parsed.positionals.length === 2) && !(action === "list" && parsed.positionals.length === 1)) {
+    throw localError("invalid_arguments", 'Usage: sharednet task claim "<title>" | done "<title>" | list');
+  }
+  const { client, state, credential } = await currentSeat(dependencies, stringOption(parsed, "as"));
+  if (credential.room_type === "compiled") throw localError("invalid_room_type", "Title tasks are for plain board Rooms; compiled Rooms use acts.");
+  const paths = controlPaths(dependencies.env, state);
+  return withControlLock(paths, "task", async () => {
+    let history: BoardMessage[] = [];
+    const list = async () => { history = await boardMessages(client, state, credential.member_token); return history; };
+    const post = async (content: string) => {
+      const result = await client.request<{ message: BoardMessage }>("POST", `/rooms/${encodeURIComponent(state.room_id)}/messages`, credential.member_token, { content }, { "idempotency-key": randomUUID() });
+      if (!result.message?.sequence) throw localError("task_state_incomplete", "The task post has no committed sequence.");
+      return result.message;
+    };
+    if (action === "list") {
+      const tasks = projectTasks(await list());
+      await noteTasks(paths, tasks, state.member_id);
+      await noteTasksSeen(paths, latestForeignTaskSequence(history, state.member_id));
+      return { room_id: state.room_id, member_id: state.member_id, tasks };
+    }
+    // Validate the title before any network side effect.
+    const content = taskMessage(action as "claim" | "done", title!);
+    await beforeSay(client, state, credential, dependencies);
+    if (action === "claim") {
+      // Look before claiming: teammates' newer tasks are shown first, and nothing is claimed until the claim is repeated.
+      const latest = latestForeignTaskSequence(await list(), state.member_id);
+      const seen = await readMark(paths.taskSeen);
+      if (latest > seen) {
+        const recent = recentTasks(projectTasks(history), taskReviewCount(dependencies.env))
+          .map(t => ({ title: t.title, owner: t.owner_name ?? t.owner, status: t.status }));
+        await controlEvent(paths, { kind: "claim_review", title: title!, latest, shown: recent.length });
+        await noteTasksSeen(paths, latest);
+        throw localError("review_tasks", "Nothing was claimed. Compare your title with these recent tasks, newest first. If your work is the same as one of them, do not claim it: pick other work, or coordinate with its owner. Otherwise run the same claim again.\n" + JSON.stringify(recent));
+      }
+      try {
+        const claimed = await claimTask({ list, post }, state.member_id, title!);
+        const tasks = projectTasks(history);
+        await noteTasks(paths, tasks, state.member_id);
+        // Claims committed between the last look and this one crossed it: the claimant could not have seen them.
+        const crossed = tasks.filter(t => t.owner !== state.member_id && t.claim_sequence > seen && t.claim_sequence < claimed.claim_sequence)
+          .map(t => ({ title: t.title, owner: t.owner_name ?? t.owner, status: t.status }));
+        await noteTasksSeen(paths, claimed.claim_sequence);
+        await controlEvent(paths, { kind: "task_claimed", task: claimed, crossed: crossed.length });
+        return { room_id: state.room_id, task: claimed, ...(crossed.length ? { crossed, note: "These tasks were claimed just before yours, unseen by you. If one is the same work, coordinate with its owner." } : {}) };
+      } catch (error) {
+        // Never grant shell access from an unconfirmed claim. `task list` can recover it.
+        await controlEvent(paths, { kind: "task_claim_refused", title: title!, code: error instanceof CliError ? error.code : "service_unavailable" });
+        throw error;
+      }
+    }
+    const key = title!.toLowerCase().replace(/\s/gu, "");
+    const before = projectTasks(await list());
+    const owned = before.find(t => t.key === key);
+    if (!owned || owned.owner !== state.member_id || owned.status !== "claimed") throw localError("task_not_owned", "Only the owner of an active task can mark it done.");
+    // Fail closed if POST succeeds but the response or subsequent replay is lost.
+    // A later task list can restore a task whose completion did not commit.
+    await controlEvent(paths, { kind: "task_released", task: owned });
+    await noteTasks(paths, before.filter(t => t.key !== key), state.member_id);
+    const posted = await post(content);
+    const tasks = projectTasks(await list());
+    const done = tasks.find(t => t.key === key);
+    if (done?.status !== "done" || !history.some(m => m.sequence === posted.sequence)) throw localError("task_state_incomplete", "Completion replay is incomplete. Run sharednet task list.");
+    await noteTasks(paths, tasks, state.member_id);
+    await controlEvent(paths, { kind: "task_done", task: done });
+    return { room_id: state.room_id, task: done };
+  });
 }
 
 /** One long-poll from the cursor; the server answers within `timeout` seconds. */
@@ -1728,6 +1842,9 @@ async function read(args: string[], dependencies: GuestDependencies): Promise<un
     `/rooms/${encodeURIComponent(state.room_id)}/messages${query.size ? `?${query.toString()}` : ""}`,
     credential.member_token,
   );
+  if (dependencies.env.SHAREDNET_MENTION_GATE === "1" && Array.isArray(page.items)) {
+    await noteRead(controlPaths(dependencies.env, state), Math.max(0, ...page.items.map(m => m.sequence)));
+  }
   // --last K is asked newest-first and shown oldest-first, the way a person reads a tail.
   if (parsed.options.has("last") && Array.isArray(page?.items)) {
     return { ...page, items: [...page.items].reverse() };
@@ -2797,6 +2914,7 @@ async function timer(args: string[], dependencies: GuestDependencies): Promise<u
 }
 
 export type GuestVerb =
+  | "task"
   | "timer"
   | "serve"
   | "whoami"
@@ -2825,6 +2943,7 @@ export type GuestVerb =
 
 export function isGuestVerb(value: string | undefined): value is GuestVerb {
   return (
+    value === "task" ||
     value === "timer" ||
     value === "serve" ||
     value === "whoami" ||
@@ -2856,6 +2975,7 @@ export async function runGuestVerb(
   args: string[],
   dependencies: GuestDependencies,
 ): Promise<unknown> {
+  if (verb === "task") return task(args, dependencies);
   if (verb === "act" || verb === "open" || verb === "deliver") return compiledCommand(verb, args, dependencies);
   if (verb === "timer") return timer(args, dependencies);
   if (verb === "serve") return serve(args, dependencies);

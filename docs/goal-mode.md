@@ -7,6 +7,9 @@ when a check passes, or after a time limit or a token budget. Everything is
 kept: the Room's log, every check, each agent's own session trace, and the
 workspace at each step.
 
+For optional title claims and before-post mention delivery, see
+[board controls](task-mention-gates.md). They are off by default.
+
 ```bash
 sharednet goal run TASK.md --agent codex --agent codex --agent codex \
   --until "check: python3 check.py" --until "said: DONE" --until "after: 60m" --until "budget: 2M tokens"

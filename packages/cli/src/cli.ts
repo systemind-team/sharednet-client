@@ -105,9 +105,10 @@ const optionValueNames = new Set([
   "image",
   "web-search",
   "turn-limit",
+  "message-routing",
   "type",
 ]);
-const booleanOptionNames = new Set(["new", "private", "quiet-checks"]);
+const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate"]);
 
 /** Room mode is fixed at creation. Omission retains the service default. */
 function roomType(parsed: ParsedArguments): "board" | "compiled" | undefined {
@@ -547,12 +548,17 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing"]);
   const type = roomType(parsed);
+  const messageRouting = option(parsed, "message-routing");
+  if (messageRouting !== undefined && messageRouting !== "broadcast" && messageRouting !== "mentions") throw localError("invalid_arguments", "--message-routing must be broadcast or mentions.");
+  if (type === "compiled" && (parsed.options.has("mention-gate") || parsed.options.has("task-gate") || messageRouting === "mentions")) {
+    throw localError("invalid_arguments", "The mention/task gates are for plain board Rooms.");
+  }
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--mention-gate] [--task-gate] [--message-routing broadcast|mentions]",
     );
   }
   const webSearch = option(parsed, "web-search") ?? "live";
@@ -629,6 +635,9 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           out,
           checkEveryMs,
           quietChecks: parsed.options.get("quiet-checks") === true,
+          mentionGate: parsed.options.get("mention-gate") === true,
+          taskGate: parsed.options.get("task-gate") === true,
+          ...(messageRouting ? { messageRouting } : {}),
           webSearch,
           ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
         },
@@ -674,7 +683,7 @@ async function execute(
   }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach/timer, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/watch/export, and decision list/approve/deny.",
+    "Use login, whoami, join/say/read/wait/ack/watch/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/watch/export, and decision list/approve/deny.",
   );
 }
 
