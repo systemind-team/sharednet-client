@@ -35,6 +35,6 @@
 - [x] 1. Test title projection and same-title competition, then implement `board-controls.ts`; test pagination completeness through the claimed sequence.
 - [x] 2. Test before-say receipt refusal, watermarks and room/seat isolation; integrate task commands and read accounting into `guest.ts` without changing wait/ack.
 - [x] 3. Execute a real bash guard under held/empty state and quoted/compound commands; wire optional flags, per-turn watermark and per-seat paths into `goal-run.ts`/`cli.ts`.
-- [ ] 4. Run all repository tests, types, export checks and package smoke. Add docs and explicit export paths. Commit and prepare a reviewable PR.
+- [x] 4. Run all repository tests, types, export checks and package smoke. Add docs and explicit export paths. Commit and prepare a reviewable PR.
 - [x] 5. Run a no-model two-seat probe against a real service using the exact candidate: concurrent claim race, mid-turn @ followed by rejected say and successful retry, publish-to-receipt timing.
-- [ ] 6. Freeze four-arm inputs, run two ProgramBench tasks with three agents and matched stop rules. Grade frozen submissions and audit exact receipts, crossed posts, tokens, time and non-shell edits made without a held task. Report exploratory limits and infrastructure failures separately.
+- [x] 6. Freeze four-arm inputs, run two ProgramBench tasks with three agents and matched stop rules. Grade frozen submissions and audit exact receipts, crossed posts, tokens, time and non-shell edits made without a held task. Report exploratory limits and infrastructure failures separately.

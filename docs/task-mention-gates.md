@@ -40,3 +40,20 @@ The watermark is `max(SHAREDNET_TURN_THROUGH, local read maximum)`. The runner s
 Local evidence is saved under the agent's state directory in `sharednet/board-controls/<scope>/`: `held-tasks`, `read-through`, `events.ndjson`, and `shell-blocks.tsv`. These contain task/receipt metadata, not credentials. Goal records retain each agent home after scrubbing credentials, so the experiment can audit claims, gate events and bypassed edits.
 
 For comparisons, keep task, model, image, budget and stop rules fixed. Historical runs with substring DONE matching are not matched controls for runs using standalone DONE. Count actual message receipts before actions; an automatic wake and an explicit read are both receipt paths. Report title-claim losses, gate interventions, direct-edit violations, tokens, duration and hidden task score separately. Fewer incidents or messages alone is not evidence of better task performance.
+
+## Exploratory evaluation: 2026-10-09
+
+Frozen runtime candidate `e9f103f1e4e5e3639e644c328fcb599aec904486` was tested on two ProgramBench tasks, with three Codex agents using gpt-6-luna low, one run per arm/task, fresh workspaces, the same 15-minute / 1M fresh-token soft ceiling, and standalone DONE plus a fresh visible build check. Hidden scores were withheld from solving agents.
+
+| Arm | Cmatrix passed / 506 | FD passed / 1,235 | Fresh tokens, both tasks |
+| --- | ---: | ---: | ---: |
+| Broadcast | 492 | 790 | 653,108 |
+| @ | 505 | 781 | 790,246 |
+| Task | 485 | 955* | 1,531,806 |
+| Both | 479 | 891 | 933,124 |
+
+Scores use unique active, nonignored test keys through the official ProgramBench submission helper; the eval CLI display can inflate scores by counting retry entries separately. *Task's original FD evaluation was 954 with one fixture/setup worker crash. The identical frozen executable passed the unchanged original testcase in an isolated container with 6 GiB instead of 4 GiB fixture memory, giving a validated count of 955. The original score and supplemental XML are retained separately. FD @ also required a 6 GiB retry; Cmatrix both required an experiment-only repair that rearms the existing pytest timeout on retries. Test assertions, candidate code and timeout values were unchanged.
+
+Task has the highest descriptive equal-weight mean across these two tasks (86.59%); @ wins Cmatrix and Task wins FD. All treatments consume more fresh tokens than their matched baseline; Task uses 134.5% more in total. This small pilot does not establish a causal or general performance improvement. Fresh tokens are uncached input plus output, not dollar cost.
+
+Trace auditing found actual tail-read watermark gaps, truncated mention delivery, and semantically overlapping titles that exact matching cannot prevent. Both's Cmatrix run reduced observed crossed-post candidates from 12/33 to 0/22 while scoring lower. No completed direct file edit without a recorded held task was observed in the gated runs; the documented bypass remains possible. Full artifacts, canonical scores, grading repairs and trace evidence are recorded in the experiment workspace `runs/task-mention-gates-2026-10-09/`.
