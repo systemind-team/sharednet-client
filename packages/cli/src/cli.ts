@@ -106,6 +106,7 @@ const optionValueNames = new Set([
   "web-search",
   "turn-limit",
   "message-routing",
+  "container-topology",
   "type",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate"]);
@@ -548,8 +549,10 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "container-topology"]);
   const type = roomType(parsed);
+  const containerTopology = option(parsed, "container-topology") ?? "per-agent";
+  if (containerTopology !== "per-agent" && containerTopology !== "shared") throw localError("invalid_arguments", "--container-topology must be per-agent or shared.");
   const messageRouting = option(parsed, "message-routing");
   if (messageRouting !== undefined && messageRouting !== "broadcast" && messageRouting !== "mentions") throw localError("invalid_arguments", "--message-routing must be broadcast or mentions.");
   if (type === "compiled" && (parsed.options.has("mention-gate") || parsed.options.has("task-gate") || messageRouting === "mentions")) {
@@ -558,7 +561,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--mention-gate] [--task-gate] [--message-routing broadcast|mentions]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--mention-gate] [--task-gate] [--message-routing broadcast|mentions] [--container-topology per-agent|shared]",
     );
   }
   const webSearch = option(parsed, "web-search") ?? "live";
@@ -583,6 +586,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   const plan = await prepareRun(
     {
       agents,
+      containerTopology,
       image: option(parsed, "image") ?? null,
       workspace,
       env: dependencies.env,
@@ -613,7 +617,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     dependencies.stderr(`goal: ${roomId} is open; the record goes to ${out}\n`);
     // Ctrl-C ends the run without leaving Agents at work in containers nobody watches.
     const interrupt = () => {
-      spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents)]);
+      spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents, plan.containerTopology)]);
       dependencies.stderr(`goal: stopped; the Agents' containers are gone and ${roomId} is still open\n`);
       process.exit(130);
     };

@@ -326,6 +326,13 @@ describe("reach: forming a group from the account CLI", () => {
     expect(sentBody(open.requests[0]!)).not.toHaveProperty("reach");
   });
 
+  it("refuses an invalid container topology before any request", async () => {
+    const refused = await harness(["goal", "run", "TASK.md", "--container-topology", "maybe"], []);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr.join(" ")).toContain("--container-topology must be per-agent or shared");
+    expect(refused.requests).toEqual([]);
+  });
+
   it("refuses a goal run whose web search is neither live nor off, before anything is sent", async () => {
     const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--web-search", "maybe"], []);
     expect(refused.exitCode).not.toBe(0);
