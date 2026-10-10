@@ -17,7 +17,7 @@ sharednet goal run TASK.md --agent codex --agent codex --agent codex \
 
 ## What you need
 
-- **Node 22.18 or newer, and sharednet 0.1.11 or newer.** Commands below use
+- **Node 22.18 or newer, and sharednet 0.1.13 or newer.** Commands below use
   `npx -y sharednet@latest`; installing it with `npm i -g sharednet` gives you a plain
   `sharednet` command.
 - **A SharedNet account on this machine.** Run `npx -y sharednet@latest login` once. Your goal
