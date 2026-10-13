@@ -2588,6 +2588,29 @@ async function saveWakeProgress(path: string, value: unknown): Promise<void> {
  * and still carries everything said meanwhile.
  */
 const MAX_TURNS_PER_HOUR = 30;
+/**
+ * Seats that resume the same session take turns. While one seat's turn holds the session, a second
+ * resume would find an "active writer" and queue its lines into that turn, which neither belongs to
+ * the seat nor keeps the lines if it ends early. So the next seat waits, then resumes, in order.
+ */
+export function sessionTurnOrder() {
+  const held = new Map<string, { holder: string; done: Promise<void> }>();
+  return async <T>(key: string, holder: string, onWait: (holder: string) => void, work: () => Promise<T>): Promise<T> => {
+    for (let current = held.get(key); current; current = held.get(key)) {
+      onWait(current.holder);
+      await current.done;
+    }
+    let release!: () => void;
+    held.set(key, { holder, done: new Promise<void>((resolve) => { release = resolve; }) });
+    try {
+      return await work();
+    } finally {
+      held.delete(key);
+      release();
+    }
+  };
+}
+
 /** A wake program that did not start is looked at again after this, doubling up to the cap. */
 const CHECK_RETRY_MS = 30_000;
 const CHECK_RETRY_MAX_MS = 600_000;
@@ -2648,6 +2671,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const seatKey = (seat: StoredRoomCredential) => `${seat.room_id}/${seat.member_id}`;
   const tracked = new Map(seats.map((seat) => [seatKey(seat), seat]));
   const turnTimes = new Map<string, number[]>();
+  const inTurnOrder = sessionTurnOrder();
   const statusOf = (all: StoredRoomCredential[]): ServeStatus => ({
     pid: process.pid,
     started_at: started,
@@ -2817,19 +2841,26 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       const wake = (await readRoomCredential(paths, seat.room_id, seat.member_id))?.wake;
       // `wake off` may have run while the poll or turn backstop was waiting.
       if (!wake) return null;
-      const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through };
-      const timeoutMs = wake.turn_limit_ms ?? DEFAULT_TURN_LIMIT_MS;
-      const checkpoint = checkpointPath(paths.stateDir, seat.room_id, seat.member_id);
-      const deadline = dependencies.now().getTime() + timeoutMs;
-      const checkpointAt = deadline - Math.min(120_000, timeoutMs / 4);
-      let prompt = wakeTurnPrompt(about) + `\n\nExecution budget: ${timeoutMs / 60_000} minutes; deadline ${new Date(deadline).toISOString()}. Save progress by ${new Date(checkpointAt).toISOString()} and after each significant milestone: sharednet wake checkpoint "completed; next step; blockers; evidence paths" --as ${seat.member_id}. Keep secrets out. Previous checkpoint (if any): ${checkpoint}. Read it to recover context, then verify current state before repeating actions. A checkpoint does not authorize automatic retries. You can set the NEXT turn's limit with sharednet wake limit 60m --as ${seat.member_id}; this does not extend this running turn. This budget applies to headless execution, not a handoff into an open chat.`;
-      if (seat.room_type === "compiled") {
-        const state = await client.request<CompiledState>("GET", `/rooms/${encodeURIComponent(seat.room_id)}/state`, seat.member_token);
-        prompt += `\n\n${compiledPrompt(state)}`;
-      }
       const plugin = pluginFor(wake.driver);
       const started = dependencies.now().getTime();
-      const delivery = await plugin.deliver(wake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs });
+      const timeoutMs = wake.turn_limit_ms ?? DEFAULT_TURN_LIMIT_MS;
+      const take = async () => {
+        const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through };
+        const checkpoint = checkpointPath(paths.stateDir, seat.room_id, seat.member_id);
+        const deadline = dependencies.now().getTime() + timeoutMs;
+        const checkpointAt = deadline - Math.min(120_000, timeoutMs / 4);
+        let prompt = wakeTurnPrompt(about) + `\n\nExecution budget: ${timeoutMs / 60_000} minutes; deadline ${new Date(deadline).toISOString()}. Save progress by ${new Date(checkpointAt).toISOString()} and after each significant milestone: sharednet wake checkpoint "completed; next step; blockers; evidence paths" --as ${seat.member_id}. Keep secrets out. Previous checkpoint (if any): ${checkpoint}. Read it to recover context, then verify current state before repeating actions. A checkpoint does not authorize automatic retries. You can set the NEXT turn's limit with sharednet wake limit 60m --as ${seat.member_id}; this does not extend this running turn. This budget applies to headless execution, not a handoff into an open chat.`;
+        if (seat.room_type === "compiled") {
+          const state = await client.request<CompiledState>("GET", `/rooms/${encodeURIComponent(seat.room_id)}/state`, seat.member_token);
+          prompt += `\n\n${compiledPrompt(state)}`;
+        }
+        return plugin.deliver(wake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs });
+      };
+      // The deadline and prompt are set when the turn starts, not while it waits for the session.
+      const sessionKey = wake.session ? JSON.stringify([wake.driver, wake.codex_home ?? null, wake.session]) : null;
+      const delivery = sessionKey === null
+        ? await take()
+        : await inTurnOrder(sessionKey, `${seat.room_id} ${seat.name}`, (holder) => dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed; its session is in ${holder}'s turn, so it resumes after that\n`), take);
       // The backstop counts turns that ran; a wake handed on, left or put off ran none.
       if (delivery.kind === "replied" || delivery.kind === "failed") turns.push(started);
       const span = `#${from + 1}..#${through}`;

@@ -3610,3 +3610,44 @@ it.each(["watch", "serve"])("hydrates a legacy compiled credential before %s inv
   expect(again.exitCode, again.stderr).toBe(0);
   expect(again.requests).toHaveLength(2);
 });
+
+describe("seats that resume one session take turns", () => {
+  it("runs one turn per session at a time, in order, and keeps other sessions free", async () => {
+    const { sessionTurnOrder } = await import("./guest.ts");
+    const inTurnOrder = sessionTurnOrder();
+    const log: string[] = [];
+    const waited: string[] = [];
+    let open!: () => void;
+    const first = inTurnOrder("codex:thread-1", "rom_A codex", () => undefined, async () => {
+      log.push("A start");
+      await new Promise<void>((resolve) => { open = resolve; });
+      log.push("A end");
+      return "A";
+    });
+    const second = inTurnOrder("codex:thread-1", "rom_B triage", (holder) => waited.push(`B waits for ${holder}`), async () => {
+      log.push("B start");
+      return "B";
+    });
+    const third = inTurnOrder("codex:thread-1", "rom_C follow-up", (holder) => waited.push(`C waits for ${holder}`), async () => {
+      log.push("C start");
+      return "C";
+    });
+    const elsewhere = await inTurnOrder("codex:thread-2", "rom_D other", () => waited.push("D waited"), async () => "D");
+    await Promise.resolve();
+    // Another session is not held up; this one has started nothing else while A holds it.
+    expect(elsewhere).toBe("D");
+    expect(log).toEqual(["A start"]);
+    open();
+    expect(await Promise.all([first, second, third])).toEqual(["A", "B", "C"]);
+    expect(log).toEqual(["A start", "A end", "B start", "C start"]);
+    expect(waited).toContain("B waits for rom_A codex");
+    expect(waited).not.toContain("D waited");
+  });
+
+  it("frees the session when a turn fails", async () => {
+    const { sessionTurnOrder } = await import("./guest.ts");
+    const inTurnOrder = sessionTurnOrder();
+    await expect(inTurnOrder("k", "a", () => undefined, async () => { throw new Error("turn crashed"); })).rejects.toThrow("turn crashed");
+    expect(await inTurnOrder("k", "b", () => undefined, async () => "next")).toBe("next");
+  });
+});
