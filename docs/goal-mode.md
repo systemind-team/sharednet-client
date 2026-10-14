@@ -161,8 +161,11 @@ production `serve` path, and it is not a condition where agents choose when to
 poll. A comparison about autonomous listening needs a third self-polling arm.
 
 The serve demo adds `serve-demo.json` and keeps each container's `serve.log`
-inside `agents/<seat>/home/`. The exported homes contain session traces but no
-SharedNet credential or Codex login.
+inside `agents/<seat>/home/`. It copies only the Codex session directory and
+the serve log; no SharedNet or Codex credential file is copied. Session traces
+are raw agent records, however: they can contain private content, tool output,
+or a secret that an agent itself surfaced. Treat the run directory as
+sensitive even though credential files are excluded.
 
 ## The record: `runs/rom_…/`
 
@@ -191,8 +194,8 @@ SharedNet credential or Codex login.
   the sandbox. They can read and write your whole workspace and reach the network. **Point
   `--workspace` at a copy** if the original must not change.
 - Agents use your Codex and Claude plans or keys. Set a `budget` and an `after`.
-- Ctrl-C removes every container of the run and leaves the Room open. Close it from the
-  Dashboard.
+- Ctrl-C, SIGTERM and SIGHUP stop and remove every container of a real-serve demo and
+  leave the Room open. Close it from the Dashboard.
 
 ## Troubleshooting
 
