@@ -83,8 +83,9 @@ function ephemeralPathEntry(entry: string): boolean {
 
 /**
  * An address that carries a user name or password, in any form. One rule: drop an optional scheme
- * and the slashes after it, take the authority (up to the first path, query or fragment delimiter),
- * and any `@` there (or `%40`, which no host name contains) means userinfo. That covers
+ * and the slashes after it, take the authority (up to the first `/`, `?` or `#`), and any `@` there
+ * (or `%40`, which no host name contains) means userinfo. A backslash does not end it: Windows-domain
+ * userinfo is `DOMAIN\user:pass@host`, and curl sends it as Proxy-Authorization. That covers
  * `scheme://user:pass@host`, the network-path `//user:pass@host`, and the scheme-less
  * `user:pass@host:port` proxy variables also accept (a URL parser reads that as scheme `user:` and
  * finds no credentials; here `user:` is dropped as a scheme and `pass@host` still has its `@`).
@@ -92,7 +93,7 @@ function ephemeralPathEntry(entry: string): boolean {
  */
 export function carriesCredentials(value: string): boolean {
   const rest = value.trim().replace(/^(?:[A-Za-z][A-Za-z0-9+.-]*:)?[\\/]*/, "");
-  const authority = rest.split(/[\\/?#]/)[0] ?? "";
+  const authority = rest.split(/[/?#]/)[0] ?? "";
   if (authority.includes("@") || /%40/i.test(authority)) return true;
   try {
     const url = new URL(value.trim());

@@ -343,13 +343,21 @@ describe("installing, inspecting and removing it", () => {
       ["http:/user:np-secret-10@proxy.example:8080", "np-secret-10"],
       ["http:\\\\user:np-secret-11@proxy.example:8080", "np-secret-11"],
       ["http:user:np-secret-12@proxy.example:8080", "np-secret-12"],
+      // Windows-domain userinfo (`DOMAIN\\user`), which curl sends as Proxy-Authorization: a backslash
+      // in the user name or the password, with a scheme and without one.
+      ["http://DOMAIN\\user:np-secret-13@proxy.example:8080", "np-secret-13"],
+      ["DOMAIN\\user:np-secret-14@proxy.example:8080", "np-secret-14"],
+      ["http://user:np\\secret-15@proxy.example:8080", "np\\secret-15"],
+      ["user:np\\secret-16@proxy.example:8080", "np\\secret-16"],
+      ["//DOMAIN\\user:np-secret-17@proxy.example:8080", "np-secret-17"],
     ];
     for (const [value, secret] of corpus) {
       expect(carriesCredentials(value), value).toBe(true);
       for (const name of ["HTTPS_PROXY", "http_proxy", "ALL_PROXY", "SHAREDNET_BASE_URL"]) {
         const { host, files } = fakeHost("/Users/synthetic");
         const report = await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin, [name]: value }, host, program).install();
-        expect(JSON.stringify(report), `${name}=${value} in the report`).not.toContain(secret);
+        // As serialized: JSON writes a backslash as two, so the raw secret would never match there.
+        expect(JSON.stringify(report), `${name}=${value} in the report`).not.toContain(JSON.stringify(secret).slice(1, -1));
         expect(files.get(plistFile), `${name}=${value} in the plist`).not.toContain(secret);
         expect(report.warnings, `${name}=${value}`).toEqual(expect.arrayContaining([expect.stringContaining(`${name} was not written`)]));
       }
