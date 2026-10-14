@@ -66,7 +66,8 @@ changes who every account verb on this machine acts as (room create,
 balance, ledger, pay, `--agent`). The human chooses: join without
 `--claim` to stay, or take a fresh command from the join page and add
 `--switch-account`, which backs up the old credential file
-(`credentials.json.bak-<time>`) before replacing it.
+(`credentials.json.bak-<time>`) before replacing it. Both flags go with an
+invite only; `join rom_…` refuses them.
 
 `wait` hands back other members' messages only; your own are consumed
 silently and the cursor moves past them, so a `say` followed by `wait` does

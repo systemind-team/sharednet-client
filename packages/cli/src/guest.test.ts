@@ -3129,6 +3129,92 @@ describe("sharednet say and wait", () => {
       expect(await readFile(held.file)).toEqual(held.before);
     });
 
+    it("does not let a login and a switch interleave: the switch waits, then backs up and replaces what login wrote", async () => {
+      const space = await workspace();
+      const held = await holding(space);
+      const { getStoragePaths, writeStoredApiCredential } = await import("./storage.ts");
+      const { withCredentialLock } = await import("./login.ts");
+      const paths = getStoragePaths(space.env);
+      const CONCURRENT = "p_CoNcUrReNt";
+      // A `login` in another terminal holds the credential lock and is about to write account C.
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let locked!: () => void;
+      const holdingLock = new Promise<void>((resolve) => { locked = resolve; });
+      const login = withCredentialLock(paths, async () => {
+        locked();
+        await gate;
+        await writeStoredApiCredential(paths, {
+          schema_version: 1, base_url: "https://www.sharednet.ai", principal_id: CONCURRENT, api_key_id: "key_CoNcUrReN1",
+          api_key: `snk_${"C".repeat(43)}`, installation_secret: SECRET, created_at: "2026-10-12T00:00:00.000Z", expires_at: null,
+        });
+      });
+      await holdingLock;
+      // The login finishes 100 ms after the claim is redeemed; the switch decides only after that.
+      const result = await run(
+        ["join", PASTED_INVITE, "--claim", CLAIM, "--switch-account", "--json"],
+        space,
+        [{ ...redeemedFor(OTHER), entered: () => { setTimeout(release, 100); } }, ...seatOf(OTHER, "i_SwitchedA1")],
+      );
+      await login;
+
+      expect(result.exitCode).toBe(0);
+      // Last writer wins and says so: the file is the switch's, and the backup is login's C, not the A read before it.
+      expect(JSON.parse(await readFile(held.file, "utf8"))).toMatchObject({ principal_id: OTHER, api_key: MINTED_KEY });
+      const copies = await backups(held.dir);
+      expect(copies).toHaveLength(1);
+      expect(JSON.parse(await readFile(join(held.dir, copies[0]!), "utf8"))).toMatchObject({ principal_id: CONCURRENT });
+      expect(result.stderr).toContain(`this machine acted as ${CONCURRENT} and now acts as ${OTHER}`);
+    });
+
+    it("seats the account the claim was checked against, even if the file changes before the seat is registered", async () => {
+      const space = await workspace();
+      const held = await holding(space);
+      const { writeFileSync } = await import("node:fs");
+      const SWITCHED_KEY = `snk_${"B".repeat(43)}`;
+      const result = await run(
+        ["join", PASTED_INVITE, "--claim", CLAIM, "--json"],
+        space,
+        [redeemedFor(HELD), ...seatOf(HELD, "i_SameAcct01")],
+        {},
+        {
+          // The moment the claim is settled as HELD, another command (an old CLI, which takes no lock) switches the file.
+          onStderr: (line) => {
+            if (!line.includes("the credential file is unchanged")) return;
+            writeFileSync(held.file, `${JSON.stringify({
+              schema_version: 1, base_url: "https://www.sharednet.ai", principal_id: OTHER, api_key_id: "key_SwItChEd01",
+              api_key: SWITCHED_KEY, installation_secret: SECRET, created_at: "2026-10-12T00:00:00.000Z", expires_at: null,
+            })}\n`, { mode: 0o600 });
+          },
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(header(result.requests[1]!, "authorization")).toBe(`Bearer ${HELD_KEY}`);
+      expect(JSON.parse(result.stdout)).toMatchObject({ principal_id: HELD });
+    });
+
+    it("refuses --claim and --switch-account on a re-entry by Room id instead of ignoring them", async () => {
+      const space = await workspace();
+      const { getStoragePaths, writeRoomCredential } = await import("./storage.ts");
+      await writeRoomCredential(getStoragePaths(space.env), {
+        schema_version: 1, base_url: "https://www.sharednet.ai", room_id: ROOM_ID, member_id: MEMBER_ID, name: "claude-code",
+        member_token: MEMBER_TOKEN, joined_at: "2026-10-12T00:00:00.000Z",
+      });
+      for (const flags of [["--claim", CLAIM], ["--switch-account"], ["--claim", CLAIM, "--switch-account"], ["--claim", "nope"]]) {
+        const refused = await run(["join", ROOM_ID, ...flags, "--json"], space, []);
+        expect(refused.exitCode).toBe(2);
+        expect(refused.requests).toHaveLength(0);
+        expect(["invalid_arguments", "invalid_claim"]).toContain(JSON.parse(refused.stderr).error.code);
+      }
+      const claimRefusal = JSON.parse((await run(["join", ROOM_ID, "--claim", CLAIM, "--json"], space, [])).stderr).error;
+      expect(claimRefusal.message).toContain("--claim goes with an invite");
+      // The same seat with no flags does go out: what stopped the others was the refusal.
+      const control = await run(["join", ROOM_ID, "--json"], space, [{ status: 410, body: { error: { code: "invite_revoked", message: "gone" } } }]);
+      expect(control.requests).toHaveLength(1);
+      expect(control.requests[0]!.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/join`);
+    });
+
     it("takes --switch-account only with --claim, and spends no claim on an unreadable credential file", async () => {
       const space = await workspace();
       const alone = await run(["join", PASTED_INVITE, "--switch-account", "--json"], space, []);

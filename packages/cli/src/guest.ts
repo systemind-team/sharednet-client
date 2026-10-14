@@ -6,7 +6,7 @@ import { isAbsolute, join as joinPath, resolve as resolvePathFrom } from "node:p
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
 import { compiledPrompt, type CompiledState } from "./compiled.ts";
 import { claimTask, controlEvent, controlPaths, latestForeignTaskSequence, noteRead, noteTasks, noteTasksSeen, pendingMentions, projectTasks, readMark, readThrough, recentTasks, taskMessage, withControlLock, type BoardMessage } from "./board-controls.ts";
-import { storeAccountCredential } from "./login.ts";
+import { accountCredentialFrom, withCredentialLock } from "./login.ts";
 import { CliError, localError } from "./errors.ts";
 import { computeLocalInstanceKey } from "./instance-computation.ts";
 import { detectRuntime, type DetectedRuntime } from "./runtime-detection.ts";
@@ -23,6 +23,8 @@ import {
   readSessionById,
   readStoredApiCredential,
   backupStoredApiCredential,
+  writeStoredApiCredential,
+  type StoredApiCredential,
   selectProjectSeat,
   writeProjectRoomState,
   writeRoomCredential,
@@ -295,15 +297,20 @@ function invalidServerResponse(): CliError {
 type RedeemedClaim = { state: string; principal: { id: string }; api_key: string; api_key_id: string };
 
 /**
- * Settles who this machine acts as after a claim was redeemed. The service
- * has no way to read a claim's account without spending it, and spending it
- * mints a key, so the comparison happens here, after the fact:
+ * Settles who this machine acts as after a claim was redeemed, and returns
+ * that account's credential. The service has no way to read a claim's account
+ * without spending it, and spending it mints a key, so the comparison happens
+ * here, after the fact:
  *
- * - no account stored: the claimed one becomes the machine's (created only if
- *   still absent, so a racing session's account is compared, not overwritten);
+ * - no account stored: the claimed one becomes the machine's;
  * - the same account: the credential file is left exactly as it was;
  * - another account: refused, file untouched, unless `--switch-account`, which
  *   backs the file up first and then replaces it.
+ *
+ * The read, the decision, the backup and the write happen under the credential
+ * lock that `login` and every other claim also take, so none of them can write
+ * in between and be lost. The caller seats the account returned, not whatever
+ * the file holds by then.
  *
  * A key that is not kept stays valid: the API has no route for a key to revoke
  * itself. Only its id is ever printed.
@@ -314,24 +321,23 @@ async function adoptClaimedAccount(
   baseUrl: string,
   paths: ReturnType<typeof getStoragePaths>,
   dependencies: GuestDependencies,
-): Promise<void> {
+): Promise<StoredApiCredential> {
   const claimed = redeemed.principal.id;
   const unusedKey = `The key the claim minted (${redeemed.api_key_id}) was not kept, and it stays valid: the CLI has no way to revoke it.`;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  return withCredentialLock(paths, async () => {
     const current = await readStoredApiCredential(paths);
     if (current === null) {
-      if (await storeAccountCredential(paths, baseUrl, redeemed, dependencies.now(), { onlyIfAbsent: true })) {
-        dependencies.stderr?.(`Claimed: this machine now acts as ${claimed}. The key is in ${paths.credentialsFile}.\n`);
-        return;
-      }
-      continue; // Another session stored an account a moment ago: compare with that one.
+      const credential = await accountCredentialFrom(paths, baseUrl, redeemed, dependencies.now());
+      await writeStoredApiCredential(paths, credential);
+      dependencies.stderr?.(`Claimed: this machine now acts as ${claimed}. The key is in ${paths.credentialsFile}.\n`);
+      return credential;
     }
     const here = sameOrigin(current.base_url, baseUrl);
     if (here && current.principal_id === claimed) {
       dependencies.stderr?.(
         `This claim is for ${claimed}, the account this machine already acts as, so the credential file is unchanged and this seat is that account's. ${unusedKey}\n`,
       );
-      return;
+      return current;
     }
     const held = here ? current.principal_id : `${current.principal_id} (on ${current.base_url})`;
     if (!switchAccount) {
@@ -343,13 +349,13 @@ async function adoptClaimedAccount(
       );
     }
     const backup = await backupStoredApiCredential(paths, dependencies.now());
-    await storeAccountCredential(paths, baseUrl, redeemed, dependencies.now());
+    const credential = await accountCredentialFrom(paths, baseUrl, redeemed, dependencies.now());
+    await writeStoredApiCredential(paths, credential);
     dependencies.stderr?.(
       `Switched: this machine acted as ${held} and now acts as ${claimed}. The previous credential file is saved at ${backup}.\n`,
     );
-    return;
-  }
-  throw localError("invalid_local_state", "The credential file changed while this claim was being stored. Run the join again.");
+    return credential;
+  });
 }
 
 async function join(args: string[], dependencies: GuestDependencies): Promise<unknown> {
@@ -372,7 +378,26 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   // seat was added to (or knows the id of) that Room. Enter it as that seat.
   const argument = parsed.positionals[0]!;
   const inviteToken = stringOption(parsed, "token") ?? dependencies.env.SHAREDNET_INVITE_TOKEN?.trim();
+  // A claim from the join page: the signed-in human minted it for their own
+  // account. Checked before any door is chosen, so no form of join can ignore it.
+  const claim = stringOption(parsed, "claim");
+  // --switch-account: the one way a claim may replace the account this
+  // machine already acts as. Without it a claim never changes who the
+  // machine is, because every account verb on it would change with it.
+  const switchAccount = parsed.options.get("switch-account") === true;
+  if (switchAccount && claim === undefined) {
+    throw localError("invalid_arguments", "--switch-account goes with --claim: it lets that claim replace the account this machine acts as.");
+  }
+  if (claim !== undefined && !/^clp_[A-Za-z0-9_-]{43}$/.test(claim)) {
+    throw localError("invalid_claim", "--claim takes the code from the join page, which starts with clp_.");
+  }
   if (ROOM_ID_PATTERN.test(argument) && !inviteToken) {
+    if (claim !== undefined) {
+      throw localError(
+        "invalid_arguments",
+        "--claim goes with an invite. `join rom_…` re-enters as a seat this machine already holds and binds no account; run the invite command from the join page as given.",
+      );
+    }
     return enterAsSeat(argument, stringOption(parsed, "as"), dependencies, { wake, wakeOff });
   }
   const { roomId, token, baseUrl } = parseInvite(argument, parsed, dependencies.env);
@@ -392,21 +417,13 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   const paths = getStoragePaths(dependencies.env);
   const client = new ApiClient(baseUrl, dependencies.fetch);
 
-  // A claim from the join page: the signed-in human minted it for their own
-  // account. Redeem it once for the account's key, keep the key in the
+  // Redeem the claim once for the account's key, keep the key in the
   // credential file, and this seat is the account's from its first message.
-  const claim = stringOption(parsed, "claim");
-  // --switch-account: the one way a claim may replace the account this
-  // machine already acts as. Without it a claim never changes who the
-  // machine is, because every account verb on it would change with it.
-  const switchAccount = parsed.options.get("switch-account") === true;
-  if (switchAccount && claim === undefined) {
-    throw localError("invalid_arguments", "--switch-account goes with --claim: it lets that claim replace the account this machine acts as.");
-  }
+  // `account` is the credential the claim settled on; the seat is registered
+  // with exactly that key, never a re-read of a file another command may
+  // have changed since.
+  let account: StoredApiCredential | null = null;
   if (claim !== undefined) {
-    if (!/^clp_[A-Za-z0-9_-]{43}$/.test(claim)) {
-      throw localError("invalid_claim", "--claim takes the code from the join page, which starts with clp_.");
-    }
     // Read before anything leaves the machine: a credential file that cannot
     // be read fails here, with the claim still unspent.
     await readStoredApiCredential(paths);
@@ -443,18 +460,21 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
       dependencies.stderr?.(
         `That claim ${used ? "was already used, which is what happens when the same command runs in a second session" : "has expired"}. This machine already acts as ${stored?.principal_id ?? "an account"}, so this seat is that account's.\n`,
       );
+      if (stored && sameOrigin(stored.base_url, baseUrl)) account = stored;
     }
     if (!spent) {
       if (redeemed?.state !== "approved" || !redeemed.api_key || !redeemed.api_key_id || !redeemed.principal?.id) throw invalidServerResponse();
-      await adoptClaimedAccount(redeemed!, switchAccount, baseUrl, paths, dependencies);
+      account = await adoptClaimedAccount(redeemed!, switchAccount, baseUrl, paths, dependencies);
     }
   }
 
   // Two doors, one model. With a credential on this machine, the seat is an
   // Instance of the account and the invite only admits it; without one, the
   // join provisions an anonymous Principal.
-  if (await hasAccountCredential(dependencies.env, paths, baseUrl)) {
-    return joinAsAccount(roomId, token, name, chosenName, baseUrl, paths, client, dependencies, reach, agent, wake, runtimeFlag);
+  if (account !== null || await hasAccountCredential(dependencies.env, paths, baseUrl)) {
+    // SHAREDNET_API_KEY still wins over the file, as for every account verb.
+    const accountKey = dependencies.env.SHAREDNET_API_KEY?.trim() ? undefined : account?.api_key;
+    return joinAsAccount(roomId, token, name, chosenName, baseUrl, paths, client, dependencies, reach, agent, wake, runtimeFlag, accountKey);
   }
   if (agent !== undefined) {
     throw localError(
@@ -651,6 +671,8 @@ async function joinAsAccount(
   agent?: string,
   wake?: SeatWake | null,
   runtimeOverride?: string,
+  /** The account key a claim settled on; omitted, the stored credential is read. */
+  apiKey?: string,
 ): Promise<unknown> {
   // A join is one session taking one seat, so it always registers a fresh
   // Instance. It never reuses one by local session key: two sessions whose
@@ -664,6 +686,7 @@ async function joinAsAccount(
     ...(reach === undefined ? {} : { reach }),
     ...(agent === undefined ? {} : { agent }),
     ...(runtimeOverride === undefined ? {} : { runtimeOverride }),
+    ...(apiKey === undefined ? {} : { apiKey }),
   });
   const payload = await client.request<AccountJoinPayload>(
     "POST",

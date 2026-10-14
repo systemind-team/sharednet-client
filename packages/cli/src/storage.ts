@@ -345,18 +345,6 @@ export async function writeStoredApiCredential(
 }
 
 /**
- * Writes the credential only where there is none yet, atomically: false when
- * another process stored one first. A claim uses it so that two sessions
- * running one command cannot both believe they set the machine's account.
- */
-export async function createStoredApiCredentialIfAbsent(
-  paths: StoragePaths,
-  credential: StoredApiCredential,
-): Promise<boolean> {
-  return createSecureJsonIfAbsent(paths.credentialsFile, credential);
-}
-
-/**
  * Copies the credential file, byte for byte and owner-only, to
  * `credentials.json.bak-<time>` beside it before it is replaced. Returns the
  * copy's path, or null when there was nothing to keep.

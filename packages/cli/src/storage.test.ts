@@ -8,7 +8,6 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   backupStoredApiCredential,
-  createStoredApiCredentialIfAbsent,
   getOrCreateInstallationSecret,
   getStoragePaths,
   listSessions,
@@ -129,7 +128,7 @@ describe("secure local state", () => {
     expect((await stat(paths.installationFile)).mode & 0o777).toBe(0o600);
   });
 
-  it("stores one account when several claims race for an empty machine, and backs a credential up byte for byte", async () => {
+  it("backs a credential up byte for byte, owner-only, without overwriting an earlier copy", async () => {
     const root = await fixtureRoot();
     const paths = getStoragePaths({
       HOME: root,
@@ -143,16 +142,7 @@ describe("secure local state", () => {
     });
 
     expect(await backupStoredApiCredential(paths, new Date())).toBeNull();
-    const won = await Promise.all(
-      Array.from({ length: 8 }, (_, index) => createStoredApiCredentialIfAbsent(paths, credential(`p_racer${index}`))),
-    );
-    expect(won.filter(Boolean)).toHaveLength(1);
-    const winner = (await readStoredApiCredential(paths))!.principal_id;
-    expect(winner).toBe(`p_racer${won.indexOf(true)}`);
-    // Present: refused, and the file is the winner's still.
-    expect(await createStoredApiCredentialIfAbsent(paths, credential("p_late"))).toBe(false);
-    expect((await readStoredApiCredential(paths))!.principal_id).toBe(winner);
-
+    await writeStoredApiCredential(paths, credential("p_first"));
     const before = await readFile(paths.credentialsFile);
     const at = new Date("2026-10-12T08:30:07.123Z");
     const first = await backupStoredApiCredential(paths, at);

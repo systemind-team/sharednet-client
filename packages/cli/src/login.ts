@@ -4,14 +4,15 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
+import { withControlLock } from "./board-controls.ts";
 import { CliError, localError } from "./errors.ts";
 import {
   getOrCreateInstallationSecret,
   getStoragePaths,
   readRoomCredential,
-  createStoredApiCredentialIfAbsent,
   writeStoredApiCredential,
   type StoragePaths,
+  type StoredApiCredential,
 } from "./storage.ts";
 
 /**
@@ -136,31 +137,43 @@ async function heldSeatTokens(paths: StoragePaths, baseUrl: string): Promise<str
 }
 
 /**
- * The key stays in the credential file, owner-only; the terminal sees only ids.
- * With `onlyIfAbsent`, nothing is replaced: false means another process
- * stored a credential first.
+ * The one lock every writer of this machine's credential file takes, so that
+ * a read, a decision and a write by one command cannot interleave with a
+ * write by another (`login`, or a claim in a second session).
  */
+export function withCredentialLock<T>(paths: StoragePaths, work: () => Promise<T>): Promise<T> {
+  return withControlLock({ root: paths.configDir }, "credential", work);
+}
+
+/** The credential a login or claim result becomes; the installation secret is the machine's, kept across accounts. */
+export async function accountCredentialFrom(
+  paths: StoragePaths,
+  baseUrl: string,
+  result: { principal: { id: string }; api_key_id: string; api_key: string },
+  now: Date,
+): Promise<StoredApiCredential> {
+  return {
+    schema_version: 1,
+    base_url: baseUrl,
+    principal_id: result.principal.id,
+    api_key_id: result.api_key_id,
+    api_key: result.api_key,
+    installation_secret: await getOrCreateInstallationSecret(paths),
+    created_at: now.toISOString(),
+    expires_at: null,
+  };
+}
+
+/** The key stays in the credential file, owner-only; the terminal sees only ids. */
 export async function storeAccountCredential(
   paths: StoragePaths,
   baseUrl: string,
   result: { principal: { id: string }; api_key_id: string; api_key: string },
   now: Date,
-  options: { onlyIfAbsent?: boolean } = {},
-): Promise<boolean> {
-  const installationSecret = await getOrCreateInstallationSecret(paths);
-  const credential = {
-    schema_version: 1 as const,
-    base_url: baseUrl,
-    principal_id: result.principal.id,
-    api_key_id: result.api_key_id,
-    api_key: result.api_key,
-    installation_secret: installationSecret,
-    created_at: now.toISOString(),
-    expires_at: null,
-  };
-  if (options.onlyIfAbsent) return createStoredApiCredentialIfAbsent(paths, credential);
-  await writeStoredApiCredential(paths, credential);
-  return true;
+): Promise<void> {
+  await withCredentialLock(paths, async () => {
+    await writeStoredApiCredential(paths, await accountCredentialFrom(paths, baseUrl, result, now));
+  });
 }
 
 export async function login(args: string[], dependencies: LoginDependencies): Promise<unknown> {
