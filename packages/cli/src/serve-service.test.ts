@@ -9,7 +9,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   BOOTOUT_SETTLE_MS,
   captureServiceEnv,
-  carriesCredentials,
   launchdHolds,
   launchdPlist,
   programIn,
@@ -108,28 +107,25 @@ describe("the environment a service keeps", () => {
     expect(captured.droppedPath).toHaveLength(4);
   });
 
-  it("never writes or reports an address with a user name or password, with or without a scheme", () => {
-    for (const value of [
-      "http://someone:synthetic-pass@proxy.example:8080",
-      "someone:synthetic-pass@proxy.example:8080",
-      "someone@proxy.example:8080",
-      "socks5://someone:synthetic-pass@127.0.0.1:1080",
-      "  someone:synthetic-pass@proxy.example  ",
-    ]) {
-      expect(carriesCredentials(value), value).toBe(true);
-    }
-    for (const value of ["http://127.0.0.1:10080", "127.0.0.1:10080", "proxy.example:3128", "http://proxy.example/path@x"]) {
-      expect(carriesCredentials(value), value).toBe(false);
-    }
+  it("never keeps an address variable with \"@\" in it, and names it, without its value, for install to refuse", () => {
     const captured = captureServiceEnv(
-      { PATH: "/usr/bin", HOME: "/h", USER: "u", LOGNAME: "u", HTTPS_PROXY: "someone:synthetic-pass@proxy.example:8080", ALL_PROXY: "socks5://127.0.0.1:1080", SHAREDNET_BASE_URL: "https://a:b@sharednet.example" },
+      {
+        PATH: "/usr/bin",
+        HOME: "/h",
+        USER: "u",
+        LOGNAME: "u",
+        HTTPS_PROXY: "someone:capture-secret-1@proxy.example:8080",
+        http_proxy: "http://DOMAIN\\someone:capture-secret-2@proxy.example:8080",
+        ALL_PROXY: "socks5://127.0.0.1:1080",
+        NO_PROXY: "localhost",
+        SHAREDNET_BASE_URL: "https://a:capture-secret-3@sharednet.example",
+      },
       FALLBACK,
     );
+    expect(captured.refusedAddresses).toEqual(["HTTPS_PROXY", "http_proxy", "SHAREDNET_BASE_URL"]);
+    expect(captured.env).toMatchObject({ ALL_PROXY: "socks5://127.0.0.1:1080", NO_PROXY: "localhost" });
     expect(captured.env.HTTPS_PROXY).toBeUndefined();
-    expect(captured.env.SHAREDNET_BASE_URL).toBeUndefined();
-    expect(captured.env.ALL_PROXY).toBe("socks5://127.0.0.1:1080");
-    expect(captured.skipped.map((skipped) => skipped.name)).toEqual(["HTTPS_PROXY", "SHAREDNET_BASE_URL"]);
-    expect(JSON.stringify(captured)).not.toContain("synthetic-pass");
+    expect(JSON.stringify(captured)).not.toMatch(/capture-secret/);
   });
 });
 
@@ -317,55 +313,50 @@ describe("installing, inspecting and removing it", () => {
     expect(plist).toContain("<key>XDG_STATE_HOME</key>\n\t\t<string>/Users/synthetic/.local/state</string>");
   });
 
-  it("never writes or reports a proxy with credentials, and says it left it out", async () => {
+  it("refuses to install when any persisted address variable contains \"@\", naming it and never showing its value, and writes nothing", async () => {
     const bin = await binWith("node");
-    const { host, files } = fakeHost("/Users/synthetic");
-    const report = await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin, HTTPS_PROXY: "user:synthetic-pass@proxy.example:8080", HTTP_PROXY: "http://user:synthetic-pass@proxy.example:8080" }, host, program).install();
-    expect(JSON.stringify(report)).not.toContain("synthetic-pass");
-    expect(files.get(plistFile)).not.toContain("synthetic-pass");
-    expect(report.warnings).toEqual(expect.arrayContaining([expect.stringContaining("HTTPS_PROXY was not written"), expect.stringContaining("HTTP_PROXY was not written")]));
-  });
-
-  it("never writes or reports userinfo before a host in any form: scheme, scheme-less, network-path, encoded", async () => {
-    const bin = await binWith("node");
-    // Each secret is distinct, so a leak names the form that leaked.
+    // No parsing: any literal "@" refuses. Each secret is distinct, so a leak names the form that leaked.
     const corpus: Array<[string, string]> = [
-      ["//user:np-secret-1@proxy.example:8080", "np-secret-1"],
-      ["//np-secret-2@proxy.example:8080", "np-secret-2"],
-      ["//:np-secret-3@proxy.example:8080", "np-secret-3"],
-      ["//us%40er:np%3Asecret-4@proxy.example:8080", "np%3Asecret-4"],
-      ["http://us%40er:np%3Asecret-5@proxy.example:8080", "np%3Asecret-5"],
-      ["user:np-secret-6@proxy.example:8080", "np-secret-6"],
-      ["http://user:np-secret-7@proxy.example:8080", "np-secret-7"],
-      ["socks5h://np-secret-8@127.0.0.1:1080", "np-secret-8"],
-      ["  //user:np-secret-9@proxy.example  ", "np-secret-9"],
-      // What a WHATWG parser still reads as authority for a special scheme.
-      ["http:/user:np-secret-10@proxy.example:8080", "np-secret-10"],
-      ["http:\\\\user:np-secret-11@proxy.example:8080", "np-secret-11"],
-      ["http:user:np-secret-12@proxy.example:8080", "np-secret-12"],
-      // Windows-domain userinfo (`DOMAIN\\user`), which curl sends as Proxy-Authorization: a backslash
-      // in the user name or the password, with a scheme and without one.
-      ["http://DOMAIN\\user:np-secret-13@proxy.example:8080", "np-secret-13"],
-      ["DOMAIN\\user:np-secret-14@proxy.example:8080", "np-secret-14"],
-      ["http://user:np\\secret-15@proxy.example:8080", "np\\secret-15"],
-      ["user:np\\secret-16@proxy.example:8080", "np\\secret-16"],
-      ["//DOMAIN\\user:np-secret-17@proxy.example:8080", "np-secret-17"],
+      ["DOMAIN\\user:at-secret-1@proxy.example:8080", "at-secret-1"],
+      ["http://DOMAIN\\user:at-secret-2@proxy.example:8080", "at-secret-2"],
+      ["//user:at-secret-3@proxy.example:8080", "at-secret-3"],
+      ["user:at-secret-4@proxy.example:8080", "at-secret-4"],
+      ["http://user:at-secret-5@proxy.example:8080", "at-secret-5"],
+      ["http://user:at\\secret-6@proxy.example:8080", "at\\secret-6"],
+      ["//at-secret-7@proxy.example:8080", "at-secret-7"],
+      ["http://us%40er:at%3Asecret-8@proxy.example:8080", "at%3Asecret-8"],
+      ["http://proxy.example/at-secret-9@x", "at-secret-9"],
     ];
-    for (const [value, secret] of corpus) {
-      expect(carriesCredentials(value), value).toBe(true);
-      for (const name of ["HTTPS_PROXY", "http_proxy", "ALL_PROXY", "SHAREDNET_BASE_URL"]) {
-        const { host, files } = fakeHost("/Users/synthetic");
-        const report = await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin, [name]: value }, host, program).install();
-        // As serialized: JSON writes a backslash as two, so the raw secret would never match there.
-        expect(JSON.stringify(report), `${name}=${value} in the report`).not.toContain(JSON.stringify(secret).slice(1, -1));
-        expect(files.get(plistFile), `${name}=${value} in the plist`).not.toContain(secret);
-        expect(report.warnings, `${name}=${value}`).toEqual(expect.arrayContaining([expect.stringContaining(`${name} was not written`)]));
+    const json = (secret: string) => JSON.stringify(secret).slice(1, -1);
+    for (const name of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "SHAREDNET_BASE_URL"]) {
+      for (const [value, secret] of corpus) {
+        const { host, files, calls, dirs } = fakeHost("/Users/synthetic");
+        const error = await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin, HTTPS_PROXY: "http://127.0.0.1:10080", [name]: value }, host, program).install().then(
+          () => null,
+          (thrown: unknown) => thrown,
+        );
+        expect(error, `${name}=${value}`).toMatchObject({ code: "service_not_installed", message: expect.stringContaining(`${name} contains "@"`) });
+        // The refusal itself never carries the value, however it is serialized.
+        const shown = `${String((error as Error).message)} ${JSON.stringify(error)}`;
+        expect(shown, `${name}=${value} in the error`).not.toContain(secret);
+        expect(shown, `${name}=${value} in the error, serialized`).not.toContain(json(secret));
+        // Refused before anything is written or asked of launchd.
+        expect(files.size, `${name}=${value}`).toBe(0);
+        expect(dirs).toEqual([]);
+        expect(calls).toEqual([]);
       }
     }
-    // Addresses without userinfo are kept.
-    for (const value of ["//proxy.example:8080", "http://127.0.0.1:10080", "127.0.0.1:10080", "proxy.example:3128", "http://proxy.example/path@x", "//proxy.example/a@b"]) {
-      expect(carriesCredentials(value), value).toBe(false);
-    }
+    // Several at once are all named.
+    const several = fakeHost("/Users/synthetic");
+    await expect(new ServiceControl({ HOME: "/Users/synthetic", PATH: bin, HTTPS_PROXY: "u:s1@p", ALL_PROXY: "u:s2@p" }, several.host, program).install()).rejects.toMatchObject({
+      message: expect.stringMatching(/^HTTPS_PROXY, ALL_PROXY contain "@"/),
+    });
+    // Values without "@" still install, and are written as given.
+    const { host, files } = fakeHost("/Users/synthetic");
+    const clean = { HTTPS_PROXY: "http://127.0.0.1:10080", http_proxy: "//proxy.example:8080", ALL_PROXY: "socks5h://127.0.0.1:1080", all_proxy: "proxy.example:3128", SHAREDNET_BASE_URL: "https://sharednet.example" };
+    const report = await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin, ...clean }, host, program).install();
+    expect(report).toMatchObject({ installed: true, env: clean });
+    for (const [name, value] of Object.entries(clean)) expect(files.get(plistFile)).toContain(`<key>${name}</key>\n\t\t<string>${value}</string>`);
   });
 
   it("reads back whether it is installed, loaded and running, and with which pid", async () => {

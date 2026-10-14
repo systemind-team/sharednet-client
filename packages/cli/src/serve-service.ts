@@ -53,7 +53,12 @@ export const SERVICE_ENV_KEYS = [
 ] as const;
 
 const PROXY_KEYS = new Set(["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]);
-/** Values that are addresses, where a user name or password could ride along. */
+/**
+ * The persisted variables whose values are addresses, where a user name or password could ride
+ * along. Any of them containing `@` refuses the install (`refusedAddresses`): no form of userinfo
+ * (scheme, `//`, scheme-less, `DOMAIN\user`, percent-encoded) exists without a literal `@`, so the
+ * value is never parsed, and never shown.
+ */
 const ADDRESS_KEYS = new Set([...PROXY_KEYS, "SHAREDNET_BASE_URL"]);
 /** The variables a storage root and the service's log are resolved from. */
 const ROOT_KEYS = ["HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"] as const;
@@ -67,6 +72,8 @@ export interface CapturedEnvironment {
   droppedPath: string[];
   /** Filled in because the installing shell lacked them. */
   filled: string[];
+  /** Address variables containing `@` (a user name or password): named only, never written; install refuses. */
+  refusedAddresses: string[];
 }
 
 /**
@@ -82,28 +89,6 @@ function ephemeralPathEntry(entry: string): boolean {
 }
 
 /**
- * An address that carries a user name or password, in any form. One rule: drop an optional scheme
- * and the slashes after it, take the authority (up to the first `/`, `?` or `#`), and any `@` there
- * (or `%40`, which no host name contains) means userinfo. A backslash does not end it: Windows-domain
- * userinfo is `DOMAIN\user:pass@host`, and curl sends it as Proxy-Authorization. That covers
- * `scheme://user:pass@host`, the network-path `//user:pass@host`, and the scheme-less
- * `user:pass@host:port` proxy variables also accept (a URL parser reads that as scheme `user:` and
- * finds no credentials; here `user:` is dropped as a scheme and `pass@host` still has its `@`).
- * A URL parse is kept as a second opinion, never as the only one.
- */
-export function carriesCredentials(value: string): boolean {
-  const rest = value.trim().replace(/^(?:[A-Za-z][A-Za-z0-9+.-]*:)?[\\/]*/, "");
-  const authority = rest.split(/[/?#]/)[0] ?? "";
-  if (authority.includes("@") || /%40/i.test(authority)) return true;
-  try {
-    const url = new URL(value.trim());
-    return url.username !== "" || url.password !== "";
-  } catch {
-    return false;
-  }
-}
-
-/**
  * The service's environment: the allowlist, from an environment with the host session's markers
  * already removed (harnessFreeEnv), so no harness session variable is ever written down.
  */
@@ -113,6 +98,7 @@ export function captureServiceEnv(env: Environment, fallback: { home: string; us
   const skipped: Array<{ name: string; why: string }> = [];
   const droppedPath: string[] = [];
   const filled: string[] = [];
+  const refusedAddresses: string[] = [];
   for (const name of SERVICE_ENV_KEYS) {
     const value = source[name];
     if (value === undefined || value === "") continue;
@@ -128,12 +114,12 @@ export function captureServiceEnv(env: Environment, fallback: { home: string; us
       if (kept.length > 0) captured.PATH = kept.join(delimiter);
       continue;
     }
-    if (/[\r\n]/.test(value)) {
-      skipped.push({ name, why: "it contains a line break, which a service definition cannot carry" });
+    if (ADDRESS_KEYS.has(name) && value.includes("@")) {
+      refusedAddresses.push(name);
       continue;
     }
-    if (ADDRESS_KEYS.has(name) && carriesCredentials(value)) {
-      skipped.push({ name, why: "it carries a user name or password, which is never written to a service file" });
+    if (/[\r\n]/.test(value)) {
+      skipped.push({ name, why: "it contains a line break, which a service definition cannot carry" });
       continue;
     }
     captured[name] = value;
@@ -148,7 +134,7 @@ export function captureServiceEnv(env: Environment, fallback: { home: string; us
       filled.push(name);
     }
   }
-  return { env: captured, skipped, droppedPath, filled };
+  return { env: captured, skipped, droppedPath, filled, refusedAddresses };
 }
 
 export function hasProxy(env: Record<string, string>): boolean {
@@ -512,6 +498,9 @@ export class ServiceControl {
     this.assertSupported();
     if (this.program === null) throw localError("service_not_installed", "Only the sharednet executable can install its service.");
     const { captured, root, stateDir } = this.prepared();
+    // Before anything is asked of launchd or written: a service without the proxy it was installed
+    // with would install cleanly and then reach nothing, so this refuses rather than drop it.
+    if (captured.refusedAddresses.length > 0) throw addressRefused(captured.refusedAddresses);
     const existing = (await this.state())!;
     if (existing.installed || existing.loaded) throw serviceInstalled(existing);
     for (const required of ["HOME", "PATH"] as const) {
@@ -599,6 +588,15 @@ export class ServiceControl {
       ? { ok: true, message: `the installed service ${state.label} was started` }
       : { ok: false, message: `the installed service ${state.label} did not start (exit ${done.exitCode}: ${lastLine(done.stderr || done.stdout)})` };
   }
+}
+
+/** The refusal for address variables with `@` in them: it names them, and never shows a value. */
+function addressRefused(names: string[]) {
+  const which = names.join(", ");
+  return localError(
+    "service_not_installed",
+    `${which} ${names.length === 1 ? "contains" : "contain"} "@", which means a user name or password, and the service definition would store it in plain text (the value is not shown). Install from a shell where ${names.length === 1 ? "it names" : "they name"} a proxy that needs no credentials, or give the proxy its credentials another way, outside the service definition, then install again.`,
+  );
 }
 
 /** The refusal when SharedNet's own service for a root is already there: the way on is --uninstall. */

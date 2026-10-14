@@ -2897,6 +2897,46 @@ describe("sharednet say and wait", () => {
         }
       });
 
+      it("refuses --install when a persisted address variable contains \"@\", and no output carries its value (item 4)", async () => {
+        const space = await joinedSpace();
+        const bin = await mkdtemp(join(tmpdir(), "sharednet-service-node-"));
+        cleanup.push(bin);
+        await writeFile(join(bin, "node"), "#!/bin/sh\n", { mode: 0o755 });
+        for (const [name, value, secret] of [
+          ["HTTPS_PROXY", "DOMAIN\\user:cli-secret-1@proxy.example:8080", "cli-secret-1"],
+          ["http_proxy", "//user:cli-secret-2@proxy.example:8080", "cli-secret-2"],
+          ["ALL_PROXY", "user:cli-secret-3@proxy.example:8080", "cli-secret-3"],
+          ["SHAREDNET_BASE_URL", "http://user:cli\\secret-4@sharednet.example", "cli\\secret-4"],
+        ] as const) {
+          const calls: string[] = [];
+          const files = new Map<string, string>();
+          const host = {
+            platform: "darwin",
+            uid: 501,
+            home: "/Users/synthetic",
+            username: "synthetic",
+            readFile: async (path: string) => files.get(path) ?? null,
+            writeFile: async (path: string, content: string) => void files.set(path, content),
+            remove: async (path: string) => void files.delete(path),
+            ensureDir: async () => undefined,
+            pause: async () => undefined,
+            run: async (command: string, args: string[]) => (
+              calls.push([command, ...args].join(" ")),
+              args[0] === "print" ? { exitCode: 113, stdout: "", stderr: "Could not find service" } : { exitCode: 0, stdout: "", stderr: "" }
+            ),
+          };
+          const wakeService = (env: Record<string, string | undefined>) => new ServiceControl(env, host, { entry: "/opt/sharednet/bin/sharednet.js", execPath: "/usr/bin/node", execArgv: [] });
+          const refused = await run(["serve", "--install", "--json"], space, [], { PATH: bin, [name]: value }, { wakeService });
+          expect(refused.exitCode, name).not.toBe(0);
+          expect(JSON.parse(refused.stderr).error, name).toMatchObject({ code: "service_not_installed", message: expect.stringContaining(`${name} contains "@"`) });
+          const output = `${refused.stdout}\n${refused.stderr}`;
+          expect(output, `${name}: raw`).not.toContain(secret);
+          expect(output, `${name}: JSON-escaped`).not.toContain(JSON.stringify(secret).slice(1, -1));
+          expect(files.size, name).toBe(0);
+          expect(calls.filter((call) => !call.startsWith("launchctl print")), name).toEqual([]);
+        }
+      });
+
       it("runs as serve --service: waits for another holder's lock and for seats instead of ending, and takes the lock once free (item 5)", async () => {
         const space = await workspace();
         await holdLock(space, { pid: process.ppid, start_identity: `test-start-${process.ppid}`, lock_id: "by-hand" });

@@ -66,7 +66,7 @@ Apart from `HOME`, `XDG_CONFIG_HOME` and `XDG_STATE_HOME` (always written, above
 Several rules apply on top of the list:
 
 - **No harness session variables.** The environment first passes through `harnessFreeEnv`, the same filter a wake delivery uses.
-- **No credentials of any kind.** Tokens and keys are not on the list. A proxy or base URL that carries a user name or password is left out, with a note, and is never written or printed. One rule decides it: drop an optional scheme and the slashes after it, take the authority (up to the first `/`, `?` or `#`; a backslash does not end it, since Windows-domain userinfo is `DOMAIN\user:pass@host`), and any `@` there, or `%40`, means userinfo. That covers `http://user:pass@host`, the network-path `//user:pass@host` (also `//user@host` and `//:pass@host`), percent-encoded userinfo, `DOMAIN\user` userinfo, and the scheme-less `user:pass@host:port`, which a URL parser reads as scheme `user:`.
+- **No credentials of any kind.** Tokens and keys are not on the list. If any persisted address variable (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, each in both cases, or `SHAREDNET_BASE_URL`) contains a literal `@`, `--install` refuses with `service_not_installed`. The error names the variable and never prints its value, and nothing is written. Use a proxy that needs no credentials, or give the proxy its credentials another way, outside the service definition. The value is not parsed: every userinfo form (`http://user:pass@host`, `//user:pass@host`, `user:pass@host:port`, `DOMAIN\user:pass@host`, percent-encoded) needs a literal `@`. The variable is never silently dropped either, since a service without its proxy would install cleanly and then reach nothing.
 - **PATH is cleaned.** Entries that belong only to the installing process are dropped: the npx cache, an npm script's `node_modules/.bin`, and relative entries.
 - **Identity is filled in.** A missing `USER` or `LOGNAME` is taken from the account, which `claude auth status` needs.
 - **A missing proxy is flagged.** If no proxy variable is set, the install says so.
@@ -92,7 +92,8 @@ If a service is installed but not running, `join` starts it: `launchctl bootstra
 ## Testing
 
 - **`serve-service.test.ts`** covers, with launchctl and the disk scripted and nothing real run:
-  - the allowlist, harness variables and credentials (a corpus of scheme, scheme-less, network-path and encoded userinfo forms, none in the plist or the report);
+  - the allowlist and harness variables;
+  - the `@` refusal: every address variable against a corpus (`DOMAIN\user:pass@host`, `//user:pass@host`, `user:pass@host:port`, `http://user:pass@…` and more), each refused with nothing written and the secret in no error, raw or JSON-escaped, and values without `@` still installing;
   - PATH cleaning;
   - the program forms;
   - the plist keys and escaping;
@@ -111,6 +112,7 @@ If a service is installed but not running, `join` starts it: `launchctl bootstra
   - `join` starting an installed service;
   - `--status` and `--stop` with a service;
   - `serve --service` waiting for a lock and for seats, and outliving stopped seats;
+  - the `@` refusal through the CLI, with no output carrying the value;
   - Linux and Windows refusing `--install` and `--uninstall` through the real `ServiceControl`, even while a connector holds the lock and from inside a sandbox.
 
 ## Port
