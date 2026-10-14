@@ -11,12 +11,14 @@ import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type Command
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
 import { dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type DockerRunner } from "./goal-run.ts";
+import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, type ServeKickoff } from "./goal-serve-demo.ts";
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
 import type { ProcessProbe } from "./process-identity.ts";
 import type { WakeServiceControl } from "./serve-service.ts";
 import type { CheckOptions, CheckResult, SeatWake, TurnRunner } from "./wake-driver.ts";
+import { validTurnLimit } from "./wake-driver.ts";
 
 
 type Environment = Record<string, string | undefined>;
@@ -129,6 +131,7 @@ const optionValueNames = new Set([
   "web-search",
   "turn-limit",
   "message-routing",
+  "kickoff",
   "type",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate"]);
@@ -514,6 +517,7 @@ async function goalCommand(
 ): Promise<unknown> {
   const parsed = parseArguments(commandArgs);
   if (action === "run") return goalRunCommand(parsed, globals, dependencies);
+  if (action === "serve-demo") return goalServeDemoCommand(parsed, globals, dependencies);
   if (action === "start") {
     assertOnlyOptions(parsed, ["name", "description", "with", "until", "type"]);
     assertPositionals(parsed, 1);
@@ -523,7 +527,7 @@ async function goalCommand(
     return roomCommand("create", [...args, "--goal", parsed.positionals[0]!, ...(option(parsed, "name") ? [] : ["--name", basename(parsed.positionals[0]!)])], globals, dependencies);
   }
   const usage =
-    "Use goal start <goal file> [--type board|compiled] --until <trigger>, goal run <goal file> [--type board|compiled] --agent codex[:model] --until <trigger> [...], goal watch <rom_…> [--workspace <dir>] [--out <dir>] [--check-every 1m] [--quiet-checks], or goal export <rom_…> [--out <dir>].";
+    "Use goal start <goal file> [--type board|compiled] --until <trigger>, goal run <goal file> [--type board|compiled] --agent codex[:model] --until <trigger> [...], goal serve-demo <goal file> --kickoff first|all --until <trigger> [...], goal watch <rom_…> [--workspace <dir>] [--out <dir>] [--check-every 1m] [--quiet-checks], or goal export <rom_…> [--out <dir>].";
   const roomId = parsed.positionals[0];
   if ((action !== "watch" && action !== "export") || parsed.positionals.length !== 1 || !/^rom_[0-9A-Za-z]{10}$/.test(roomId ?? "")) {
     throw localError("unknown_command", usage);
@@ -672,6 +676,94 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   });
 }
 
+/** Three Docker Codex threads driven by three production `serve` listeners, not by Goal's seat loop. */
+async function goalServeDemoCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "turn-limit", "kickoff"]);
+  if (parsed.positionals.length !== 1) {
+    throw localError(
+      "invalid_arguments",
+      "Usage: sharednet goal serve-demo <goal file> --kickoff first|all [--agent codex[:model] --agent codex[:model] --agent codex[:model]] --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--turn-limit 20m]",
+    );
+  }
+  const kickoff = option(parsed, "kickoff");
+  if (kickoff !== "first" && kickoff !== "all") throw localError("invalid_arguments", "--kickoff is first or all.");
+  const turnLimitMs = parsed.options.has("turn-limit") ? parseDuration(option(parsed, "turn-limit"), "--turn-limit") : undefined;
+  if (turnLimitMs !== undefined && !validTurnLimit(turnLimitMs)) throw localError("invalid_arguments", "--turn-limit must be between 1m and 24h.");
+  // Serve owns the model calls, so this watcher cannot enforce a live token budget.
+  const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime());
+  if (until.wire.some((trigger) => trigger.startsWith("count "))) {
+    throw localError("invalid_arguments", "goal serve-demo does not accept count: the one runner kickoff is a real Room message. Use said, check, idle, after, at, message, or mention.");
+  }
+  const agents = parseServeDemoAgents(parsed.repeated.get("agent") ?? []);
+  const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
+  assertServeDemoGoalUnaddressed(content);
+  const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
+  if (!(await stat(workspace).then((entry) => entry.isDirectory(), () => false))) {
+    throw localError("invalid_arguments", `--workspace ${workspace} is not a directory.`);
+  }
+  const checkEveryMs = parsed.options.has("check-every") ? parseDuration(option(parsed, "check-every"), "--check-every") : 60_000;
+  const baseUrl = resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL);
+  const apiKey = await resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), baseUrl);
+  const docker = dependencies.docker ?? dockerRunner(dependencies.env);
+  const plan = await prepareRun(
+    {
+      agents,
+      image: option(parsed, "image") ?? null,
+      workspace,
+      env: dependencies.env,
+      home: dependencies.env.HOME ?? homedir(),
+      entry: dependencies.cliEntry ?? realpathSync(process.argv[1]!),
+    },
+    docker,
+    dependencies.stderr,
+  );
+  const limited: ResolvedDependencies = { ...dependencies, fetch: withRequestLimit(dependencies.fetch) };
+  return withSelectedSession(globals, limited, async (client, session) => {
+    const created = await client.request<{ room?: { id?: string } }>(
+      "POST",
+      "/rooms",
+      session.instance_token,
+      { name: option(parsed, "name") ?? basename(workspace), type: "board" },
+      { "idempotency-key": randomUUID() },
+    );
+    const roomId = created.room?.id;
+    if (!roomId) throw new CliError("invalid_server_response", "The Room was created but its id did not come back.", 5);
+    const invite = await client.request<{ token?: string }>("POST", `/rooms/${encodeURIComponent(roomId)}/invites`, session.instance_token);
+    if (!invite?.token) throw new CliError("invalid_server_response", "The Agents' invite did not come back.", 5);
+    const out = resolvePathFrom(dependencies.cwd, option(parsed, "out") ?? join("runs", roomId));
+    dependencies.stderr(`goal: ${roomId} is empty while three real serve listeners start; the record goes to ${out}\n`);
+    const interrupt = () => {
+      spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents)]);
+      dependencies.stderr(`goal: stopped; the Agents' containers are gone and ${roomId} is still open\n`);
+      process.exit(130);
+    };
+    if (!dependencies.docker) process.once("SIGINT", interrupt);
+    try {
+      return await runServeGoalDemo(
+        client,
+        session.instance_token,
+        apiKey,
+        {
+          plan,
+          roomId,
+          inviteToken: invite.token,
+          goal: content,
+          until: until.wire,
+          baseUrl,
+          out,
+          checkEveryMs,
+          quietChecks: parsed.options.get("quiet-checks") === true,
+          kickoff: kickoff as ServeKickoff,
+          ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
+        },
+        { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
+      );
+    } finally {
+      process.off("SIGINT", interrupt);
+    }
+  });
+}
+
 async function execute(
   globals: GlobalArguments,
   dependencies: ResolvedDependencies,
@@ -706,7 +798,7 @@ async function execute(
   }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/ack/watch/handed/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/watch/export, and decision list/approve/deny.",
+    "Use login, whoami, join/say/read/wait/ack/watch/handed/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/serve-demo/watch/export, and decision list/approve/deny.",
   );
 }
 
