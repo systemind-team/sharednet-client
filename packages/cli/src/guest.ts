@@ -22,6 +22,7 @@ import {
   readRoomCredential,
   readSessionById,
   readStoredApiCredential,
+  backupStoredApiCredential,
   selectProjectSeat,
   writeProjectRoomState,
   writeRoomCredential,
@@ -120,7 +121,7 @@ const WAIT_MAX_SECONDS = 25;
 const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on", "artifact"]);
-const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake"]);
+const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account"]);
 
 function parseGuestArguments(args: string[]): ParsedGuestArguments {
   const options = new Map<string, string | true>();
@@ -291,13 +292,73 @@ function invalidServerResponse(): CliError {
   );
 }
 
+type RedeemedClaim = { state: string; principal: { id: string }; api_key: string; api_key_id: string };
+
+/**
+ * Settles who this machine acts as after a claim was redeemed. The service
+ * has no way to read a claim's account without spending it, and spending it
+ * mints a key, so the comparison happens here, after the fact:
+ *
+ * - no account stored: the claimed one becomes the machine's (created only if
+ *   still absent, so a racing session's account is compared, not overwritten);
+ * - the same account: the credential file is left exactly as it was;
+ * - another account: refused, file untouched, unless `--switch-account`, which
+ *   backs the file up first and then replaces it.
+ *
+ * A key that is not kept stays valid: the API has no route for a key to revoke
+ * itself. Only its id is ever printed.
+ */
+async function adoptClaimedAccount(
+  redeemed: RedeemedClaim,
+  switchAccount: boolean,
+  baseUrl: string,
+  paths: ReturnType<typeof getStoragePaths>,
+  dependencies: GuestDependencies,
+): Promise<void> {
+  const claimed = redeemed.principal.id;
+  const unusedKey = `The key the claim minted (${redeemed.api_key_id}) was not kept, and it stays valid: the CLI has no way to revoke it.`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const current = await readStoredApiCredential(paths);
+    if (current === null) {
+      if (await storeAccountCredential(paths, baseUrl, redeemed, dependencies.now(), { onlyIfAbsent: true })) {
+        dependencies.stderr?.(`Claimed: this machine now acts as ${claimed}. The key is in ${paths.credentialsFile}.\n`);
+        return;
+      }
+      continue; // Another session stored an account a moment ago: compare with that one.
+    }
+    const here = sameOrigin(current.base_url, baseUrl);
+    if (here && current.principal_id === claimed) {
+      dependencies.stderr?.(
+        `This claim is for ${claimed}, the account this machine already acts as, so the credential file is unchanged and this seat is that account's. ${unusedKey}\n`,
+      );
+      return;
+    }
+    const held = here ? current.principal_id : `${current.principal_id} (on ${current.base_url})`;
+    if (!switchAccount) {
+      throw localError(
+        "account_mismatch",
+        `This claim is for ${claimed}, but this machine already acts as ${held}. Nothing changed: ${paths.credentialsFile} still holds ${held}, and no seat was taken. ` +
+          `Redeeming spent the claim, so this command cannot be run again as it is. To stay ${held}, run the join without --claim. ` +
+          `To make this machine act as ${claimed} instead (every account verb here — room create, balance, ledger, pay, --agent — would then act as ${claimed}), open the join link again for a fresh command and run it with --switch-account; the current credential file is backed up first. ${unusedKey}`,
+      );
+    }
+    const backup = await backupStoredApiCredential(paths, dependencies.now());
+    await storeAccountCredential(paths, baseUrl, redeemed, dependencies.now());
+    dependencies.stderr?.(
+      `Switched: this machine acted as ${held} and now acts as ${claimed}. The previous credential file is saved at ${backup}.\n`,
+    );
+    return;
+  }
+  throw localError("invalid_local_state", "The credential file changed while this claim was being stored. Run the join again.");
+}
+
 async function join(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["name", "token", "private", "as", "claim", "agent", "runtime", "no-wake"]);
+  assertOnlyOptions(parsed, ["name", "token", "private", "as", "claim", "switch-account", "agent", "runtime", "no-wake"]);
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet join <invite> [--name <name>] [--agent <tag>] [--runtime <handle>] [--private] [--claim <clp_…>] [--no-wake], or sharednet join <rom_…> [--as <i_…>]",
+      "Usage: sharednet join <invite> [--name <name>] [--agent <tag>] [--runtime <handle>] [--private] [--claim <clp_…> [--switch-account]] [--no-wake], or sharednet join <rom_…> [--as <i_…>]",
     );
   }
   // The session taking the seat is remembered, so being addressed in the Room resumes it. --no-wake
@@ -335,43 +396,57 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   // account. Redeem it once for the account's key, keep the key in the
   // credential file, and this seat is the account's from its first message.
   const claim = stringOption(parsed, "claim");
+  // --switch-account: the one way a claim may replace the account this
+  // machine already acts as. Without it a claim never changes who the
+  // machine is, because every account verb on it would change with it.
+  const switchAccount = parsed.options.get("switch-account") === true;
+  if (switchAccount && claim === undefined) {
+    throw localError("invalid_arguments", "--switch-account goes with --claim: it lets that claim replace the account this machine acts as.");
+  }
   if (claim !== undefined) {
     if (!/^clp_[A-Za-z0-9_-]{43}$/.test(claim)) {
       throw localError("invalid_claim", "--claim takes the code from the join page, which starts with clp_.");
     }
-    // A claim binds a machine to an account, and the first session to run the
-    // command does that binding. Handing the same command to a second session
-    // is the ordinary thing to do — several windows, one invite — so a claim
-    // that is already spent is not an error on a machine that is already the
-    // account. It is only an error where there is no account to fall back to.
-    const alreadyAnAccount = await hasAccountCredential(dependencies.env, paths, baseUrl);
+    // Read before anything leaves the machine: a credential file that cannot
+    // be read fails here, with the claim still unspent.
+    await readStoredApiCredential(paths);
+    let redeemed: RedeemedClaim | null = null;
+    let spent = false;
     try {
-      const redeemed = await client.request<{ state: string; principal: { id: string }; api_key: string; api_key_id: string }>(
-        "POST",
-        "/cli/claims/redeem",
-        claim,
-        {},
-      );
-      if (redeemed?.state !== "approved" || !redeemed.api_key || !redeemed.principal?.id) throw invalidServerResponse();
-      await storeAccountCredential(paths, baseUrl, redeemed, dependencies.now());
-      dependencies.stderr?.(`Claimed: this machine now acts as ${redeemed.principal.id}. The key is in ${paths.credentialsFile}.\n`);
+      redeemed = await client.request<RedeemedClaim>("POST", "/cli/claims/redeem", claim, {});
     } catch (error) {
       const code = error instanceof CliError ? error.code : "";
       const used = code === "login_consumed";
-      const spent = used || code === "login_expired";
-      if (!spent || !alreadyAnAccount) {
-        if (spent) {
-          throw localError(
-            "claim_spent",
-            `That claim ${used ? "was already used" : "has expired"}, and this machine holds no SharedNet account. Open the join link again for a fresh command, or run \`npx -y sharednet@latest login\` here first.`,
-          );
-        }
-        throw error;
-      }
+      if (!used && code !== "login_expired") throw error;
+      spent = true;
+      // A claim binds a machine to an account, and the first session to run
+      // the command does that binding. Handing the same command to a second
+      // session is the ordinary thing to do — several windows, one invite — so
+      // a claim that is already spent is not an error on a machine that is
+      // already an account. Asked late, so the session that just stored the
+      // account counts. It is an error where there is no account to fall back
+      // to, and where the command asked for a switch it can no longer make.
       const stored = await readStoredApiCredential(paths).catch(() => null);
+      const why = used ? "was already used" : "has expired";
+      if (switchAccount) {
+        throw localError(
+          "claim_spent",
+          `That claim ${why}, so nothing was switched${stored ? `: this machine still acts as ${stored.principal_id}` : ""}. --switch-account needs a claim nobody has redeemed: open the join link again for a fresh command.`,
+        );
+      }
+      if (!(await hasAccountCredential(dependencies.env, paths, baseUrl))) {
+        throw localError(
+          "claim_spent",
+          `That claim ${why}, and this machine holds no SharedNet account. Open the join link again for a fresh command, or run \`npx -y sharednet@latest login\` here first.`,
+        );
+      }
       dependencies.stderr?.(
         `That claim ${used ? "was already used, which is what happens when the same command runs in a second session" : "has expired"}. This machine already acts as ${stored?.principal_id ?? "an account"}, so this seat is that account's.\n`,
       );
+    }
+    if (!spent) {
+      if (redeemed?.state !== "approved" || !redeemed.api_key || !redeemed.api_key_id || !redeemed.principal?.id) throw invalidServerResponse();
+      await adoptClaimedAccount(redeemed!, switchAccount, baseUrl, paths, dependencies);
     }
   }
 

@@ -9,6 +9,7 @@ import {
   getOrCreateInstallationSecret,
   getStoragePaths,
   readRoomCredential,
+  createStoredApiCredentialIfAbsent,
   writeStoredApiCredential,
   type StoragePaths,
 } from "./storage.ts";
@@ -134,16 +135,21 @@ async function heldSeatTokens(paths: StoragePaths, baseUrl: string): Promise<str
   return tokens.slice(0, 50);
 }
 
-/** The key stays in the credential file, owner-only; the terminal sees only ids. */
+/**
+ * The key stays in the credential file, owner-only; the terminal sees only ids.
+ * With `onlyIfAbsent`, nothing is replaced: false means another process
+ * stored a credential first.
+ */
 export async function storeAccountCredential(
   paths: StoragePaths,
   baseUrl: string,
   result: { principal: { id: string }; api_key_id: string; api_key: string },
   now: Date,
-): Promise<void> {
+  options: { onlyIfAbsent?: boolean } = {},
+): Promise<boolean> {
   const installationSecret = await getOrCreateInstallationSecret(paths);
-  await writeStoredApiCredential(paths, {
-    schema_version: 1,
+  const credential = {
+    schema_version: 1 as const,
     base_url: baseUrl,
     principal_id: result.principal.id,
     api_key_id: result.api_key_id,
@@ -151,7 +157,10 @@ export async function storeAccountCredential(
     installation_secret: installationSecret,
     created_at: now.toISOString(),
     expires_at: null,
-  });
+  };
+  if (options.onlyIfAbsent) return createStoredApiCredentialIfAbsent(paths, credential);
+  await writeStoredApiCredential(paths, credential);
+  return true;
 }
 
 export async function login(args: string[], dependencies: LoginDependencies): Promise<unknown> {

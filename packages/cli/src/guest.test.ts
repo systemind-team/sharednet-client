@@ -2976,6 +2976,175 @@ describe("sharednet say and wait", () => {
     expect(error.message).toContain("Open the join link again");
   });
 
+  describe("a claim never silently replaces the machine's account", () => {
+    // Synthetic values only. HELD is what the machine already acts as; the claim may be for it or for OTHER.
+    const HELD = "p_HeLdAcCt01";
+    const OTHER = "p_OtHeRaCcT1";
+    const HELD_KEY = `snk_${"K".repeat(43)}`;
+    const MINTED_KEY = `snk_${"Q".repeat(43)}`;
+    const MINTED_KEY_ID = "key_MiNtEd0001";
+    const SECRET = Buffer.alloc(32, 7).toString("base64url");
+
+    async function holding(space: Awaited<ReturnType<typeof workspace>>, credential: Partial<{ base_url: string; principal_id: string }> = {}) {
+      const { getStoragePaths, writeStoredApiCredential } = await import("./storage.ts");
+      const paths = getStoragePaths(space.env);
+      await writeStoredApiCredential(paths, {
+        schema_version: 1, base_url: "https://www.sharednet.ai", principal_id: HELD, api_key_id: "key_HeLd000001",
+        api_key: HELD_KEY, installation_secret: SECRET, created_at: "2026-10-01T00:00:00.000Z", expires_at: null, ...credential,
+      });
+      return { file: paths.credentialsFile, dir: paths.configDir, before: await readFile(paths.credentialsFile) };
+    }
+    const redeemedFor = (principal: string) => ({
+      status: 200,
+      body: { state: "approved", login: { id: "cli_AbCdEfGhIj", bind_instance_ids: [] }, api_key: MINTED_KEY, api_key_id: MINTED_KEY_ID, principal: { id: principal } },
+    });
+    const seatOf = (principal: string, id: string) => [
+      {
+        status: 201,
+        body: {
+          instance: {
+            id, principal_id: principal, agent_id: null, runtime_kind: "claude-code", cli_version: "0.1.0", runtime_metadata: {}, reach: "public",
+            status: "online", display_name: null, started_at: "2026-10-12T00:00:00.000Z", last_seen_at: "2026-10-12T00:00:00.000Z",
+            lease_expires_at: "2099-10-12T00:01:00.000Z", token_expires_at: null, ended_at: null, revoked_at: null,
+          },
+          token: `sni_${"S".repeat(43)}`, heartbeat_after_seconds: 30,
+        },
+      },
+      { status: 200, body: { room: { id: ROOM_ID, name: "Launch review", state: "open" }, membership: { member_id: id, principal_id: principal, kind: "instance", admitted_by: "invite", name: null, state: "active" } } },
+      { status: 200, body: { items: [], next_cursor: null, has_more: false } },
+    ];
+    async function backups(dir: string) {
+      const { readdir } = await import("node:fs/promises");
+      return (await readdir(dir)).filter((name) => name.startsWith("credentials.json.bak-"));
+    }
+
+    it("keeps the credential file byte for byte when the claim is for the account the machine already is", async () => {
+      const space = await workspace();
+      const held = await holding(space);
+      const result = await run(["join", PASTED_INVITE, "--claim", CLAIM, "--json"], space, [redeemedFor(HELD), ...seatOf(HELD, "i_SameAcct01")]);
+
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ as: "account", principal_id: HELD, member_id: "i_SameAcct01" });
+      expect(await readFile(held.file)).toEqual(held.before);
+      expect(await backups(held.dir)).toEqual([]);
+      // The seat is registered on the key the machine already held, not the one the claim minted.
+      expect(header(result.requests[1]!, "authorization")).toBe(`Bearer ${HELD_KEY}`);
+      expect(result.stderr).toContain(`already acts as, so the credential file is unchanged`);
+      expect(result.stderr).toContain(MINTED_KEY_ID);
+      for (const secret of [MINTED_KEY, HELD_KEY, CLAIM]) expect(result.stdout + result.stderr).not.toContain(secret);
+    });
+
+    it("refuses a claim for another account, names both, leaves the file as it was and takes no seat", async () => {
+      const space = await workspace();
+      const held = await holding(space);
+      const result = await run(["join", PASTED_INVITE, "--claim", CLAIM, "--json"], space, [redeemedFor(OTHER)]);
+
+      expect(result.exitCode).toBe(2);
+      // Only the redemption went out: nothing was joined as anybody.
+      expect(result.requests).toHaveLength(1);
+      const error = JSON.parse(result.stderr).error;
+      expect(error.code).toBe("account_mismatch");
+      expect(error.message).toContain(`This claim is for ${OTHER}, but this machine already acts as ${HELD}`);
+      expect(error.message).toContain("--switch-account");
+      // Honest that the claim is gone: a rerun needs a fresh one.
+      expect(error.message).toContain("Redeeming spent the claim");
+      expect(error.message).toContain("open the join link again for a fresh command");
+      expect(error.message).toContain(MINTED_KEY_ID);
+      expect(await readFile(held.file)).toEqual(held.before);
+      expect(await backups(held.dir)).toEqual([]);
+      await expect(readFile(join(space.project, ".sharednet", "room.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      for (const secret of [MINTED_KEY, HELD_KEY, CLAIM]) expect(result.stdout + result.stderr).not.toContain(secret);
+    });
+
+    it("switches with --switch-account, after an owner-only byte-for-byte backup of the previous file", async () => {
+      const space = await workspace();
+      const held = await holding(space);
+      const result = await run(
+        ["join", PASTED_INVITE, "--claim", CLAIM, "--switch-account", "--json"],
+        space,
+        [redeemedFor(OTHER), ...seatOf(OTHER, "i_SwitchedA1")],
+        {},
+        { now: () => new Date("2026-10-12T08:30:07.123Z") },
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ as: "account", principal_id: OTHER, member_id: "i_SwitchedA1" });
+      expect(header(result.requests[1]!, "authorization")).toBe(`Bearer ${MINTED_KEY}`);
+      const now = JSON.parse(await readFile(held.file, "utf8"));
+      expect(now).toMatchObject({ principal_id: OTHER, api_key_id: MINTED_KEY_ID, api_key: MINTED_KEY });
+      // The installation secret survives the switch, so this machine's seat anchors stay the same.
+      expect(now.installation_secret).toBe(SECRET);
+      expect(await backups(held.dir)).toEqual(["credentials.json.bak-2026-10-12T08-30-07-123Z"]);
+      const backup = join(held.dir, "credentials.json.bak-2026-10-12T08-30-07-123Z");
+      expect(await readFile(backup)).toEqual(held.before);
+      expect((await stat(backup)).mode & 0o777).toBe(0o600);
+      expect(result.stderr).toContain(`Switched: this machine acted as ${HELD} and now acts as ${OTHER}`);
+      expect(result.stderr).toContain(backup);
+      for (const secret of [MINTED_KEY, HELD_KEY, CLAIM]) expect(result.stdout + result.stderr).not.toContain(secret);
+    });
+
+    it("treats a stored account on another origin as another account, and names where it lives", async () => {
+      const space = await workspace();
+      const held = await holding(space, { base_url: "https://staging.sharednet.example" });
+      const result = await run(["join", PASTED_INVITE, "--claim", CLAIM, "--json"], space, [redeemedFor(HELD)]);
+
+      expect(result.exitCode).toBe(2);
+      const error = JSON.parse(result.stderr).error;
+      expect(error.code).toBe("account_mismatch");
+      expect(error.message).toContain(`${HELD} (on https://staging.sharednet.example)`);
+      expect(await readFile(held.file)).toEqual(held.before);
+    });
+
+    it("compares with the account on disk after the redemption, so one another session stored meanwhile is not overwritten", async () => {
+      const space = await workspace();
+      const { getStoragePaths, writeStoredApiCredential } = await import("./storage.ts");
+      const paths = getStoragePaths(space.env);
+      // No account when the command starts; the racing session stores one before the redemption answers.
+      const racing = { ...redeemedFor(OTHER), wait: Promise.resolve().then(() => writeStoredApiCredential(paths, {
+        schema_version: 1, base_url: "https://www.sharednet.ai", principal_id: HELD, api_key_id: "key_HeLd000001",
+        api_key: HELD_KEY, installation_secret: SECRET, created_at: "2026-10-01T00:00:00.000Z", expires_at: null,
+      })) };
+      const result = await run(["join", PASTED_INVITE, "--claim", CLAIM, "--json"], space, [racing]);
+
+      expect(result.exitCode).toBe(2);
+      expect(JSON.parse(result.stderr).error.code).toBe("account_mismatch");
+      expect(JSON.parse(await readFile(paths.credentialsFile, "utf8"))).toMatchObject({ principal_id: HELD, api_key: HELD_KEY });
+    });
+
+    it("refuses --switch-account with a spent claim rather than joining as the old account", async () => {
+      const space = await workspace();
+      const held = await holding(space);
+      const result = await run(
+        ["join", PASTED_INVITE, "--claim", CLAIM, "--switch-account", "--json"],
+        space,
+        [{ status: 410, body: { error: { code: "login_consumed", message: "CLI login was already used." } } }],
+      );
+
+      expect(result.exitCode).toBe(2);
+      expect(result.requests).toHaveLength(1);
+      const error = JSON.parse(result.stderr).error;
+      expect(error.code).toBe("claim_spent");
+      expect(error.message).toContain(`nothing was switched: this machine still acts as ${HELD}`);
+      expect(error.message).toContain("fresh command");
+      expect(await readFile(held.file)).toEqual(held.before);
+    });
+
+    it("takes --switch-account only with --claim, and spends no claim on an unreadable credential file", async () => {
+      const space = await workspace();
+      const alone = await run(["join", PASTED_INVITE, "--switch-account", "--json"], space, []);
+      expect(alone.exitCode).toBe(2);
+      expect(alone.requests).toHaveLength(0);
+      expect(JSON.parse(alone.stderr).error.code).toBe("invalid_arguments");
+
+      const held = await holding(space);
+      await writeFile(held.file, "not json", { mode: 0o600 });
+      const broken = await run(["join", PASTED_INVITE, "--claim", CLAIM, "--json"], space, []);
+      expect(broken.exitCode).toBe(2);
+      expect(broken.requests).toHaveLength(0);
+      expect(JSON.parse(broken.stderr).error.code).toBe("invalid_local_state");
+    });
+  });
+
   it("groups an account's seat under a tag with --agent, and refuses the flag for a machine that acts as nobody", async () => {
     const space = await workspace();
     const instance = {
