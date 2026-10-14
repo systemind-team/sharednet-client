@@ -127,8 +127,14 @@ Code's headless mode (<https://www.workbuddy.ai/docs/cli/headless>, <https://www
   whose last element is the `result` object, not the single object the doc describes. The shared parser (`claudeSummary`)
   now reads a whole output that is an array by its last `result`; Claude Code's single object parses as before. A woken turn
   that used to be reported "exited 0" now replies.
-- **Still not verified live:** a full wake through `serve` after the parser fix (the first live run failed on this parsing), and
-  whether a conversation the desktop app made can be resumed *without* `--fork-session` while the app is closed.
+- **Live passes through `serve` (Yu's Mac, 2026-10-14, WorkBuddy 5.2.5 / CodeBuddy 2.106.4, a launcher without `-y`):** a plain reply
+  (`WB-2-OK`), and at 18:37 an @ asked the seat to read `wb-tool-check.txt` from its working directory; it replied with the file's
+  freshly generated contents (`WB-TOOL-183715-OK`) 9 s later. So a read-only tool works headlessly under the default permission
+  mode; tools that need approval need `-y` or `--permission-mode` in the launcher, which stays the owner's choice (it is not defaulted).
+- **`wake check`** looks at the program (a launcher is not started) and that the config directory is readable. It takes none of the
+  sign-in, transcript or throwaway-call steps the `claude-code` check has; the live passes above are the proof of the path.
+- **Still not verified live:** resuming a conversation the desktop app made *without* `--fork-session` while the app is closed, and
+  `--output-format json` as a single object (it was an array on 2.106.4; both forms parse).
 
 ### `command`
 
