@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { runCli } from "./cli.ts";
 import type { CommandRunner } from "./guest.ts";
 import { processAlive, systemProcessProbe, type ProcessProbe } from "./process-identity.ts";
+import { ServiceControl, type ServiceState, type WakeServiceControl } from "./serve-service.ts";
 import type { CheckOptions, CheckResult, CheckStep, SeatWake, TurnRunner, TurnSpec } from "./wake-driver.ts";
 
 const cleanup: string[] = [];
@@ -107,6 +108,7 @@ async function run(
     rescanMs?: number;
     listSeats?: <T>(read: () => Promise<T>) => Promise<T>;
     lockPause?: () => Promise<void>;
+    wakeService?: (env: Record<string, string | undefined>) => WakeServiceControl;
   } = {},
 ) {
   const { mkdir } = await import("node:fs/promises");
@@ -2723,6 +2725,184 @@ describe("sharednet say and wait", () => {
       expect(served.exitCode).toBe(0);
       const after = await run(["serve", "--status", "--json"], space, []);
       expect(JSON.parse(after.stdout)).toMatchObject({ running: false });
+    });
+
+    describe("an installed launchd service (serve --install)", () => {
+      const lockFile = (space: Awaited<ReturnType<typeof workspace>>) => join(space.env.XDG_CONFIG_HOME!, "sharednet", "serve.json");
+      const rootOf = (space: Awaited<ReturnType<typeof workspace>>) => join(space.env.XDG_CONFIG_HOME!, "sharednet");
+      const holdLock = async (space: Awaited<ReturnType<typeof workspace>>, status: Record<string, unknown>) => {
+        await mkdir(rootOf(space), { recursive: true, mode: 0o700 });
+        await writeFile(lockFile(space), JSON.stringify({ started_at: "2026-10-05T00:00:00.000Z", rooms: [], ...status }));
+      };
+      /** SharedNet's own service as launchd would report it; every call is recorded, nothing runs. */
+      function installedService(space: Awaited<ReturnType<typeof workspace>>, state: Partial<ServiceState> | null, started: { ok: boolean; message: string } = { ok: true, message: "the installed service ai.sharednet.serve was started" }) {
+        const calls: string[] = [];
+        const control: WakeServiceControl = {
+          state: async () => (state === null ? null : { label: "ai.sharednet.serve", file: "/Users/synthetic/Library/LaunchAgents/ai.sharednet.serve.plist", root: rootOf(space), installed: true, loaded: true, holds: "loaded", running: false, ...state }),
+          start: async () => (calls.push("start"), started),
+          install: async () => (calls.push("install"), { installed: true, root: rootOf(space), label: "ai.sharednet.serve", file: "/Users/synthetic/Library/LaunchAgents/ai.sharednet.serve.plist", log: "/serve.log", program: ["/opt/homebrew/bin/npx", "-y", "sharednet@latest", "serve", "--service"], program_note: "note", env: { PATH: "/usr/bin", HTTPS_PROXY: "http://127.0.0.1:10080" }, warnings: ["Only SharedNet's own service … retire it"] }),
+          uninstall: async () => (calls.push("uninstall"), { uninstalled: true }),
+        };
+        return { calls, wakeService: () => control };
+      }
+      const absent = { installed: false, loaded: false, holds: "absent" as const };
+
+      it("installs and names the label, file and root, and warns about supervisors of one's own (items 7, 3)", async () => {
+        const space = await joinedSpace();
+        const service = installedService(space, absent);
+        const installed = await run(["serve", "--install", "--json"], space, [], {}, { wakeService: service.wakeService });
+        expect(installed.exitCode).toBe(0);
+        expect(JSON.parse(installed.stdout)).toMatchObject({ installed: true, label: "ai.sharednet.serve", root: rootOf(space) });
+        expect(installed.stderr).toContain(`serve: installed ai.sharednet.serve at /Users/synthetic/Library/LaunchAgents/ai.sharednet.serve.plist, for storage root ${rootOf(space)}`);
+        expect(installed.stderr).toContain("retire it");
+        expect(installed.stderr).toContain("  HTTPS_PROXY=http://127.0.0.1:10080");
+        expect(service.calls).toEqual(["install"]);
+        // Only alone, and not from inside a sandbox.
+        for (const argv of [["serve", "--install", "--uninstall"], ["serve", "--install", "--run", "x"]]) {
+          expect((await run([...argv, "--json"], space, [], {}, { wakeService: service.wakeService })).exitCode).not.toBe(0);
+        }
+        expect(JSON.parse((await run(["serve", "--install", "--json"], space, [], { CODEX_SANDBOX: "seatbelt" }, { wakeService: service.wakeService })).stderr).error.code).toBe("service_not_installed");
+        expect(service.calls).toEqual(["install"]);
+        expect((await run(["serve", "--uninstall", "--json"], space, [], {}, { wakeService: service.wakeService })).exitCode).toBe(0);
+        expect(service.calls).toEqual(["install", "uninstall"]);
+      });
+
+      it("checks its own service before the lock: an installed, running one answers service_installed and --uninstall (item 1)", async () => {
+        const space = await joinedSpace();
+        // The installed service holds the lock itself (the test runner's parent stands in for it).
+        await holdLock(space, { pid: process.ppid, start_identity: `test-start-${process.ppid}`, lock_id: "service" });
+        const service = installedService(space, { installed: true, running: true, pid: process.ppid });
+        const refused = await run(["serve", "--install", "--json"], space, [], {}, { wakeService: service.wakeService });
+        expect(JSON.parse(refused.stderr).error).toMatchObject({ code: "service_installed", message: expect.stringContaining("sharednet serve --uninstall") });
+        // Loaded by launchd with its plist gone, or launchd unable to say: the same.
+        for (const state of [{ installed: false, loaded: true, holds: "loaded" as const }, { installed: false, loaded: true, holds: "unknown" as const }]) {
+          const held = installedService(space, state);
+          expect(JSON.parse((await run(["serve", "--install", "--json"], space, [], {}, { wakeService: held.wakeService })).stderr).error.code).toBe("service_installed");
+          expect(held.calls).toEqual([]);
+        }
+        expect(service.calls).toEqual([]);
+      });
+
+      it("refuses while a live listener holds this root's lock, whoever started it, naming the root and pid (item 2)", async () => {
+        const space = await joinedSpace();
+        const service = installedService(space, absent);
+        await holdLock(space, { pid: process.ppid, start_identity: `test-start-${process.ppid}`, lock_id: "by-hand" });
+        const refused = await run(["serve", "--install", "--json"], space, [], {}, { wakeService: service.wakeService });
+        expect(JSON.parse(refused.stderr).error).toMatchObject({ code: "serve_running", message: expect.stringContaining(`storage root ${rootOf(space)} (pid ${process.ppid})`) });
+        expect(service.calls).toEqual([]);
+        // A stale lock (the pid gone, or another process now) does not stand in the way.
+        for (const stale of [{ pid: 2 ** 22 + 17, start_identity: "gone" }, { pid: process.ppid, start_identity: "someone else" }]) {
+          await holdLock(space, stale);
+          expect((await run(["serve", "--install", "--json"], space, [], {}, { wakeService: service.wakeService })).exitCode).toBe(0);
+        }
+        expect(service.calls).toEqual(["install", "install"]);
+        // The lock checked is the service's own root.
+        const elsewhere = installedService(space, { ...absent, root: "/somewhere/else/sharednet" });
+        expect(JSON.parse((await run(["serve", "--install", "--json"], space, [], {}, { wakeService: elsewhere.wakeService })).stderr).error.code).toBe("service_not_installed");
+      });
+
+      it("has join start an installed service instead of a second, detached serve; without one, join is as before (item 8)", async () => {
+        const CODEX = { CLAUDE_SESSION_ID: "", CODEX_SESSION_ID: "019a-codex-thread", CODEX_HOME: "/codex-home", PATH: "" };
+        const spawned: unknown[] = [];
+        const startWakeService = (input: { env: Record<string, string | undefined>; logFile: string }) => (spawned.push(input), 4242);
+        const space = await workspace();
+        const stopped = installedService(space, { installed: true, loaded: false, holds: "absent" });
+        const first = await run(["join", PASTED_INVITE, "--json"], space, [joined([message(1, "Welcome")])], CODEX, { startWakeService, wakeService: stopped.wakeService });
+        expect(JSON.parse(first.stdout).wake).toMatchObject({ service: "started" });
+        expect(stopped.calls).toEqual(["start"]);
+        expect(spawned).toHaveLength(0);
+        // A start that fails is reported; still no detached serve beside the installed service.
+        const broken = await workspace();
+        const refusing = installedService(broken, { installed: true, loaded: true }, { ok: false, message: "the installed service ai.sharednet.serve did not start (exit 5: Input/output error)" });
+        const failed = await run(["join", PASTED_INVITE, "--json"], broken, [joined([message(1, "Welcome")])], CODEX, { startWakeService, wakeService: refusing.wakeService });
+        expect(JSON.parse(failed.stdout).wake.service).toBe("not_started");
+        expect(spawned).toHaveLength(0);
+        // No service installed (or none possible here): the detached serve, as on main.
+        for (const state of [null, absent]) {
+          const plain = await workspace();
+          const none = await run(["join", PASTED_INVITE, "--json"], plain, [joined([message(1, "Welcome")])], CODEX, { startWakeService, wakeService: installedService(plain, state).wakeService });
+          expect(JSON.parse(none.stdout).wake).toMatchObject({ service: "started", pid: 4242 });
+        }
+        expect(spawned).toHaveLength(2);
+      });
+
+      it("reports the service in --status, and a --stop of it says launchd starts it again (item 8)", async () => {
+        const space = await workspace();
+        const service = installedService(space, { installed: true, loaded: true, running: true, pid: 94930 });
+        expect(JSON.parse((await run(["serve", "--status", "--json"], space, [], {}, { wakeService: service.wakeService })).stdout)).toMatchObject({ running: false, service: { installed: true, running: true, pid: 94930 } });
+        const { spawn } = await import("node:child_process");
+        const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore", timeout: 60_000 });
+        try {
+          await holdLock(space, { pid: child.pid, start_identity: `test-start-${child.pid}`, lock_id: "service" });
+          const stopped = await run(["serve", "--stop", "--json"], space, [], {}, { wakeService: service.wakeService });
+          expect(JSON.parse(stopped.stdout)).toMatchObject({ stopped: true, pid: child.pid, restarts: true });
+          expect(stopped.stderr).toContain("sharednet serve --uninstall");
+          // Without a service, --stop is exactly as on main.
+          const plain = await workspace();
+          expect(JSON.parse((await run(["serve", "--stop", "--json"], plain, [])).stdout)).toEqual({ stopped: false, reason: "no connector has been started on this machine" });
+        } finally {
+          child.kill("SIGKILL");
+        }
+      });
+
+      it("refuses --install on Linux and Windows with why, even while a connector holds the lock (item 8)", async () => {
+        const space = await joinedSpace();
+        await holdLock(space, { pid: process.ppid, start_identity: `test-start-${process.ppid}`, lock_id: "by-hand" });
+        for (const [platform, says] of [["linux", "systemd --user support is planned"], ["win32", "not supported on Windows"]] as const) {
+          const calls: string[] = [];
+          const host = {
+            platform,
+            uid: 1000,
+            home: "/home/synthetic",
+            username: "synthetic",
+            readFile: async () => null,
+            writeFile: async (path: string) => void calls.push(`write ${path}`),
+            remove: async (path: string) => void calls.push(`remove ${path}`),
+            ensureDir: async () => undefined,
+            pause: async () => undefined,
+            run: async (command: string, args: string[]) => (calls.push([command, ...args].join(" ")), { exitCode: 0, stdout: "", stderr: "" }),
+          };
+          const wakeService = (env: Record<string, string | undefined>) => new ServiceControl(env, host, { entry: "/opt/sharednet/bin/sharednet.js", execPath: "/usr/bin/node", execArgv: [] });
+          const refused = await run(["serve", "--install", "--json"], space, [], {}, { wakeService });
+          expect(JSON.parse(refused.stderr).error).toMatchObject({ code: "service_unsupported", message: expect.stringContaining(says) });
+          expect(JSON.parse((await run(["serve", "--uninstall", "--json"], space, [], {}, { wakeService })).stderr).error.code).toBe("service_unsupported");
+          expect(calls).toEqual([]);
+        }
+      });
+
+      it("runs as serve --service: waits for another holder's lock and for seats instead of ending, and takes the lock once free (item 5)", async () => {
+        const space = await workspace();
+        await holdLock(space, { pid: process.ppid, start_identity: `test-start-${process.ppid}`, lock_id: "by-hand" });
+        let looks = 0;
+        const sleep = async () => {
+          looks += 1;
+          if (looks === 2) await holdLock(space, { pid: 2 ** 22 + 17, start_identity: "gone", lock_id: "gone" });
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        };
+        const stop = new AbortController();
+        const serving = run(["serve", "--service", "--json"], space, [], {}, { sleep, signal: stop.signal });
+        await vi.waitFor(async () => expect(JSON.parse(await readFile(lockFile(space), "utf8"))).toMatchObject({ pid: process.pid, seats: [] }), { timeout: 5_000 });
+        stop.abort();
+        const result = await serving;
+        expect(result.exitCode).toBe(0);
+        expect(result.stderr).toContain(`a connector is already running (pid ${process.ppid}) for storage root ${rootOf(space)}; this service waits for it to stop`);
+        expect(result.stderr).toContain("no seat to drive yet");
+        // A plain serve with no seat still ends, as on main.
+        expect(JSON.parse((await run(["serve", "--json"], space, [])).stderr).error.code).toBe("not_in_a_room");
+      });
+
+      it("as serve --service, outlives a seat that stops, so launchd does not start it over and over (item 5)", async () => {
+        const space = await joinedSpace();
+        const stop = new AbortController();
+        const serving = run(["serve", "--service", "--json"], space, [revoked()], {}, { service: { delivered_through: 1, acked_through: 1 }, signal: stop.signal });
+        await vi.waitFor(async () => expect(JSON.parse(await readFile(lockFile(space), "utf8")).seats).toEqual([expect.objectContaining({ state: "stopped" })]), { timeout: 5_000 });
+        let ended = false;
+        void serving.then(() => (ended = true));
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        expect(ended).toBe(false);
+        stop.abort();
+        expect((await serving).exitCode).toBe(0);
+      });
     });
 
     describe("the serve lock knows its holder", () => {
