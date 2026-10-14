@@ -82,15 +82,20 @@ function ephemeralPathEntry(entry: string): boolean {
 }
 
 /**
- * An address that carries a user name or password, in any form: `scheme://user[:pass]@host`, or the
- * scheme-less `user[:pass]@host[:port]` that proxy variables also accept (a URL parser reads the
- * latter as scheme `user:` and finds no credentials, so the authority is checked by hand first).
+ * An address that carries a user name or password, in any form. One rule: drop an optional scheme
+ * and the slashes after it, take the authority (up to the first path, query or fragment delimiter),
+ * and any `@` there (or `%40`, which no host name contains) means userinfo. That covers
+ * `scheme://user:pass@host`, the network-path `//user:pass@host`, and the scheme-less
+ * `user:pass@host:port` proxy variables also accept (a URL parser reads that as scheme `user:` and
+ * finds no credentials; here `user:` is dropped as a scheme and `pass@host` still has its `@`).
+ * A URL parse is kept as a second opinion, never as the only one.
  */
 export function carriesCredentials(value: string): boolean {
-  const authority = value.trim().replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, "").split(/[/?#]/)[0] ?? "";
-  if (authority.includes("@")) return true;
+  const rest = value.trim().replace(/^(?:[A-Za-z][A-Za-z0-9+.-]*:)?[\\/]*/, "");
+  const authority = rest.split(/[\\/?#]/)[0] ?? "";
+  if (authority.includes("@") || /%40/i.test(authority)) return true;
   try {
-    const url = new URL(value);
+    const url = new URL(value.trim());
     return url.username !== "" || url.password !== "";
   } catch {
     return false;
@@ -474,6 +479,11 @@ export class ServiceControl {
     return { ...serviceLocation(root, this.host.home), root };
   }
 
+  /** Refuses, with why, where there is no launchd (Linux, Windows): before any other check. */
+  assertSupported(): void {
+    if (this.host.platform !== "darwin") unsupported(this.host.platform);
+  }
+
   /** SharedNet's own service for this root as launchd sees it, or null where there is no launchd. */
   async state(): Promise<ServiceState | null> {
     const where = this.where();
@@ -498,7 +508,7 @@ export class ServiceControl {
    * holding) its label. A reinstall is an explicit uninstall first.
    */
   async install(): Promise<Record<string, unknown>> {
-    if (this.host.platform !== "darwin") unsupported(this.host.platform);
+    this.assertSupported();
     if (this.program === null) throw localError("service_not_installed", "Only the sharednet executable can install its service.");
     const { captured, root, stateDir } = this.prepared();
     const existing = (await this.state())!;
@@ -546,7 +556,7 @@ export class ServiceControl {
    * uninstall can be retried, and the failure names the command to finish it by hand.
    */
   async uninstall(): Promise<Record<string, unknown>> {
-    if (this.host.platform !== "darwin") unsupported(this.host.platform);
+    this.assertSupported();
     const where = this.where()!;
     const target = `gui/${this.host.uid}/${where.label}`;
     const done = await this.host.run("launchctl", ["bootout", target]);
@@ -599,4 +609,4 @@ export function serviceInstalled(state: ServiceState) {
 }
 
 /** What `serve` and `join` use of the service; tests stand in for it. */
-export type WakeServiceControl = Pick<ServiceControl, "state" | "install" | "uninstall" | "start">;
+export type WakeServiceControl = Pick<ServiceControl, "assertSupported" | "state" | "install" | "uninstall" | "start">;

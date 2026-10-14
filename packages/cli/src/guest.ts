@@ -2779,6 +2779,9 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       throw localError("invalid_arguments", "--install and --uninstall go alone: the service serves every seat here joined from a Codex or Claude Code session.");
     }
     if (!control) throw localError("service_unsupported", "Only the sharednet executable can install or remove its service.");
+    // No launchd here (Linux, Windows): say so before anything else, the sandbox included, since
+    // leaving the sandbox would not help.
+    control.assertSupported();
     if (!install) return control.uninstall();
     if (sandboxed(dependencies.env)) throw localError("service_not_installed", "This session runs in a sandbox; install the service from a terminal outside it.");
     // The install-time contract (docs/serve-service.md), in this order. First SharedNet's own service
@@ -2786,7 +2789,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     // would undo a --stop, so the way on is --uninstall. Then this root's serve lock, whoever holds
     // it. Supervisors SharedNet did not write are not interpreted; the report tells the operator so.
     const own = await control.state();
-    // No launchd here (Linux, Windows): install refuses with why, before a lock it could never act on.
+    // Supported (above), so launchd answers; null would mean no launchd after all, which install refuses.
     if (own === null) return reportInstall(await control.install(), dependencies);
     if (own.installed || own.loaded) throw serviceInstalled(own);
     // The lock checked is the one the service will use.

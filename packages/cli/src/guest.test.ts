@@ -2738,6 +2738,7 @@ describe("sharednet say and wait", () => {
       function installedService(space: Awaited<ReturnType<typeof workspace>>, state: Partial<ServiceState> | null, started: { ok: boolean; message: string } = { ok: true, message: "the installed service ai.sharednet.serve was started" }) {
         const calls: string[] = [];
         const control: WakeServiceControl = {
+          assertSupported: () => undefined,
           state: async () => (state === null ? null : { label: "ai.sharednet.serve", file: "/Users/synthetic/Library/LaunchAgents/ai.sharednet.serve.plist", root: rootOf(space), installed: true, loaded: true, holds: "loaded", running: false, ...state }),
           start: async () => (calls.push("start"), started),
           install: async () => (calls.push("install"), { installed: true, root: rootOf(space), label: "ai.sharednet.serve", file: "/Users/synthetic/Library/LaunchAgents/ai.sharednet.serve.plist", log: "/serve.log", program: ["/opt/homebrew/bin/npx", "-y", "sharednet@latest", "serve", "--service"], program_note: "note", env: { PATH: "/usr/bin", HTTPS_PROXY: "http://127.0.0.1:10080" }, warnings: ["Only SharedNet's own service … retire it"] }),
@@ -2866,6 +2867,32 @@ describe("sharednet say and wait", () => {
           const refused = await run(["serve", "--install", "--json"], space, [], {}, { wakeService });
           expect(JSON.parse(refused.stderr).error).toMatchObject({ code: "service_unsupported", message: expect.stringContaining(says) });
           expect(JSON.parse((await run(["serve", "--uninstall", "--json"], space, [], {}, { wakeService })).stderr).error.code).toBe("service_unsupported");
+          expect(calls).toEqual([]);
+        }
+      });
+
+      it("refuses --install and --uninstall on Linux and Windows as unsupported, not as sandboxed, from inside a sandbox (item 8)", async () => {
+        const space = await joinedSpace();
+        for (const [platform, says] of [["linux", "systemd --user support is planned"], ["win32", "not supported on Windows"]] as const) {
+          const calls: string[] = [];
+          const host = {
+            platform,
+            uid: 1000,
+            home: "/home/synthetic",
+            username: "synthetic",
+            readFile: async () => null,
+            writeFile: async (path: string) => void calls.push(`write ${path}`),
+            remove: async (path: string) => void calls.push(`remove ${path}`),
+            ensureDir: async () => undefined,
+            pause: async () => undefined,
+            run: async (command: string, args: string[]) => (calls.push([command, ...args].join(" ")), { exitCode: 0, stdout: "", stderr: "" }),
+          };
+          const wakeService = (env: Record<string, string | undefined>) => new ServiceControl(env, host, { entry: "/opt/sharednet/bin/sharednet.js", execPath: "/usr/bin/node", execArgv: [] });
+          for (const action of ["--install", "--uninstall"]) {
+            const refused = await run(["serve", action, "--json"], space, [], { CODEX_SANDBOX: "seatbelt" }, { wakeService });
+            expect(JSON.parse(refused.stderr).error, `${platform} ${action}`).toMatchObject({ code: "service_unsupported", message: expect.stringContaining(says) });
+            expect(refused.stderr).not.toContain("outside it");
+          }
           expect(calls).toEqual([]);
         }
       });

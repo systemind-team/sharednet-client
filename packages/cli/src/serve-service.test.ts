@@ -326,6 +326,40 @@ describe("installing, inspecting and removing it", () => {
     expect(report.warnings).toEqual(expect.arrayContaining([expect.stringContaining("HTTPS_PROXY was not written"), expect.stringContaining("HTTP_PROXY was not written")]));
   });
 
+  it("never writes or reports userinfo before a host in any form: scheme, scheme-less, network-path, encoded", async () => {
+    const bin = await binWith("node");
+    // Each secret is distinct, so a leak names the form that leaked.
+    const corpus: Array<[string, string]> = [
+      ["//user:np-secret-1@proxy.example:8080", "np-secret-1"],
+      ["//np-secret-2@proxy.example:8080", "np-secret-2"],
+      ["//:np-secret-3@proxy.example:8080", "np-secret-3"],
+      ["//us%40er:np%3Asecret-4@proxy.example:8080", "np%3Asecret-4"],
+      ["http://us%40er:np%3Asecret-5@proxy.example:8080", "np%3Asecret-5"],
+      ["user:np-secret-6@proxy.example:8080", "np-secret-6"],
+      ["http://user:np-secret-7@proxy.example:8080", "np-secret-7"],
+      ["socks5h://np-secret-8@127.0.0.1:1080", "np-secret-8"],
+      ["  //user:np-secret-9@proxy.example  ", "np-secret-9"],
+      // What a WHATWG parser still reads as authority for a special scheme.
+      ["http:/user:np-secret-10@proxy.example:8080", "np-secret-10"],
+      ["http:\\\\user:np-secret-11@proxy.example:8080", "np-secret-11"],
+      ["http:user:np-secret-12@proxy.example:8080", "np-secret-12"],
+    ];
+    for (const [value, secret] of corpus) {
+      expect(carriesCredentials(value), value).toBe(true);
+      for (const name of ["HTTPS_PROXY", "http_proxy", "ALL_PROXY", "SHAREDNET_BASE_URL"]) {
+        const { host, files } = fakeHost("/Users/synthetic");
+        const report = await new ServiceControl({ HOME: "/Users/synthetic", PATH: bin, [name]: value }, host, program).install();
+        expect(JSON.stringify(report), `${name}=${value} in the report`).not.toContain(secret);
+        expect(files.get(plistFile), `${name}=${value} in the plist`).not.toContain(secret);
+        expect(report.warnings, `${name}=${value}`).toEqual(expect.arrayContaining([expect.stringContaining(`${name} was not written`)]));
+      }
+    }
+    // Addresses without userinfo are kept.
+    for (const value of ["//proxy.example:8080", "http://127.0.0.1:10080", "127.0.0.1:10080", "proxy.example:3128", "http://proxy.example/path@x", "//proxy.example/a@b"]) {
+      expect(carriesCredentials(value), value).toBe(false);
+    }
+  });
+
   it("reads back whether it is installed, loaded and running, and with which pid", async () => {
     const bin = await binWith("node");
     const env = { HOME: "/Users/synthetic", PATH: bin };
