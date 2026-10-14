@@ -355,6 +355,9 @@
     "docs/harness-modes.md",
     "docs/superpowers/plans/2026-10-16-harness-mode-registry.md",
     "packages/cli/src/harness-modes.ts",
-    "packages/cli/src/harness-modes.test.ts"
+    "packages/cli/src/harness-modes.test.ts",
+    "packages/cli/src/goal-serve-demo.ts",
+    "packages/cli/src/goal-serve-demo.test.ts",
+    "docs/superpowers/plans/2026-10-14-serve-goal-demo.md"
   ]
 }

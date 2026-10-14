@@ -388,6 +388,39 @@ describe("reach: forming a group from the account CLI", () => {
     expect(compiled.requests).toEqual([]);
   });
 
+  it("requires an explicit first or all kickoff for the real-serve Goal demo before anything is sent", async () => {
+    for (const args of [
+      ["goal", "serve-demo", "TASK.md", "--until", "after: 1h"],
+      ["goal", "serve-demo", "TASK.md", "--until", "after: 1h", "--kickoff", "broadcast"],
+    ]) {
+      const refused = await harness(args, []);
+      expect(refused.exitCode).not.toBe(0);
+      expect(refused.stderr.join(" ")).toContain("--kickoff is first or all");
+      expect(refused.requests).toEqual([]);
+    }
+  });
+
+  it("refuses a live token budget for the real-serve Goal demo before anything is sent", async () => {
+    const refused = await harness(["goal", "serve-demo", "TASK.md", "--kickoff", "first", "--until", "budget 1M tokens", "--until", "after 1h"], []);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr.join(" ")).toContain("budget_needs_goal_run");
+    expect(refused.requests).toEqual([]);
+  });
+
+  it("refuses count for the real-serve Goal demo because its kickoff is a real Room message", async () => {
+    const refused = await harness(["goal", "serve-demo", "TASK.md", "--kickoff", "first", "--until", "count 3", "--until", "after 1h"], []);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr.join(" ")).toContain("does not accept count");
+    expect(refused.requests).toEqual([]);
+  });
+
+  it("refuses a serve-demo turn limit above the wake driver's 24 hour cap before creating a Room", async () => {
+    const refused = await harness(["goal", "serve-demo", "TASK.md", "--kickoff", "first", "--until", "after 3d", "--turn-limit", "2d"], []);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr.join(" ")).toContain("between 1m and 24h");
+    expect(refused.requests).toEqual([]);
+  });
+
   it("accepts independent board gates before validating the rest of a run", async () => {
     for (const flags of [["--mention-gate"], ["--task-gate"], ["--mention-gate", "--task-gate"]]) {
       const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after 1h", "--turn-limit", "30s", ...flags], []);
