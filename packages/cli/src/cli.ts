@@ -732,35 +732,37 @@ async function goalServeDemoCommand(parsed: ParsedArguments, globals: GlobalArgu
     if (!invite?.token) throw new CliError("invalid_server_response", "The Agents' invite did not come back.", 5);
     const out = resolvePathFrom(dependencies.cwd, option(parsed, "out") ?? join("runs", roomId));
     dependencies.stderr(`goal: ${roomId} is empty while three real serve listeners start; the record goes to ${out}\n`);
-    const interrupt = () => {
-      spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents)]);
-      dependencies.stderr(`goal: stopped; the Agents' containers are gone and ${roomId} is still open\n`);
-      process.exit(130);
-    };
-    if (!dependencies.docker) process.once("SIGINT", interrupt);
-    try {
-      return await runServeGoalDemo(
-        client,
-        session.instance_token,
-        apiKey,
-        {
-          plan,
-          roomId,
-          inviteToken: invite.token,
-          goal: content,
-          until: until.wire,
-          baseUrl,
-          out,
-          checkEveryMs,
-          quietChecks: parsed.options.get("quiet-checks") === true,
-          kickoff: kickoff as ServeKickoff,
-          ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
-        },
-        { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
-      );
-    } finally {
-      process.off("SIGINT", interrupt);
-    }
+    return runServeGoalDemo(
+      client,
+      session.instance_token,
+      apiKey,
+      {
+        plan,
+        roomId,
+        inviteToken: invite.token,
+        goal: content,
+        until: until.wire,
+        baseUrl,
+        out,
+        checkEveryMs,
+        quietChecks: parsed.options.get("quiet-checks") === true,
+        kickoff: kickoff as ServeKickoff,
+        ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
+      },
+      {
+        docker,
+        now: dependencies.now,
+        ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
+        stderr: dependencies.stderr,
+        ...(!dependencies.docker ? {
+          signalHost: {
+            on: (signal, listener) => process.on(signal, listener),
+            off: (signal, listener) => process.off(signal, listener),
+            exit: (code) => process.exit(code),
+          },
+        } : {}),
+      },
+    );
   });
 }
 

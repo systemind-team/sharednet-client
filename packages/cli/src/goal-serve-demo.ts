@@ -18,6 +18,13 @@ import { mentions } from "./triggers.ts";
 import { validTurnLimit } from "./wake-driver.ts";
 
 export type ServeKickoff = "first" | "all";
+export type ServeDemoSignal = "SIGINT" | "SIGTERM" | "SIGHUP";
+
+export interface ServeDemoSignalHost {
+  on(signal: ServeDemoSignal, listener: () => void): void;
+  off(signal: ServeDemoSignal, listener: () => void): void;
+  exit(code: number): void;
+}
 
 const CONTAINER_WORKSPACE = "/workspace";
 const CONTAINER_HOMES = "/home/agents";
@@ -109,6 +116,8 @@ export interface ServeGoalDemoDependencies {
   sleep?: (ms: number) => Promise<void>;
   stderr?: (line: string) => void;
   watch?: WatchGoal;
+  /** Only the real CLI supplies process signals; tests can provide an inert host. */
+  signalHost?: ServeDemoSignalHost;
 }
 
 export interface ServeGoalDemoResult extends GoalWatchResult {
@@ -175,17 +184,129 @@ export async function runServeGoalDemo(
   const turnLimitMs = input.turnLimitMs ?? DEFAULT_TURN_LIMIT_MS;
   const checks = containerName(input.roomId);
   const containers = runContainers(input.roomId, plan.agents);
+  const createdContainers = new Set<string>();
+  const runningContainers = new Set<string>();
+  const pendingStarts = new Set<Promise<unknown>>();
   const records: Array<AgentSpec & { member_id: string | null; session_id: string | null }> = plan.agents.map((agent) => ({ ...agent, member_id: null, session_id: null }));
   await mkdir(input.out, { recursive: true });
 
-  const startContainer = (seat: AgentSpec) => docker([
-    "run", "--detach", "--name", containerName(input.roomId, seat.name),
-    "--add-host", "host.docker.internal:host-gateway",
-    "--volume", `${plan.workspace}:${CONTAINER_WORKSPACE}`,
-    "--volume", `${plan.cli.root}:${CONTAINER_CLI}:ro`,
-    ...(plan.codexAuth?.kind === "login" ? ["--volume", `${plan.codexAuth.file}:${CONTAINER_CODEX_AUTH}:ro`] : []),
-    plan.image, "sleep", "infinity",
-  ]);
+  let interrupted: ServeDemoSignal | null = null;
+  const interruptedError = () => localError("goal_interrupted", `goal serve-demo was interrupted by ${interrupted ?? "a signal"}.`);
+  const startManagedContainer = async (name: string, createArgs: readonly string[]) => {
+    if (interrupted) throw interruptedError();
+    // `docker run` may create a stopped container and still return nonzero. Split create
+    // from start so this invocation owns an exact set that cleanup may safely remove,
+    // while a pre-existing same-name container is never mistaken for ours.
+    const pending = (async () => {
+      const created = await docker(["create", "--name", name, ...createArgs]);
+      if (created.code !== 0) return created;
+      createdContainers.add(name);
+      if (interrupted) throw interruptedError();
+      const started = await docker(["start", name]);
+      if (started.code === 0) runningContainers.add(name);
+      return started;
+    })();
+    pendingStarts.add(pending);
+    let result: Awaited<ReturnType<DockerRunner>>;
+    try {
+      result = await pending;
+    } finally {
+      pendingStarts.delete(pending);
+    }
+    if (interrupted) throw interruptedError();
+    return result;
+  };
+
+  const startContainer = (seat: AgentSpec) => {
+    const name = containerName(input.roomId, seat.name);
+    return startManagedContainer(name, [
+      "--add-host", "host.docker.internal:host-gateway",
+      "--volume", `${plan.workspace}:${CONTAINER_WORKSPACE}`,
+      "--volume", `${plan.cli.root}:${CONTAINER_CLI}:ro`,
+      ...(plan.codexAuth?.kind === "login" ? ["--volume", `${plan.codexAuth.file}:${CONTAINER_CODEX_AUTH}:ro`] : []),
+      plan.image, "sleep", "infinity",
+    ]);
+  };
+
+  let stopPromise: Promise<void> | null = null;
+  const stopContainers = () => {
+    stopPromise ??= (async () => {
+      await Promise.allSettled([...pendingStarts]);
+      const targets = containers.filter((name) => runningContainers.has(name));
+      if (targets.length === 0) return;
+      const stopped = await docker(["stop", "--time", "5", ...targets]);
+      if (stopped.code !== 0) {
+        throw localError("container_stop_failed", `The Goal containers could not be stopped: ${stopped.stderr.trim().slice(-400) || `docker exited ${stopped.code}`}`);
+      }
+      for (const target of targets) runningContainers.delete(target);
+    })();
+    return stopPromise;
+  };
+
+  let removePromise: Promise<void> | null = null;
+  const removeContainers = () => {
+    removePromise ??= (async () => {
+      await Promise.allSettled([...pendingStarts]);
+      const targets = containers.filter((name) => createdContainers.has(name));
+      if (targets.length === 0) return;
+      const removed = await docker(["rm", "--force", ...targets]);
+      if (removed.code !== 0) {
+        const listed = await docker(["ps", "--all", "--format", "{{.Names}}"]).catch(() => null);
+        const names = new Set((listed?.code === 0 ? listed.stdout : "").split("\n").map((name) => name.trim()).filter(Boolean));
+        const remaining = listed?.code === 0 ? targets.filter((name) => names.has(name)) : targets;
+        if (remaining.length > 0) {
+          const detail = removed.stderr.trim().slice(-400) || `docker exited ${removed.code}`;
+          throw localError(
+            "container_remove_failed",
+            `The Goal containers could not be removed: ${detail}. Still present: ${remaining.join(", ")}. Remove them with docker rm --force ${remaining.join(" ")}`,
+          );
+        }
+      }
+      for (const target of targets) {
+        createdContainers.delete(target);
+        runningContainers.delete(target);
+      }
+    })();
+    return removePromise;
+  };
+
+  const cleanupContainers = async () => {
+    const failures: Error[] = [];
+    await stopContainers().catch((error: unknown) => failures.push(error instanceof Error ? error : new Error("docker stop failed")));
+    await removeContainers().catch((error: unknown) => failures.push(error instanceof Error ? error : new Error("docker rm failed")));
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw localError("container_cleanup_failed", failures.map((failure) => failure.message).join("; "));
+  };
+
+  const signalExitCodes: Record<ServeDemoSignal, number> = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+  const signalListeners = new Map<ServeDemoSignal, () => void>();
+  const detachSignals = () => {
+    if (!dependencies.signalHost) return;
+    for (const [signal, listener] of signalListeners) dependencies.signalHost.off(signal, listener);
+    signalListeners.clear();
+  };
+  if (dependencies.signalHost) {
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+      const listener = () => {
+        if (interrupted) return;
+        interrupted = signal;
+        void cleanupContainers().then(
+          () => {
+            detachSignals();
+            log(`goal: ${signal} stopped and removed the Goal containers; ${input.roomId} is still open\n`);
+            dependencies.signalHost!.exit(signalExitCodes[signal]);
+          },
+          (error: unknown) => {
+            detachSignals();
+            log(`goal: cleanup after ${signal} failed: ${error instanceof Error ? error.message : "unknown error"}\n`);
+            dependencies.signalHost!.exit(2);
+          },
+        );
+      };
+      signalListeners.set(signal, listener);
+      dependencies.signalHost.on(signal, listener);
+    }
+  }
 
   const execSeat = (
     seat: typeof records[number],
@@ -214,9 +335,10 @@ export async function runServeGoalDemo(
     await client.request("POST", `/rooms/${encodeURIComponent(input.roomId)}/close`, apiKey, { detail: `goal serve-demo could not start: ${reason}`.slice(0, 2_000) }).catch(() => undefined);
   };
 
+  let runFailure: unknown = null;
   try {
     try {
-      const checker = await docker(["run", "--detach", "--name", checks, "--volume", `${plan.workspace}:${CONTAINER_WORKSPACE}`, plan.image, "sleep", "infinity"]);
+      const checker = await startManagedContainer(checks, ["--volume", `${plan.workspace}:${CONTAINER_WORKSPACE}`, plan.image, "sleep", "infinity"]);
       if (checker.code !== 0) throw localError("container_failed", `The checks' container did not start: ${checker.stderr.trim()}`);
       const port = loopbackPort(input.baseUrl);
       const entry = `${CONTAINER_CLI}/${plan.cli.entry}`;
@@ -350,6 +472,7 @@ export async function runServeGoalDemo(
           },
         },
       );
+      if (interrupted) throw interruptedError();
     } catch (error) {
       await client.request("POST", `/rooms/${encodeURIComponent(input.roomId)}/close`, apiKey, {
         trigger: "runner_error",
@@ -358,13 +481,13 @@ export async function runServeGoalDemo(
       throw error;
     }
 
-    await docker(["stop", "--time", "5", ...containers]);
+    await stopContainers();
     for (const seat of seats) {
       const target = join(input.out, "agents", seat.name, "home");
       await rm(target, { recursive: true, force: true });
       await mkdir(join(target, ".codex"), { recursive: true });
-      // Copy only evidence paths. The container-held Codex login and SharedNet seat credential
-      // are never copied, so an interruption cannot leave a credential in the run record.
+      // Copy only evidence paths, never credential files. The raw session trace can still contain
+      // sensitive content or a secret that an agent itself read and surfaced.
       const sessions = await docker(["cp", `${containerName(input.roomId, seat.name)}:${CONTAINER_HOMES}/${seat.name}/.codex/sessions`, join(target, ".codex", "sessions")]);
       if (sessions.code !== 0) log(`goal: ${seat.name}'s Codex trace could not be copied out: ${sessions.stderr.trim()}\n`);
       const serveLog = await docker(["cp", `${containerName(input.roomId, seat.name)}:${CONTAINER_HOMES}/${seat.name}/serve.log`, join(target, "serve.log")]);
@@ -373,7 +496,21 @@ export async function runServeGoalDemo(
     const result: ServeGoalDemoResult = { ...watched, mode: "real-serve", kickoff: input.kickoff, agents: seats };
     await writeFile(join(input.out, "serve-demo.json"), `${JSON.stringify({ mode: result.mode, kickoff: result.kickoff, image: plan.image, turn_limit_ms: turnLimitMs, goal_sequence: goalSequence, kickoff_message: kickoff, agents: seats }, null, 2)}\n`);
     return result;
+  } catch (error) {
+    runFailure = error;
+    throw error;
   } finally {
-    await docker(["rm", "--force", ...containers]);
+    try {
+      await cleanupContainers();
+    } catch (cleanupError) {
+      if (runFailure && cleanupError !== runFailure) {
+        const original = runFailure instanceof Error ? runFailure.message : "the Goal run failed";
+        const cleanup = cleanupError instanceof Error ? cleanupError.message : "container cleanup failed";
+        throw localError("container_cleanup_failed", `${original}; cleanup also failed: ${cleanup}`.slice(0, 2_000));
+      }
+      throw cleanupError;
+    } finally {
+      detachSignals();
+    }
   }
 }

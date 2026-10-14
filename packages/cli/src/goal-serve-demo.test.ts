@@ -7,8 +7,16 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ApiClient } from "./api-client.ts";
-import { DEFAULT_IMAGE, containerName, type DockerRunner, type RunPlan } from "./goal-run.ts";
-import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, serveKickoff, serveSessionPrompt } from "./goal-serve-demo.ts";
+import { DEFAULT_IMAGE, containerName, runContainers, type DockerRunner, type RunPlan } from "./goal-run.ts";
+import {
+  assertServeDemoGoalUnaddressed,
+  parseServeDemoAgents,
+  runServeGoalDemo,
+  serveKickoff,
+  serveSessionPrompt,
+  type ServeDemoSignal,
+  type ServeDemoSignalHost,
+} from "./goal-serve-demo.ts";
 
 const ROOM = "rom_AbCdEfGhIj";
 const cleanup: string[] = [];
@@ -18,6 +26,107 @@ async function temporary() {
   const directory = await mkdtemp(join(tmpdir(), "sharednet-serve-goal-"));
   cleanup.push(directory);
   return directory;
+}
+
+async function lifecycleScenario(options: {
+  stopCode?: number;
+  removeCode?: number;
+  remainingAfterRemove?: boolean;
+  createFailureFor?: string;
+  startFailureFor?: string;
+  holdWatch?: boolean;
+  signals?: boolean;
+  watchError?: string;
+} = {}) {
+  const out = await temporary();
+  const workspace = await temporary();
+  const calls: string[][] = [];
+  const members = new Map([
+    ["codex-1", "i_AgentOne01"],
+    ["codex-2", "i_AgentTwo02"],
+    ["codex-3", "i_AgentTre03"],
+  ]);
+  const docker: DockerRunner = async (args) => {
+    calls.push([...args]);
+    if (args[0] === "create" && args.includes(containerName(ROOM, options.createFailureFor ?? "missing"))) {
+      return { code: 125, stdout: "", stderr: "name already exists" };
+    }
+    if (args[0] === "start" && args[1] === containerName(ROOM, options.startFailureFor ?? "missing")) {
+      return { code: 9, stdout: "", stderr: "start broke" };
+    }
+    if (args[0] === "stop") return { code: options.stopCode ?? 0, stdout: "", stderr: options.stopCode ? "stop broke" : "" };
+    if (args[0] === "rm") return { code: options.removeCode ?? 0, stdout: "", stderr: options.removeCode ? "remove broke" : "" };
+    if (args[0] === "ps") {
+      return { code: 0, stdout: options.remainingAfterRemove ? `${runContainers(ROOM, parseServeDemoAgents([])).join("\n")}\n` : "", stderr: "" };
+    }
+    const container = args.find((argument) => argument.startsWith(`sharednet-goal-${ROOM}-codex-`));
+    const name = container?.slice(`sharednet-goal-${ROOM}-`.length) ?? null;
+    const command = container ? args.slice(args.indexOf(container) + 1) : [];
+    if (command.includes("codex") && command.includes("exec") && !command.includes("resume")) {
+      return { code: 0, stdout: `${JSON.stringify({ type: "thread.started", thread_id: `thread-${name}` })}\n${JSON.stringify({ type: "turn.completed", usage: {} })}\n`, stderr: "" };
+    }
+    if (command[0] === "sharednet" && command[1] === "join") {
+      return { code: 0, stdout: JSON.stringify({ member_id: members.get(name!) }), stderr: "" };
+    }
+    if (command[0] === "sharednet" && command[1] === "serve" && command.includes("--status")) {
+      return { code: 0, stdout: JSON.stringify({ running: true, wake_protocol: "wake-plugins-v1", seats: [{ room_id: ROOM, member_id: members.get(name!), state: "listening" }] }), stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const client = {
+    async request(method: string, path: string) {
+      if (method === "POST" && path.endsWith("/goal")) return { room: {}, message: { sequence: 1 } };
+      if (method === "POST" && path.endsWith("/owner-messages")) return { message: { sequence: 2 } };
+      return {};
+    },
+  } as unknown as ApiClient;
+  const plan: RunPlan = {
+    image: DEFAULT_IMAGE,
+    agents: parseServeDemoAgents([]),
+    workspace,
+    cli: { root: "/opt/sharednet-cli", entry: "src/main.ts" },
+    codexAuth: { kind: "login", file: "/home/owner/.codex/auth.json" },
+    claudeAuth: null,
+  };
+  let enterWatch!: () => void;
+  const watchEntered = new Promise<void>((resolve) => { enterWatch = resolve; });
+  let finishWatch!: () => void;
+  const heldWatch = new Promise<void>((resolve) => { finishWatch = resolve; });
+  const handlers = new Map<ServeDemoSignal, () => void>();
+  const exits: number[] = [];
+  let recordExit!: () => void;
+  const exitCalled = new Promise<void>((resolve) => { recordExit = resolve; });
+  const signalHost: ServeDemoSignalHost | undefined = options.signals ? {
+    on: (signal, listener) => { handlers.set(signal, listener); },
+    off: (signal, listener) => { if (handlers.get(signal) === listener) handlers.delete(signal); },
+    exit: (code) => { exits.push(code); recordExit(); },
+  } : undefined;
+  const promise = runServeGoalDemo(client, "sni_owner-seat", "snk_owner-secret", {
+    plan,
+    roomId: ROOM,
+    inviteToken: "rit_invite-secret",
+    goal: "Build the demo.",
+    until: ["after 20m"],
+    baseUrl: "https://www.sharednet.ai",
+    out,
+    checkEveryMs: 60_000,
+    quietChecks: true,
+    kickoff: "first",
+  }, {
+    docker,
+    now: () => new Date("2026-10-14T20:00:00.000Z"),
+    uid: 4242,
+    gid: 4343,
+    sleep: async () => undefined,
+    ...(signalHost ? { signalHost } : {}),
+    watch: async () => {
+      enterWatch();
+      if (options.holdWatch) await heldWatch;
+      if (options.watchError) throw new Error(options.watchError);
+      return { room_id: ROOM, ended_by: { trigger: "after 20m", at: "2026-10-14T20:20:00.000Z", detail: null }, messages: 2, checks: 0, snapshots: 0, out };
+    },
+  });
+  return { calls, exits, exitCalled, finishWatch, handlers, promise, watchEntered };
 }
 
 describe("serve-first Goal demo", () => {
@@ -191,7 +300,7 @@ describe("serve-first Goal demo", () => {
     expect(watchOptions).toMatchObject({ ignoreThrough: 2 });
     expect(calls.some((args) => args.includes("wait") || args.includes("ack"))).toBe(false);
     expect(calls.filter((args) => args.join(" ").includes("sharednet serve --rooms"))).toHaveLength(3);
-    expect(calls.filter((args) => args[0] === "run" && args.some((arg) => arg.endsWith("/auth.json:/run/codex/auth.json:ro")))).toHaveLength(3);
+    expect(calls.filter((args) => args[0] === "create" && args.some((arg) => arg.endsWith("/auth.json:/run/codex/auth.json:ro")))).toHaveLength(3);
     const agentExecs = calls.filter((args) => args[0] === "exec" && args.includes("--user") && args[args.indexOf("--user") + 1] !== "root");
     expect(agentExecs.length).toBeGreaterThan(0);
     expect(agentExecs.every((args) => args[args.indexOf("--user") + 1] === "4242:4343")).toBe(true);
@@ -291,5 +400,74 @@ describe("serve-first Goal demo", () => {
     expect(closes).toEqual([{ trigger: "runner_error", detail: "goal serve-demo stopped: watch exploded" }]);
     expect(lifecycle).toEqual(["close", "rm"]);
     expect(dockerCalls.at(-1)?.slice(0, 2)).toEqual(["rm", "--force"]);
+  });
+
+  it.each([
+    ["SIGINT", 130],
+    ["SIGTERM", 143],
+    ["SIGHUP", 129],
+  ] as const)("stops and removes detached listeners once on %s", async (signal, exitCode) => {
+    const scenario = await lifecycleScenario({ holdWatch: true, signals: true });
+    await scenario.watchEntered;
+
+    scenario.handlers.get(signal)?.();
+    scenario.handlers.get(signal)?.();
+    await scenario.exitCalled;
+    scenario.finishWatch();
+
+    await expect(scenario.promise).rejects.toMatchObject({ code: "goal_interrupted" });
+    expect(scenario.exits).toEqual([exitCode]);
+    expect(scenario.calls.filter((args) => args[0] === "stop")).toHaveLength(1);
+    expect(scenario.calls.filter((args) => args[0] === "rm")).toHaveLength(1);
+    expect(scenario.handlers).toHaveLength(0);
+  });
+
+  it("surfaces a failed docker stop and still attempts the final removal", async () => {
+    const scenario = await lifecycleScenario({ stopCode: 9 });
+
+    await expect(scenario.promise).rejects.toMatchObject({ code: "container_stop_failed", message: expect.stringContaining("stop broke") });
+    expect(scenario.calls.filter((args) => args[0] === "stop")).toHaveLength(1);
+    expect(scenario.calls.filter((args) => args[0] === "rm")).toHaveLength(1);
+    expect(scenario.calls.filter((args) => args[0] === "cp")).toHaveLength(0);
+  });
+
+  it("surfaces a failed final docker removal", async () => {
+    const scenario = await lifecycleScenario({ removeCode: 9, remainingAfterRemove: true });
+
+    await expect(scenario.promise).rejects.toMatchObject({ code: "container_remove_failed", message: expect.stringContaining("remove broke") });
+    expect(scenario.calls.filter((args) => args[0] === "stop")).toHaveLength(1);
+    expect(scenario.calls.filter((args) => args[0] === "rm")).toHaveLength(1);
+  });
+
+  it("accepts a nonzero docker rm only after verifying that no target container remains", async () => {
+    const scenario = await lifecycleScenario({ removeCode: 9 });
+
+    await expect(scenario.promise).resolves.toMatchObject({ mode: "real-serve" });
+    expect(scenario.calls.filter((args) => args[0] === "ps")).toHaveLength(1);
+  });
+
+  it("reports both the run failure and a cleanup failure", async () => {
+    const scenario = await lifecycleScenario({ watchError: "watch exploded", removeCode: 9, remainingAfterRemove: true });
+
+    await expect(scenario.promise).rejects.toMatchObject({
+      code: "container_cleanup_failed",
+      message: expect.stringMatching(/watch exploded.*cleanup also failed.*remove broke/),
+    });
+  });
+
+  it("force-removes a container that this run created even when starting it fails", async () => {
+    const scenario = await lifecycleScenario({ startFailureFor: "codex-1" });
+
+    await expect(scenario.promise).rejects.toMatchObject({ code: "container_failed", message: expect.stringContaining("start broke") });
+    const removed = scenario.calls.find((args) => args[0] === "rm")!;
+    expect(removed).toContain(containerName(ROOM, "codex-1"));
+  });
+
+  it("does not remove a pre-existing container when create reports a name conflict", async () => {
+    const scenario = await lifecycleScenario({ createFailureFor: "codex-1" });
+
+    await expect(scenario.promise).rejects.toMatchObject({ code: "container_failed", message: expect.stringContaining("name already exists") });
+    const removed = scenario.calls.find((args) => args[0] === "rm")!;
+    expect(removed).not.toContain(containerName(ROOM, "codex-1"));
   });
 });
