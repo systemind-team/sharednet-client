@@ -100,7 +100,32 @@ describe("the codebuddy plugin: delivering", () => {
     expect(ran[0]!.env).not.toHaveProperty("CODEBUDDY_CONFIG_DIR");
   });
 
-  it("reads the result the way Claude Code's is read, one object or one per line, through the shared turn", async () => {
+  it("reads the array of events CodeBuddy 2.106.4 prints, by its last result, as seen from WorkBuddy 5.2.5", async () => {
+    // Shape of a live run (2026-10-14): pretty-printed array, 13 events, the result last. Contents stripped.
+    const events = [
+      { type: "message", role: "user", sessionId: SESSION, content: [{ type: "input_text", text: "stripped" }] },
+      { type: "file-history-snapshot", isSnapshotUpdate: false, snapshot: {} },
+      { type: "reasoning", sessionId: SESSION, content: [] },
+      { type: "function_call", name: "Read", callId: "c1", arguments: "{}" },
+      { type: "function_call_result", name: "Read", callId: "c1", status: "completed", output: {} },
+      { type: "message", role: "assistant", sessionId: SESSION, status: "completed", content: [{ type: "output_text", text: "an earlier assistant message" }] },
+      { type: "result", subtype: "success", is_error: false, result: "WB-RAW-OK", session_id: "f07732fe-da9e-4f94-b6b3-e737e37cd0f2", total_cost_usd: 0, num_turns: 10 },
+    ];
+    const printed = JSON.stringify(events, null, 2);
+    expect(printed.split("\n").length).toBeGreaterThan(20);
+    const ok = scripted({ stdout: printed });
+    expect(await codebuddyPlugin.deliver(wake, input, ok.context)).toEqual({ kind: "replied", reply: "WB-RAW-OK" });
+    // An error result in the array is a failure with its words; an array with no result is a failure.
+    const refused = scripted({ stdout: JSON.stringify([...events.slice(0, 3), { type: "result", subtype: "error_during_execution", is_error: true, result: "Please log in first" }], null, 2) });
+    expect(await codebuddyPlugin.deliver(wake, input, refused.context)).toMatchObject({ kind: "failed", why: "Please log in first" });
+    const none = scripted({ stdout: JSON.stringify(events.slice(0, 5), null, 2) });
+    expect((await codebuddyPlugin.deliver(wake, input, none.context)).kind).toBe("failed");
+    // A last result wins over an earlier one, and a non-object element is skipped.
+    const two = scripted({ stdout: JSON.stringify([{ type: "result", is_error: false, result: "old" }, null, "x", { type: "result", is_error: false, result: "new" }], null, 2) });
+    expect(await codebuddyPlugin.deliver(wake, input, two.context)).toEqual({ kind: "replied", reply: "new" });
+  });
+
+  it("still reads Claude Code's single object, or one per line, as before", async () => {
     const result = { type: "result", is_error: false, result: "done" };
     const one = scripted({ stdout: JSON.stringify(result) });
     expect(await codebuddyPlugin.deliver(wake, input, one.context)).toEqual({ kind: "replied", reply: "done" });

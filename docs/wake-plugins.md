@@ -122,10 +122,13 @@ Code's headless mode (<https://www.workbuddy.ai/docs/cli/headless>, <https://www
   then `sharednet wake set codebuddy --resume <session> --config-dir ~/.workbuddy --command /path/to/that.sh`. Unattended tool
   use needs `-y` or `--permission-mode` (the headless doc says so); add the flags to the launcher if you want them. `wake check`
   looks at a launcher without starting it. The standalone CLI is `npm i -g @tencent-ai/codebuddy-code`.
-- **Not verified live:** the tests script the runner. `--version` and `--help` of the bundled CLI were run; no model turn, so
-  whether a conversation the desktop app made can be resumed headlessly with the app's login, and whether `--output-format json`
-  prints a single object (as Claude Code's does, and as the doc says) rather than a list, are unconfirmed. If a live run shows a
-  list, the parser to extend is the shared one.
+- **First live run (2026-10-14, CodeBuddy 2.106.4 in WorkBuddy 5.2.5):** `-p --resume <id> --fork-session --output-format json` prints a
+  pretty-printed **array** of the turn's events (message, file-history-snapshot, reasoning, function_call, function_call_result, ...)
+  whose last element is the `result` object, not the single object the doc describes. The shared parser (`claudeSummary`)
+  now reads a whole output that is an array by its last `result`; Claude Code's single object parses as before. A woken turn
+  that used to be reported "exited 0" now replies.
+- **Still not verified live:** a full wake through `serve` after the parser fix (the first live run failed on this parsing), and
+  whether a conversation the desktop app made can be resumed *without* `--fork-session` while the app is closed.
 
 ### `command`
 

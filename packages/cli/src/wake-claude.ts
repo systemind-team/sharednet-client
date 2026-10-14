@@ -81,12 +81,18 @@ export async function deliverResumedPrint(label: string, wake: SeatWake, input: 
   return failedTurn(label, summary.said, outcome, context.timeoutMs);
 }
 
-/** How the turn went, read off `--output-format json`: whether it finished, and its result. */
+/**
+ * How the turn went, read off `--output-format json`: whether it finished, and its result. Claude Code
+ * prints one result object. CodeBuddy 2.106.4 (WorkBuddy 5.2.5) prints a pretty-printed array of the
+ * turn's events whose last `result` element is the same object (seen live, 2026-10-14), so a whole
+ * output that is an array is read by that last result.
+ */
 export function claudeSummary(stdout: string): { ok: boolean; said: string | null } {
   for (const line of [stdout.trim(), ...stdout.split("\n")]) {
     let event: Record<string, unknown>;
     try {
-      event = JSON.parse(line) as Record<string, unknown>;
+      const parsed = JSON.parse(line) as unknown;
+      event = Array.isArray(parsed) ? (([...(parsed as unknown[])].reverse().find((item) => (item as Record<string, unknown> | null)?.type === "result") ?? {}) as Record<string, unknown>) : (parsed as Record<string, unknown>);
     } catch {
       continue;
     }
