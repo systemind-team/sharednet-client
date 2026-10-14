@@ -594,7 +594,7 @@ export class ServiceControl {
 function addressRefused(names: string[]) {
   const which = names.join(", ");
   return localError(
-    "service_not_installed",
+    "install_refused",
     `${which} ${names.length === 1 ? "contains" : "contain"} "@", which means a user name or password, and the service definition would store it in plain text (the value is not shown). Install from a shell where ${names.length === 1 ? "it names" : "they name"} a proxy that needs no credentials, or give the proxy its credentials another way, outside the service definition, then install again.`,
   );
 }

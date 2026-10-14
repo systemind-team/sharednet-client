@@ -2903,10 +2903,14 @@ describe("sharednet say and wait", () => {
         cleanup.push(bin);
         await writeFile(join(bin, "node"), "#!/bin/sh\n", { mode: 0o755 });
         for (const [name, value, secret] of [
+          // One per variable, each with a different userinfo form.
           ["HTTPS_PROXY", "DOMAIN\\user:cli-secret-1@proxy.example:8080", "cli-secret-1"],
-          ["http_proxy", "//user:cli-secret-2@proxy.example:8080", "cli-secret-2"],
-          ["ALL_PROXY", "user:cli-secret-3@proxy.example:8080", "cli-secret-3"],
-          ["SHAREDNET_BASE_URL", "http://user:cli\\secret-4@sharednet.example", "cli\\secret-4"],
+          ["https_proxy", "http://DOMAIN\\user:cli-secret-2@proxy.example:8080", "cli-secret-2"],
+          ["HTTP_PROXY", "http://user:cli-secret-3@proxy.example:8080", "cli-secret-3"],
+          ["http_proxy", "//user:cli-secret-4@proxy.example:8080", "cli-secret-4"],
+          ["ALL_PROXY", "user:cli-secret-5@proxy.example:8080", "cli-secret-5"],
+          ["all_proxy", "socks5h://cli-secret-6@127.0.0.1:1080", "cli-secret-6"],
+          ["SHAREDNET_BASE_URL", "http://user:cli\\secret-7@sharednet.example", "cli\\secret-7"],
         ] as const) {
           const calls: string[] = [];
           const files = new Map<string, string>();
@@ -2928,7 +2932,8 @@ describe("sharednet say and wait", () => {
           const wakeService = (env: Record<string, string | undefined>) => new ServiceControl(env, host, { entry: "/opt/sharednet/bin/sharednet.js", execPath: "/usr/bin/node", execArgv: [] });
           const refused = await run(["serve", "--install", "--json"], space, [], { PATH: bin, [name]: value }, { wakeService });
           expect(refused.exitCode, name).not.toBe(0);
-          expect(JSON.parse(refused.stderr).error, name).toMatchObject({ code: "service_not_installed", message: expect.stringContaining(`${name} contains "@"`) });
+          expect(refused.exitCode, name).toBe(2);
+          expect(JSON.parse(refused.stderr).error, name).toMatchObject({ code: "install_refused", message: expect.stringContaining(`${name} contains "@"`) });
           const output = `${refused.stdout}\n${refused.stderr}`;
           expect(output, `${name}: raw`).not.toContain(secret);
           expect(output, `${name}: JSON-escaped`).not.toContain(JSON.stringify(secret).slice(1, -1));

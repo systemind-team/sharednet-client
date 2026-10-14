@@ -335,7 +335,7 @@ describe("installing, inspecting and removing it", () => {
           () => null,
           (thrown: unknown) => thrown,
         );
-        expect(error, `${name}=${value}`).toMatchObject({ code: "service_not_installed", message: expect.stringContaining(`${name} contains "@"`) });
+        expect(error, `${name}=${value}`).toMatchObject({ code: "install_refused", message: expect.stringContaining(`${name} contains "@"`) });
         // The refusal itself never carries the value, however it is serialized.
         const shown = `${String((error as Error).message)} ${JSON.stringify(error)}`;
         expect(shown, `${name}=${value} in the error`).not.toContain(secret);
