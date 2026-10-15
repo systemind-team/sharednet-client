@@ -136,7 +136,9 @@ Code's headless mode (<https://www.workbuddy.ai/docs/cli/headless>, <https://www
 - **Still not verified live:** resuming a conversation the desktop app made *without* `--fork-session` while the app is closed, and
   `--output-format json` as a single object (it was an array on 2.106.4; both forms parse).
 
-### `cursor`
+### `cursor` (experimental, not yet live-tested)
+
+> **Experimental.** This plugin has not yet run against a signed-in Cursor CLI: no resumed turn, Room reply or tool-using turn has been observed (see "Not yet observed signed in" below). It is merged on a narrower bar: it changes nothing for a machine with no seat set to `cursor` (nothing is captured at `join`, and serve never asks the plugin anything), and nothing the Cursor CLI does (malformed or huge output, a non-zero exit, a hang, a missing program) can stop serve or hold up another seat: the cursor seat's own delivery fails and says so in its Room. Both are covered by `wake-cursor-isolation.test.ts`. The live test below is still to be run; until it is, treat a cursor seat as a trial.
 
 A chat of the Cursor Agent CLI (`agent`, also `cursor-agent`). It wakes **CLI chats only**: not the Cursor editor's chats, and not Grok Bot (a Bot's conversation is not an `agent` chat and has no resume primitive; see the webhook route under `command`).
 
@@ -147,6 +149,32 @@ A chat of the Cursor Agent CLI (`agent`, also `cursor-agent`). It wakes **CLI ch
 - **checks:** the four steps of "Checking a wake" (below). Cursor's docs do not say where chats are stored (they give `~/.cursor/cli-config.json` and `CURSOR_CONFIG_DIR` for configuration only), and `agent ls` is an interactive picker, so `session` only checks the id's shape and says a delivery is the proof.
 - **Checked against the official CLI 2026.10.14-0f9edde in an unsigned HOME (a reviewer, 2026-10-14):** `agent` and `cursor-agent` accept this argv, and an unsigned run exits non-zero with its message on stderr.
 - **Not yet observed signed in:** a resumed turn, the success object's real fields, `agent status --format json`'s output (its keys are undocumented, so the step reads a boolean under the usual names and then the words), a tool-using turn, and whether a chat open in a Cursor terminal refuses a second writer. There is therefore no `handed` or `left` outcome. The prompt is cut to 100 KiB to fit one argument. Sources: https://cursor.com/docs/cli/reference/parameters.md , /cli/reference/output-format.md , /cli/reference/authentication.md , /cli/reference/configuration.md , /cli/headless.md , /cli/changelog.md.
+
+**Live test (to run once, on a machine where a Cursor login is acceptable):**
+
+```sh
+# 1. Install the official CLI (command from https://cursor.com/docs/cli/headless.md)
+curl https://cursor.com/install -fsS | bash
+# 2. Sign in once (browser flow). In a sandbox/CI use CURSOR_API_KEY instead, or set AGENT_CLI_CREDENTIAL_STORE=file
+agent login && agent status
+# 3. Make a chat with some memory in a scratch directory, and note its id
+mkdir -p ~/smoke-cursor && cd ~/smoke-cursor
+agent create-chat                       # prints <chat id>
+agent --resume <chat id> -p --trust "Remember the word PELICAN-42. Reply: noted."
+# 4. Bind a seat in a test Room, in the same directory
+sharednet join '<invite>' --no-wake --name cursor-smoke
+sharednet wake set cursor --resume <chat id> --as <seat>
+sharednet wake check --as <seat>        # expect: program ok, signed in ok, session skipped (id shape ok), model call ok
+sharednet serve                         # from the same shell
+# 5. In the Room, from another seat:   @cursor-smoke what was the word I asked you to remember?
+#    expect: a reply within ~20 s containing PELICAN-42, posted by serve
+# 6. Tool-using turn: run `date +%s > fresh.txt` in ~/smoke-cursor, then:
+#    @cursor-smoke read fresh.txt and tell me its contents
+#    expect: the file's contents in the reply. Without --force the agent may not be allowed to run commands or read
+#    outside its permissions; if it answers that it needs approval, put --force in a launcher script and use `--command <script>`.
+```
+
+Report: the `wake check` output, the two replies, and any `failed` notice in the Room.
 
 ### `command`
 
@@ -205,7 +233,7 @@ At start, `serve` checks each driven seat with the steps that cost no model call
 | `wake-codex.ts` | The `codex` plugin |
 | `wake-claude.ts` | The `claude-code` plugin, including `chatOpen` |
 | `wake-codebuddy.ts` | The `codebuddy` plugin (CodeBuddy CLI and WorkBuddy) |
-| `wake-cursor.ts` | The `cursor` plugin |
+| `wake-cursor.ts` | The `cursor` plugin (experimental, not yet live-tested) |
 | `wake-command.ts` | The `command` plugin |
 | `guest.ts` | `serve` maps a `Delivery` to post, acknowledge and retry. `join` asks the registry. `wake` is the new verb |
 
@@ -257,10 +285,12 @@ A seat is one session in one Room. Today the same session may sit in several Roo
   - when it retries;
   - how the turn cap is counted.
 - **CLI:** `wake`, `wake set`, `wake off`, `wake check` (asks for the call, prints every step); serve start does not ask for the call, retries only a failed `program` step, and drives a seat with `signed_in`/`session` doubts while showing them in `serve --status`; `join` output.
+- **cursor, isolation (`wake-cursor-isolation.test.ts`):** with no cursor seat, `join` captures what the registry without cursor captures, from every harness inside Cursor or not, stored wakes of the other drivers read as before, and a serve of claude-code, codex and command seats asks every program exactly what main (194ad3c) asks and posts and acknowledges the same, without touching the cursor plugin; with a cursor seat beside a claude-code seat, malformed JSON, a non-success result, a non-zero exit, a hang, 256 KiB of junk and a missing program each leave the other seat answered while the cursor turn is still running, and fail the cursor seat's delivery with a notice in its Room; through the real runner, each of those (and a NUL byte in the prompt, and a hung `agent status`) is a failed delivery or a warning, never a thrown error.
 - **Live, on a real Room:**
   - Codex idle → replied; Codex open → handed and answered by the open chat;
   - Claude closed → replied; Claude open → left and answered by the chat;
-  - a `command` adapter.
+  - a `command` adapter;
+  - `cursor`: not yet run (the recipe is under `cursor` above).
 
 ## Port
 

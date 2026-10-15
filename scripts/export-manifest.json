@@ -358,6 +358,7 @@
     "packages/cli/src/serve-service.ts",
     "packages/cli/src/serve-service.test.ts",
     "packages/cli/src/wake-cursor.ts",
-    "packages/cli/src/wake-cursor.test.ts"
+    "packages/cli/src/wake-cursor.test.ts",
+    "packages/cli/src/wake-cursor-isolation.test.ts"
   ]
 }

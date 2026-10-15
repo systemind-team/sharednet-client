@@ -32,6 +32,10 @@ import {
  * The `cursor` wake plugin (docs/wake-plugins.md): a chat of the Cursor Agent CLI (`agent`, also
  * installed as `cursor-agent`).
  *
+ * Experimental: not yet run against a signed-in CLI (the live test is in docs/wake-plugins.md). Nothing
+ * here runs unless a seat is set to `cursor` by hand, and whatever the CLI does ends as this seat's own
+ * Delivery (wake-cursor-isolation.test.ts).
+ *
  * The seat's chat is resumed with `agent -p --resume <chat id> --output-format json`, and the result is
  * the reply. That is the documented primitive (https://cursor.com/docs/cli/reference/parameters.md and
  * /cli/reference/output-format.md): print mode, `--resume [chatId]`, and one `{"type":"result",
@@ -96,6 +100,20 @@ export function cursorResume(wake: SeatWake, prompt: string, env: Environment, m
   };
 }
 
+/** How many object-shaped lines are parsed, from the end, looking for the result. */
+const RESULT_LINES_TRIED = 64;
+
+/** The text as a `{"type":"result",…}` object, or null. */
+function resultObject(text: string): Record<string, unknown> | null {
+  if (!text.startsWith("{")) return null;
+  try {
+    const event = JSON.parse(text) as unknown;
+    return event && typeof event === "object" && !Array.isArray(event) && (event as Record<string, unknown>).type === "result" ? (event as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * How the turn went, read off `--output-format json`, which documents exactly one success shape:
  * `{"type":"result","subtype":"success","is_error":false,"result":"<text>",...}`
@@ -103,15 +121,25 @@ export function cursorResume(wake: SeatWake, prompt: string, env: Environment, m
  * then holds a message for the Room: the CLI's own words when it reported an error, else what was wrong
  * with the output. A result that merely lacks `is_error: true` is not a success: serve would
  * acknowledge the wake and post nothing.
+ *
+ * The result is the last result object printed: looked for from the last line back, then in the
+ * whole output (a pretty-printed object). Only lines that look like an object are parsed, and at
+ * most RESULT_LINES_TRIED of them, so no output (up to the 256 KiB a turn keeps) holds up serve,
+ * which reads every seat's turns on the same thread: a parse that throws costs microseconds, and
+ * 130,000 of them, one per line of junk, held the event loop for about two seconds.
  */
 export function cursorSummary(stdout: string): { ok: boolean; said: string | null; reported: boolean } {
-  let result: Record<string, unknown> | null = null;
-  for (const line of [stdout.trim(), ...stdout.split("\n")]) {
-    try {
-      const event = JSON.parse(line) as unknown;
-      if (event && typeof event === "object" && !Array.isArray(event) && (event as Record<string, unknown>).type === "result") result = event as Record<string, unknown>;
-    } catch {
-      // not a JSON line
+  let result = resultObject(stdout.trim());
+  const lines = stdout.split("\n");
+  let tried = 0;
+  for (let index = lines.length - 1; index >= 0 && tried < RESULT_LINES_TRIED; index -= 1) {
+    const line = lines[index]!.trim();
+    if (!line.startsWith("{") || !line.endsWith("}")) continue;
+    tried += 1;
+    const event = resultObject(line);
+    if (event !== null) {
+      result = event;
+      break;
     }
   }
   if (result === null) return { ok: false, said: stdout.trim() === "" ? "the Cursor CLI printed nothing" : "the Cursor CLI printed no result object", reported: false };
