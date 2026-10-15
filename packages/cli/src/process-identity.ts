@@ -52,11 +52,11 @@ export function statStartTime(line: string): string | null {
 }
 
 /** ps with a fixed environment, so what it prints does not depend on who asks. */
-const PS_ENV = { PATH: "/bin:/usr/bin", TZ: "UTC", LC_ALL: "C", LANG: "C" };
+const PS_ENV: Record<string, string | undefined> = { PATH: "/bin:/usr/bin", TZ: "UTC", LC_ALL: "C", LANG: "C" };
 
 function ps(field: string, pid: number): string | null {
   try {
-    const out = execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"], env: PS_ENV }).trim();
+    const out = execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], { encoding: "utf8", timeout: 5_000, stdio: ["ignore", "pipe", "ignore"], env: PS_ENV as NodeJS.ProcessEnv }).trim();
     return out === "" ? null : out;
   } catch {
     return null;

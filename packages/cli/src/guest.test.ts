@@ -2464,7 +2464,7 @@ describe("sharednet say and wait", () => {
       const result = await run(["serve", "--json"], space, [revoked()], CODEX, {
         checkWake: async (wake) => {
           checked.push(wake.command);
-          return checked.length === 1 ? { ok: false, message: "codex is temporarily unavailable" } : { ok: true };
+          return checked.length === 1 ? { ok: false, message: "codex is temporarily unavailable" } : { ok: true, message: "codex is available" };
         },
         sleep: async () => {
           slept += 1;
@@ -3189,7 +3189,7 @@ describe("sharednet say and wait", () => {
           await hold(space, { pid: 2 ** 22 + 17, start_identity: "a listener that crashed", lock_id: "stale-lock" });
           // Only processes this test starts, and only they are signalled.
           const children = Array.from({ length: 8 }, () => {
-            const child = spawn(process.execPath, [entry, "serve", "--run", "cat"], { env: { PATH: process.env.PATH ?? "", ...space.env }, cwd: space.root, stdio: ["ignore", "ignore", "pipe"] });
+            const child = spawn(process.execPath, [entry, "serve", "--run", "cat"], { env: { NODE_ENV: "test", PATH: process.env.PATH ?? "", ...space.env }, cwd: space.root, stdio: ["ignore", "ignore", "pipe"] });
             const said = { text: "" };
             child.stderr.on("data", (chunk: Buffer) => (said.text += chunk.toString()));
             return { child, said };
@@ -3223,7 +3223,7 @@ describe("sharednet say and wait", () => {
           await vi.waitFor(async () => expect(JSON.parse(await readFile(statusFile(space), "utf8"))).toMatchObject({ pid: process.pid, start_identity: expect.any(String) }));
           const { spawn } = await import("node:child_process");
           const entry = join(import.meta.dirname, "main.ts");
-          const second = spawn(process.execPath, [entry, "serve", "--json"], { env: { PATH: process.env.PATH ?? "", ...space.env }, cwd: space.project, stdio: ["ignore", "pipe", "pipe"] });
+          const second = spawn(process.execPath, [entry, "serve", "--json"], { env: { NODE_ENV: "test", PATH: process.env.PATH ?? "", ...space.env }, cwd: space.project, stdio: ["ignore", "pipe", "pipe"] });
           let stderr = "";
           second.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
           const code = await new Promise<number | null>((resolve) => second.once("exit", (exit) => resolve(exit)));
