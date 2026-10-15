@@ -351,6 +351,8 @@
     "packages/cli/src/process-identity.test.ts",
     "docs/serve-service.md",
     "packages/cli/src/serve-service.ts",
-    "packages/cli/src/serve-service.test.ts"
+    "packages/cli/src/serve-service.test.ts",
+    "packages/cli/src/wake-manus.ts",
+    "packages/cli/src/wake-manus.test.ts"
   ]
 }

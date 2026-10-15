@@ -16,7 +16,8 @@ import { looksLikeServe, systemProcessProbe, type ProcessProbe } from "./process
 import { RESTART_SECONDS, serviceInstalled, type WakeServiceControl } from "./serve-service.ts";
 import { chatOpen } from "./wake-claude.ts";
 import { codebuddyProgram } from "./wake-codebuddy.ts";
-import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
+import { ALLOW_LOOPBACK_ENV, apiBase, keyEnvOf, MANUS_API } from "./wake-manus.ts";
+import { withoutSecrets, DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
 import { describeWake, isWakeDriver, pluginFor, seatWakeFrom } from "./wake-plugins.ts";
 import {
   getOrCreateInstallationSecret,
@@ -136,7 +137,7 @@ const INVITE_TOKEN_PATTERN = /^rit_[A-Za-z0-9_-]{43}$/;
 /** The server caps one wait at this; the client loops. */
 const WAIT_MAX_SECONDS = 25;
 
-const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume", "config-dir"]);
+const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume", "config-dir", "key-env"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on", "artifact"]);
 const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account", "install", "uninstall", "service"]);
@@ -589,6 +590,15 @@ async function heldSeats(paths: ReturnType<typeof getStoragePaths>): Promise<Sto
     }
   }
   return seats;
+}
+
+/**
+ * Reading a seat file registers the API key variable it names (wake-plugins.ts), so reading all of them is how
+ * a process learns every key variable that no program it starts may see. A fresh CLI process that parsed only
+ * the seat it was asked about would not know another seat's custom name.
+ */
+async function learnSecretNames(dependencies: GuestDependencies): Promise<void> {
+  await heldSeats(getStoragePaths(dependencies.env)).catch(() => []);
 }
 
 /**
@@ -1316,7 +1326,7 @@ function defaultExec(command: string, input: string, env: Record<string, string>
     let stderr = "";
     try {
       const child = spawn(shell[0]!, shell.slice(1), {
-        env: { ...process.env, ...env },
+        env: { ...withoutSecrets(process.env), ...env },
         stdio: ["pipe", "pipe", "pipe"],
       });
       child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
@@ -1522,6 +1532,8 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
   const sleep = dependencies.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const exec = dependencies.exec ?? defaultExec;
   const log = dependencies.stderr ?? (() => undefined);
+  // A `--run` command is a program we start: learn every API key variable any seat names before it can be.
+  await learnSecretNames(dependencies);
   if (command) await hydrateRoomMode(client, credential, dependencies);
   const me = await whoAmI(client, state, credential);
   const iso = (ms: number) => new Date(ms).toISOString();
@@ -2757,6 +2769,7 @@ const CHECK_RETRY_MAX_MS = 600_000;
 const MAX_MESSAGE_BYTES = 32_768;
 
 async function serve(args: string[], dependencies: GuestDependencies): Promise<unknown> {
+  await learnSecretNames(dependencies);
   const parsed = parseGuestArguments(args);
   assertOnlyOptions(parsed, ["run", "reply", "rooms", "from-instance", "from-agent", "grep", "status", "stop", "push", "listen", "install", "uninstall", "service"]);
   if (parsed.positionals.length !== 0) {
@@ -3086,7 +3099,13 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         const deadline = started + timeoutMs;
         const checkpointAt = deadline - Math.min(120_000, timeoutMs / 4);
         const prompt = wakeTurnPrompt(about) + `\n\nExecution budget: ${timeoutMs / 60_000} minutes; deadline ${new Date(deadline).toISOString()}. Save progress by ${new Date(checkpointAt).toISOString()} and after each significant milestone: sharednet wake checkpoint "completed; next step; blockers; evidence paths" --as ${seat.member_id}. Keep secrets out. Previous checkpoint (if any): ${checkpoint}. Read it to recover context, then verify current state before repeating actions. A checkpoint does not authorize automatic retries. You can set the NEXT turn's limit with sharednet wake limit 60m --as ${seat.member_id}; this does not extend this running turn. This budget applies to headless execution, not a handoff into an open chat.${compiled}`;
-        const delivery = await plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs });
+        // Before any program is started for any seat, learn every key variable any seat names (reading a seat
+        // file registers it), so no model process gets another seat's API key.
+        await heldSeats(paths).catch(() => []);
+        // An API plugin gets the one variable it names and nothing else: it starts no program.
+        // (and the one non-secret control that lets a test stand-in on this machine take it).
+        const env = currentWake.driver === "manus" ? { [keyEnvOf(currentWake)]: dependencies.env[keyEnvOf(currentWake)], [ALLOW_LOOPBACK_ENV]: dependencies.env[ALLOW_LOOPBACK_ENV] } : dependencies.env;
+        const delivery = await plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, { env, run: drive, chatOpen: open, timeoutMs, signal: stopping.signal });
         return { state: "delivered", delivery, pluginLabel: plugin.label, started, timeoutMs };
       };
       let ran: WakeRun;
@@ -3789,15 +3808,16 @@ async function timer(args: string[], dependencies: GuestDependencies): Promise<u
 }
 
 const WAKE_USAGE =
-  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|codebuddy|command [--command <path>] [--resume <session>] [--config-dir <path>] [--as <i_…>], sharednet wake off [--as <i_…>], sharednet wake check [--as <i_…>], sharednet wake limit <1m..24h> [--as <i_…>], or sharednet wake checkpoint <progress> [--as <i_…>]";
+  "Usage: sharednet wake [--as <i_…>], sharednet wake set codex|claude-code|codebuddy|manus|command [--command <path>] [--resume <session>] [--config-dir <path>] [--key-env <NAME>] [--as <i_…>], sharednet wake off [--as <i_…>], sharednet wake check [--as <i_…>], sharednet wake limit <1m..24h> [--as <i_…>], or sharednet wake checkpoint <progress> [--as <i_…>]";
 
 /**
  * A seat's wake, by hand (docs/wake-plugins.md): which plugin delivers it, what it resumes, the
  * program it calls. Local only: the service never hears a session id.
  */
 async function wakeVerb(args: string[], dependencies: GuestDependencies): Promise<unknown> {
+  await learnSecretNames(dependencies);
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["as", "command", "resume", "config-dir"]);
+  assertOnlyOptions(parsed, ["as", "command", "resume", "config-dir", "key-env"]);
   const [action = "show", driver, ...extra] = parsed.positionals;
   if (extra.length > 0 || !["show", "set", "off", "check", "limit", "checkpoint"].includes(action) || ["set", "limit", "checkpoint"].includes(action) !== (driver !== undefined)) {
     throw localError("invalid_arguments", WAKE_USAGE);
@@ -3847,30 +3867,40 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
     return { ...shown(wake), check: checked.message, ...(checked.steps ? { steps: checked.steps } : {}) };
   }
 
-  if (!isWakeDriver(driver)) throw localError("invalid_arguments", `The wake drivers are codex, claude-code, codebuddy and command. ${WAKE_USAGE}`);
+  if (!isWakeDriver(driver)) throw localError("invalid_arguments", `The wake drivers are codex, claude-code, codebuddy, manus and command. ${WAKE_USAGE}`);
   // What this process is, when it is the harness being set: its session, its program, its open chat.
   const here = pluginFor(driver).capture(dependencies.env, dependencies.cwd);
   const before = credential.wake?.driver === driver ? credential.wake : undefined;
   const session = stringOption(parsed, "resume") ?? before?.session ?? here?.session;
   const command = stringOption(parsed, "command") ?? before?.command ?? here?.command;
   if (driver === "command" && command === undefined) throw localError("invalid_arguments", "A command wake needs --command <path>: the adapter that is handed each wake.");
-  if (driver !== "command" && session === undefined) {
+  // The Manus key is only ever sent to the Manus API: refuse another address now, not at the first wake.
+  if (driver === "manus" && command !== undefined) {
+    const where = apiBase({ driver, cwd: dependencies.cwd, command }, dependencies.env);
+    if ("error" in where) throw localError("invalid_arguments", where.error);
+  }
+  // A Manus seat may have no task: every wake then starts one.
+  if (driver !== "command" && driver !== "manus" && session === undefined) {
     throw localError("invalid_arguments", `A ${pluginFor(driver).label} wake resumes a session: give --resume <session id>, or run this from inside that session.`);
   }
   const home = before?.codex_home ?? here?.codex_home;
   const configDir = stringOption(parsed, "config-dir") ?? before?.config_dir ?? here?.config_dir;
   if (stringOption(parsed, "config-dir") !== undefined && driver !== "codebuddy") throw localError("invalid_arguments", "--config-dir belongs to the codebuddy driver.");
+  const keyEnv = stringOption(parsed, "key-env") ?? before?.api_key_env;
+  if (keyEnv !== undefined && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(keyEnv)) throw localError("invalid_arguments", "--key-env is the NAME of the environment variable that holds the API key, not the key.");
+  if (keyEnv !== undefined && driver !== "manus") throw localError("invalid_arguments", "--key-env belongs to the manus driver.");
   // An open chat is only this one, and only when it is the session being set.
   const live = here?.live_pid !== undefined && here.session === session ? here.live_pid : undefined;
   const wake: SeatWake = {
     driver,
-    ...(driver === "command" ? {} : { session: session! }),
+    ...(driver === "command" || session === undefined ? {} : { session }),
     cwd: before?.cwd ?? dependencies.cwd,
     ...(credential.wake?.turn_limit_ms !== undefined ? { turn_limit_ms: credential.wake.turn_limit_ms } : {}),
-    command: command ?? (driver === "codex" ? (onPath("codex", dependencies.env) ?? "codex") : driver === "codebuddy" ? codebuddyProgram(dependencies.env) : (onPath("claude", dependencies.env) ?? "claude")),
+    command: command ?? (driver === "codex" ? (onPath("codex", dependencies.env) ?? "codex") : driver === "codebuddy" ? codebuddyProgram(dependencies.env) : driver === "manus" ? MANUS_API : (onPath("claude", dependencies.env) ?? "claude")),
     ...(driver === "codex" && home ? { codex_home: home } : {}),
     ...(driver === "codebuddy" && configDir ? { config_dir: configDir } : {}),
     ...(driver === "claude-code" && live !== undefined ? { live_pid: live } : {}),
+    ...(driver === "manus" && keyEnv ? { api_key_env: keyEnv } : {}),
   };
   await writeRoomCredential(paths, { ...credential, wake });
   dependencies.stderr?.(`${credential.member_id} wakes ${describeWake(wake)} when addressed; a running serve uses it from the next wake.\n`);
