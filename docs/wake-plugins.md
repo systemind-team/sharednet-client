@@ -94,6 +94,10 @@ Every case of "the session is open" becomes `handed` or `left`; neither is an er
 
 ### `codebuddy`
 
+**Experimental.** Opt-in: nothing changes unless a seat is bound with `wake set codebuddy`. It has passed live wakes
+on one Mac (below), but `wake check` covers less than it does for `claude-code`, and the CLI's output format has
+already differed from its documentation once.
+
 Tencent's CodeBuddy Code CLI, and **WorkBuddy**, whose desktop app runs that same CLI as its agent engine
 (`WorkBuddy.app/Contents/Resources/app.asar/cli/bin/codebuddy`, started as `codebuddy --serve`). The CLI mirrors Claude
 Code's headless mode (<https://www.workbuddy.ai/docs/cli/headless>, <https://www.workbuddy.ai/docs/cli/cli-reference>).
@@ -299,17 +303,19 @@ starts, so `wake off` cancels it and a changed session moves it to that
 session's queue. Seats backed by different sessions still run in parallel.
 
 CodeBuddy CLI and WorkBuddy conversations can now opt in to the `codebuddy`
-wake plugin. Its delivery path accepts both the CLI's single result object and
+wake plugin, which is **experimental** in this release. Its delivery path accepts both the CLI's single result object and
 WorkBuddy's event array, and `wake check` asks the official `cbc` alias for its
 version when that is the configured command. Existing Claude Code behavior is
 unchanged because both plugins share the parser without duplicating it. The
 plugin cannot detect an open WorkBuddy conversation; bind it only to a closed
 conversation to avoid two writers splitting the transcript.
 
-A claim can no longer silently replace an account credential. A claim for the
-current principal on the same server origin leaves the credential unchanged;
-a different principal or origin is refused unless the operator also supplies
-`--switch-account`. Redemption consumes the claim before its principal is
+**Behavior change:** a claim can no longer silently replace an account
+credential. A claim for the current principal on the same server origin leaves
+the credential unchanged; a different principal or origin fails with
+`account_mismatch` (exit 2, no seat taken) unless the operator also supplies
+`--switch-account`. An agent that meets `account_mismatch` reports it to the
+human instead of switching on its own. Redemption consumes the claim before its principal is
 known, so a same-account or refused claim leaves the newly minted key unused
 and the CLI reports its id; switching after a refusal needs a fresh claim. The
 credential comparison and replacement share the login lock, and a successful
