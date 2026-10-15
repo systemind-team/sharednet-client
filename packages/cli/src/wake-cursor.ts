@@ -198,12 +198,13 @@ export function cursorSignedIn(stdout: string): "yes" | "no" | "unknown" {
  */
 export async function checkCursor(wake: SeatWake, env: Environment, run: TurnRunner, options: CheckOptions = { call: false }): Promise<CheckResult> {
   const steps: CheckStep[] = [];
-  const started = await checkProgram(wake, harnessName(wake.command), env, run);
+  // Every child a check starts runs without Cursor's host markers, the `--version` probe included.
+  const runEnv = cursorFreeEnv(env);
+  const started = await checkProgram(wake, harnessName(wake.command), runEnv, run);
   steps.push({ step: "program", status: started.ok ? "ok" : "failed", message: started.message });
   const program = wakeProgram(wake, env);
   if (!started.ok || program === null) return skipRest(steps, options, "the program did not start");
   const launcher = isLauncher(program, harnessName(program));
-  const runEnv = cursorFreeEnv(env);
 
   if (launcher) {
     steps.push({ step: "signed_in", status: "skipped", message: `${program} is a launcher, written for the turn a delivery runs; \`status\` is not asked of it` });

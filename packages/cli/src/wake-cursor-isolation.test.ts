@@ -454,7 +454,8 @@ describe("(c) the cursor plugin's own delivery fails cleanly, through the real r
     await writeFile(command, `#!/bin/sh\ncase "$1" in --version) echo 2026.10.14;; *) sleep 30;; esac\n`);
     await chmod(command, 0o755);
     const wake: SeatWake = { driver: "cursor", session: CHAT, cwd: directory, command };
-    const shortRun: TurnRunner = (spec) => runTurn({ ...spec, timeoutMs: Math.min(spec.timeoutMs, 500) });
+    // Only `status` is cut short; `--version` keeps its own limit, so a loaded machine does not fail the program step.
+    const shortRun: TurnRunner = (spec) => runTurn(spec.args[0] === "status" ? { ...spec, timeoutMs: 500 } : spec);
     const checked = await cursorPlugin.check(wake, { PATH: "/usr/bin:/bin" }, shortRun);
     expect(checked.ok).toBe(true);
     expect(checked.steps?.map((step) => [step.step, step.status])).toEqual([["program", "ok"], ["signed_in", "warning"], ["session", "skipped"]]);

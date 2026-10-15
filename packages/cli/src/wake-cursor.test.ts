@@ -178,10 +178,11 @@ describe("point 4: Cursor's host markers stay behind, its sign-in stays", () => 
   it("scrubs them from every step of a check as well", async () => {
     const { ran, run } = checks({ version: { stdout: "2026.10.14\n" }, signed_in: { stdout: '{"isAuthenticated":true}' }, call: { stdout: JSON.stringify(DOC_SUCCESS) } });
     await cursorPlugin.check({ ...wake, command: await agentOnPath() }, { ...host, ...signIn, PATH: pathDir }, run, { call: true });
-    expect(ran.length).toBe(3);
-    for (const spec of ran.slice(1)) {
+    // Every child a check starts, the --version probe included: program, signed_in and call.
+    expect(ran.map((spec) => (spec.args[0] === "--version" ? "program" : spec.args[0] === "status" ? "signed_in" : "call"))).toEqual(["program", "signed_in", "call"]);
+    for (const spec of ran) {
       for (const key of Object.keys(host)) expect(spec.env, `${spec.args[0]} ${key}`).not.toHaveProperty(key);
-      expect(spec.env.CURSOR_API_KEY).toBe("key_test");
+      expect(spec.env, spec.args[0]).toMatchObject({ ...signIn, PATH: pathDir });
     }
   });
 });
