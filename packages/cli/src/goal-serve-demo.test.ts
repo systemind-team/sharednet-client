@@ -198,10 +198,12 @@ describe("serve-first Goal demo", () => {
     ]);
     const calls: string[][] = [];
     const callEnvironments: Array<Record<string, string>> = [];
+    const callInputs: Array<string | undefined> = [];
     const statusChecks = new Map<string, number>();
     const docker: DockerRunner = async (args, options = {}) => {
       calls.push([...args]);
       callEnvironments.push(options.env ?? {});
+      callInputs.push(options.input);
       const container = args.find((argument) => argument.startsWith(`sharednet-goal-${ROOM}-codex-`));
       const name = container?.slice(`sharednet-goal-${ROOM}-`.length) ?? null;
       const commandAt = container ? args.indexOf(container) + 1 : -1;
@@ -252,7 +254,7 @@ describe("serve-first Goal demo", () => {
     } as unknown as ApiClient;
     const plan: RunPlan = {
       image: DEFAULT_IMAGE,
-      agents: parseServeDemoAgents([]),
+      agents: parseServeDemoAgents(["codex:gpt-6-luna", "codex:gpt-6-luna", "codex:gpt-6-luna"]),
       workspace,
       cli: { root: "/opt/sharednet-cli", entry: "src/main.ts" },
       codexAuth: { kind: "login", file: "/home/owner/.codex/auth.json" },
@@ -305,6 +307,8 @@ describe("serve-first Goal demo", () => {
     expect(agentExecs.length).toBeGreaterThan(0);
     expect(agentExecs.every((args) => args[args.indexOf("--user") + 1] === "4242:4343")).toBe(true);
     expect(calls.filter((args) => args[0] === "exec" && args.includes("chown")).every((args) => args.join(" ").includes("chown -R 4242:4343"))).toBe(true);
+    const configWrites = calls.flatMap((args, index) => args.some((argument) => argument.includes("/.codex/config.toml")) ? [callInputs[index]] : []);
+    expect(configWrites).toEqual(Array(3).fill('model = "gpt-6-luna"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n'));
     expect(calls.flat().join(" ")).not.toContain("snk_owner-secret");
     expect(calls.flat().join(" ")).not.toContain("rit_invite-secret");
     const copies = calls.filter((args) => args[0] === "cp");

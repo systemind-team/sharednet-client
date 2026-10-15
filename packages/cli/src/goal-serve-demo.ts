@@ -368,7 +368,10 @@ export async function runServeGoalDemo(
             ])
           : await docker(["exec", "--user", "root", container, "sh", "-c", `mkdir -p '${home}/.codex' && chown -R ${agentUser} '${home}'`]);
         if (prepared.code !== 0) throw localError("container_failed", `${seat.name}'s Codex home could not be made: ${prepared.stderr.trim()}`);
-        const config = `approval_policy = "never"\nsandbox_mode = "danger-full-access"\n`;
+        // `sharednet serve` resumes this thread in a new Codex process. Persist an
+        // explicitly selected model in the seat's Codex home so those later turns
+        // do not silently fall back to the machine or image default.
+        const config = `${seat.model ? `model = "${seat.model}"\n` : ""}approval_policy = "never"\nsandbox_mode = "danger-full-access"\n`;
         const configured = await docker(["exec", "--user", agentUser, "--interactive", container, "sh", "-c", `cat > '${home}/.codex/config.toml'`], { input: config });
         if (configured.code !== 0) throw localError("container_failed", `${seat.name}'s Codex policy could not be written: ${configured.stderr.trim()}`);
       }
