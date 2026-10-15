@@ -2090,7 +2090,7 @@ describe("sharednet say and wait", () => {
         const out = join(space.root, "serve-env.txt");
         const result = await run(["join", PASTED_INVITE, "--json"], space, [joined([message(1, "Welcome")])], { ...CODEX, ...MANUS_ENV, PATH: process.env.PATH! }, {
           // The real launcher, with a shell standing in for `node sharednet.js serve`: it writes what it was given.
-          startWakeService: (input) => startWakeService({ ...input, entry: "serve-stand-in", execPath: "/bin/sh", execArgv: ["-c", `env > '${out}'`] }),
+          startWakeService: (input) => startWakeService({ ...input, entry: "serve-stand-in", execPath: "/bin/sh", execArgv: ["-c", `env > '${out}.part' && mv '${out}.part' '${out}'`] }),
         });
         expect(result.exitCode).toBe(0);
         const lines = await vi.waitFor(async () => (await readFile(out, "utf8")).split("\n"));

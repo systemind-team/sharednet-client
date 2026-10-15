@@ -85,6 +85,8 @@ const MAX_TEXT = 40_000;
 const MAX_LABEL = 300;
 const MAX_DESTINATION = 2_048;
 const MAX_TITLE = 300;
+/** Characters link parsing may read in one reply, however many links it holds or fails to close. */
+const MAX_LINK_SCAN = 1_000_000;
 
 interface ManusAttachment {
   filename?: string;
@@ -266,7 +268,12 @@ export function fitPrompt(prompt: string): string {
  * or null when the text there is not one. The label may hold balanced brackets; the destination is `<...>`
  * (spaces allowed) or a run without whitespace whose parentheses balance, then an optional title.
  */
-function parseLink(text: string, open: number): { label: string; destination: string; end: number } | null {
+function parseLink(text: string, open: number, scan: { cost: number }): { label: string; destination: string; end: number } | null {
+  // What a look costs is how far it read; cleanLinks stops looking past MAX_LINK_SCAN in all.
+  const done = <T>(value: T, at: number): T => {
+    scan.cost += Math.max(1, at - open);
+    return value;
+  };
   let depth = 1;
   let i = open + 1;
   const labelEnd = Math.min(text.length, open + 1 + MAX_LABEL);
@@ -275,15 +282,16 @@ function parseLink(text: string, open: number): { label: string; destination: st
     else if (text[i] === "[") depth += 1;
     else if (text[i] === "]") depth -= 1;
   }
-  if (depth !== 0 || text[i] !== "(") return null;
+  if (depth !== 0 || text[i] !== "(") return done(null, i);
   const label = text.slice(open + 1, i - 1);
   let j = i + 1;
   while (j < i + 1 + MAX_TITLE && /\s/.test(text[j] ?? "")) j += 1;
   let destination: string;
   if (text[j] === "<") {
     const within = text.slice(j + 1, j + 1 + MAX_DESTINATION).indexOf(">");
-    const close = within === -1 ? -1 : j + 1 + within;
-    if (close === -1 || text.slice(j + 1, close).includes("\n")) return null;
+    if (within === -1) return done(null, Math.min(text.length, j + 1 + MAX_DESTINATION));
+    const close = j + 1 + within;
+    if (text.slice(j + 1, close).includes("\n")) return done(null, close);
     destination = text.slice(j + 1, close);
     j = close + 1;
   } else {
@@ -298,7 +306,7 @@ function parseLink(text: string, open: number): { label: string; destination: st
         parens -= 1;
       }
     }
-    if (j === destinationEnd && j < text.length) return null;
+    if (j === destinationEnd && j < text.length) return done(null, j);
     destination = text.slice(from, j);
   }
   const spaced = j + MAX_TITLE;
@@ -307,14 +315,13 @@ function parseLink(text: string, open: number): { label: string; destination: st
   if (quote === '"' || quote === "'" || quote === "(") {
     const closer = quote === "(" ? ")" : quote;
     const within = text.slice(j + 1, j + 1 + MAX_TITLE).indexOf(closer);
-    if (within === -1) return null;
-    const close = j + 1 + within;
-    j = close + 1;
+    if (within === -1) return done(null, Math.min(text.length, j + 1 + MAX_TITLE));
+    j = j + 1 + within + 1;
     const after = j + MAX_TITLE;
     while (j < after && /\s/.test(text[j] ?? "")) j += 1;
   }
-  if (text[j] !== ")") return null;
-  return { label, destination, end: j + 1 };
+  if (text[j] !== ")") return done(null, j);
+  return done({ label, destination, end: j + 1 }, j + 1);
 }
 
 /**
@@ -325,11 +332,17 @@ function parseLink(text: string, open: number): { label: string; destination: st
  */
 export function cleanLinks(whole: string, attachments: ManusAttachment[] = []): string {
   const text = whole.slice(0, MAX_TEXT);
+  const scan = { cost: 0 };
   let out = "";
   let i = 0;
   while (i < text.length) {
+    // A reply made to be expensive (thousands of unclosed links) is not looked at further: the rest stays as written.
+    if (scan.cost > MAX_LINK_SCAN) {
+      out += text.slice(i);
+      break;
+    }
     const start = text[i] === "[" ? i : text[i] === "!" && text[i + 1] === "[" ? i + 1 : -1;
-    const node = start === -1 ? null : parseLink(text, start);
+    const node = start === -1 ? null : parseLink(text, start, scan);
     if (node === null) {
       out += text[i];
       i += 1;
