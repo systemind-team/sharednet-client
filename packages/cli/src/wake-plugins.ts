@@ -3,7 +3,7 @@ import { codebuddyPlugin } from "./wake-codebuddy.ts";
 import { codexPlugin } from "./wake-codex.ts";
 import { commandPlugin } from "./wake-command.ts";
 import { validTurnLimit, withholdSecretEnv } from "./wake-driver.ts";
-import { manusPlugin } from "./wake-manus.ts";
+import { MANUS_KEY_ENV, manusPlugin } from "./wake-manus.ts";
 import type { Environment, SeatWake, WakeDriver, WakePlugin } from "./wake-driver.ts";
 
 /**
@@ -43,9 +43,11 @@ export function parseSeatWake(value: unknown): SeatWake | undefined {
   // A harness's wake resumes a session; a command's has none to resume, and a Manus seat without a
   // task id starts a new task per wake.
   if (!driver || !cwd || !command || (driver !== "command" && driver !== "manus" && !session)) return undefined;
+  // A variable name is kept as written; the plugin refuses one that is not a key name (wake-manus.ts).
   const keyEnv = typeof record.api_key_env === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(record.api_key_env) ? record.api_key_env : null;
-  // Reading a seat that names a key variable is when this process learns that no program it starts may see it.
-  if (driver === "manus" && keyEnv) withholdSecretEnv(keyEnv);
+  // Reading a Manus seat is when this process learns which variable no program started for a seat may see.
+  // Only a Manus seat registers one: on a machine without one, nothing is withheld (wake-driver.ts).
+  if (driver === "manus") withholdSecretEnv(keyEnv ?? MANUS_KEY_ENV);
   const home = text(record.codex_home);
   const configDir = text(record.config_dir);
   const live = record.live_pid;

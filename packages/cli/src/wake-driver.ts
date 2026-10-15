@@ -327,21 +327,41 @@ const HARNESS_SESSION_KEYS = new Set([
 // CLAUDE_CODE_* is mostly the host session's own wiring; these few are how a person signs in.
 const KEPT_CLAUDE_CODE_KEYS = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]);
 
-// Environment variables that hold a credential only a plugin's own API calls may read (the Manus API key,
-// whatever name a seat gives it). serve has to hold them, but no model process it starts may see them: a
-// resumed Codex or Claude turn, a `--run` adapter or a probe could otherwise read or print them. The default
-// name is always withheld; a seat file that names another registers it as soon as it is read.
-const SECRET_ENV = new Set<string>(["MANUS_API_KEY"]);
+// The Manus API key (wake-manus.ts) is a credential only that plugin's own HTTP calls may read. On a machine
+// that holds a Manus seat, the variables those seats keep it in are withheld from every program started for a
+// seat (a resumed Codex or Claude turn, a `command` adapter, a `--run` command, the probes of a check): any of
+// them could otherwise read or print it. On a machine with no Manus seat nothing is withheld, so every program
+// gets exactly the environment it got before this plugin existed. A name is registered when a Manus seat is
+// read (wake-plugins.ts parseSeatWake); guest.ts reads every seat right before it starts such a program.
+// Only MANUS_API_KEY and MANUS_API_KEY_<SUFFIX> can be registered (`wake set manus --key-env` takes no other),
+// so a seat can never take a variable that Codex or Claude needs (OPENAI_API_KEY, PATH) away from them.
+const API_KEY_NAME = /^MANUS_API_KEY(?:_[A-Z0-9_]+)?$/i;
+/** Upper-cased: a Windows environment is read without regard to case, so it is withheld that way too. */
+const SECRET_ENV = new Set<string>();
 
-/** From now on, in this process, no spawned program gets the variable with this name. */
-export function withholdSecretEnv(name: string): void {
-  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) SECRET_ENV.add(name);
+/** Whether an environment holds a variable a Manus seat could keep its key in: if not, there is nothing to withhold. */
+export function mayHoldApiKey(env: Environment): boolean {
+  for (const [key, value] of Object.entries(env)) if (value !== undefined && API_KEY_NAME.test(key)) return true;
+  return false;
 }
 
-/** The environment without the credentials reserved for API plugins; what any spawned program may be given. */
+/** A Manus seat keeps its key in this variable: from now on, in this process, no program started for a seat gets it. */
+export function withholdSecretEnv(name: string): void {
+  if (API_KEY_NAME.test(name)) SECRET_ENV.add(name.toUpperCase());
+}
+
+/** The variables the Manus seats on this machine name, read just now from every seat: exactly these are withheld. */
+export function setWithheldSecretEnv(names: Iterable<string>): void {
+  SECRET_ENV.clear();
+  for (const name of names) withholdSecretEnv(name);
+}
+
+const isSecretEnv = (key: string) => SECRET_ENV.size > 0 && SECRET_ENV.has(key.toUpperCase());
+
+/** The environment without the credentials of this machine's Manus seats; with no such seat, all of it. */
 export function withoutSecrets<T extends Environment>(env: T): Record<string, string> {
   const kept: Record<string, string> = {};
-  for (const [key, value] of Object.entries(env)) if (value !== undefined && !SECRET_ENV.has(key)) kept[key] = value;
+  for (const [key, value] of Object.entries(env)) if (value !== undefined && !isSecretEnv(key)) kept[key] = value;
   return kept;
 }
 
@@ -350,7 +370,7 @@ export function harnessFreeEnv(env: Environment, keepSecrets = false): Record<st
   const kept: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined || HARNESS_SESSION_KEYS.has(key)) continue;
-    if (!keepSecrets && SECRET_ENV.has(key)) continue;
+    if (!keepSecrets && isSecretEnv(key)) continue;
     if (key.startsWith("CLAUDE_CODE_") && !KEPT_CLAUDE_CODE_KEYS.has(key)) continue;
     kept[key] = value;
   }
