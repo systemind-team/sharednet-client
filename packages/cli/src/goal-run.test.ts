@@ -167,7 +167,7 @@ describe("a turn", () => {
     expect(opening).toContain('Say "DONE" in the Room only when you believe the goal is met');
     expect(opening).toContain("Do not run `sharednet wait`");
     // Each Agent has a container of its own, so it is told what it shares and what it does not.
-    expect(opening).toContain("You share this directory (/workspace) with the others, and only this one");
+    expect(opening).toContain("You share this workspace (/workspace) with the others. Each seat has its own HOME and harness session");
     const wake = wakePrompt({
       wake_id: "wk_1",
       fired: ["message"],
@@ -250,10 +250,13 @@ describe("prepareRun", () => {
 });
 
 describe("runGoal", () => {
-  it.each([["board", false, false], ["compiled", false, false], ["board", true, false], ["board", false, true], ["board", true, true]] as const)("runs every %s seat with mention=%s task=%s until the budget is spent and keeps credentials private", async (roomType, mentionGate, taskGate) => {
+  it.each((["per-agent", "shared"] as const).flatMap(topology => ([["board", false, false], ["compiled", false, false], ["board", true, false], ["board", false, true], ["board", true, true]] as const).map(row => [...row, topology] as const)))("runs every %s seat with mention=%s task=%s until the budget is spent and keeps credentials private", async (roomType, mentionGate, taskGate, topology) => {
+    const agentContainer = (name: string) => containerName(ROOM, topology === "shared" ? "agents" : name);
+    const agentContainers = [...new Set([agentContainer("codex-1"), agentContainer("codex-2")])];
     const out = await temporary();
     const workspace = await temporary();
     const plan: RunPlan = {
+      containerTopology: topology,
       image: DEFAULT_IMAGE,
       agents: parseAgents(["codex:gpt-6-luna", "codex"]),
       workspace,
@@ -411,31 +414,31 @@ describe("runGoal", () => {
     // Each Agent runs in its own container and the checks in one more; every one mounts the shared workspace.
     const runs = calls.filter((call) => call.args[0] === "run");
     const named = (name: string) => runs.find((call) => call.args[call.args.indexOf("--name") + 1] === name)!;
-    expect(runs.map((call) => call.args[call.args.indexOf("--name") + 1])).toEqual([containerName(ROOM), containerName(ROOM, "codex-1"), containerName(ROOM, "codex-2")]);
+    expect(runs.map((call) => call.args[call.args.indexOf("--name") + 1])).toEqual([containerName(ROOM), ...agentContainers]);
     expect(runs.every((call) => call.args.includes(`${workspace}:/workspace`))).toBe(true);
     // The Codex login is mounted for the Codex seats, and never for the checks.
-    expect(named(containerName(ROOM, "codex-1")).args).toContain("/Users/someone/.codex/auth.json:/run/codex/auth.json");
+    expect(named(agentContainer("codex-1")).args).toContain("/Users/someone/.codex/auth.json:/run/codex/auth.json");
     expect(named(containerName(ROOM)).args.join(" ")).not.toContain("auth.json");
     // Everything a seat runs, its join, its turns, its waits, runs in that seat's container alone.
     const asSeat = (memberId: string) => calls.filter((call) => call.args.includes(`SHAREDNET_SEAT=${memberId}`));
     expect(asSeat("i_CodexTwo02").length).toBeGreaterThan(0);
-    expect(asSeat("i_CodexTwo02").every((call) => call.args.includes(containerName(ROOM, "codex-2")))).toBe(true);
-    expect(asSeat("i_CodexOne01").every((call) => call.args.includes(containerName(ROOM, "codex-1")))).toBe(true);
+    expect(asSeat("i_CodexTwo02").every((call) => call.args.includes(agentContainer("codex-2")))).toBe(true);
+    expect(asSeat("i_CodexOne01").every((call) => call.args.includes(agentContainer("codex-1")))).toBe(true);
     // Each Agent's container gets its own forwarder and its own sharednet command.
     const forwarders = calls.filter((call) => call.args[0] === "exec" && call.args.includes("--detach"));
     const target = (call: DockerCall) => call.args.find((arg) => arg.startsWith(containerName(ROOM)));
-    expect(forwarders.map(target)).toEqual([containerName(ROOM, "codex-1"), containerName(ROOM, "codex-2")]);
+    expect(forwarders.map(target)).toEqual(agentContainers);
     const installs = calls.filter((call) => call.args.join(" ").includes("cat > /usr/local/bin/sharednet"));
-    expect(installs.map(target)).toEqual([containerName(ROOM, "codex-1"), containerName(ROOM, "codex-2")]);
+    expect(installs.map(target)).toEqual(agentContainers);
     // Every container is stopped, each home is copied out of its own Agent's container, and every container is removed.
     const kinds = calls.map((call) => call.args[0]);
     expect(kinds.lastIndexOf("stop")).toBeLessThan(kinds.indexOf("cp"));
-    expect(calls.find((call) => call.args[0] === "stop")!.args).toEqual(["stop", "--time", "5", ...runContainers(ROOM, plan.agents)]);
+    expect(calls.find((call) => call.args[0] === "stop")!.args).toEqual(["stop", "--time", "5", ...runContainers(ROOM, plan.agents, topology)]);
     expect(calls.filter((call) => call.args[0] === "cp").map((call) => call.args[1])).toEqual([
-      `${containerName(ROOM, "codex-1")}:/home/agents/codex-1`,
-      `${containerName(ROOM, "codex-2")}:/home/agents/codex-2`,
+      `${agentContainer("codex-1")}:/home/agents/codex-1`,
+      `${agentContainer("codex-2")}:/home/agents/codex-2`,
     ]);
-    expect(calls.at(-1)!.args).toEqual(["rm", "--force", ...runContainers(ROOM, plan.agents)]);
+    expect(calls.at(-1)!.args).toEqual(["rm", "--force", ...runContainers(ROOM, plan.agents, topology)]);
 
     // The record: one line per turn, each Agent's stream and home, the token totals.
     const wakes = (await readFile(join(out, "wakes.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
@@ -447,25 +450,30 @@ describe("runGoal", () => {
     await expect(readFile(join(home, ".codex", "auth.json"))).rejects.toThrow();
     await expect(readFile(join(home, ".config", "sharednet", "rooms", "seat.json"))).rejects.toThrow();
     const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
-    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", turn_limit_s: 1200, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
+    expect(episode).toMatchObject({ container_topology: topology, agent_containers: agentContainers, checks_container: containerName(ROOM), image: DEFAULT_IMAGE, web_search: "live", turn_limit_s: 1200, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
     expect(episode.agents).toHaveLength(2);
   });
 });
 
 describe("a check", () => {
-  it("runs in the checks' own container, on the shared workspace, under no Agent's home", async () => {
+  it.each([
+    ["per-agent", ["claude-code"]],
+    ["shared", ["claude-code", "codex", "codex", "codex"]],
+    ["shared", ["codex", "codex", "codex", "claude-code"]],
+  ] as const)("runs an independent check with %s containers and seats %j", async (topology, drivers) => {
     const out = await temporary();
     const workspace = await temporary();
     const plan: RunPlan = {
       image: DEFAULT_IMAGE,
-      agents: parseAgents(["claude-code"]),
+      containerTopology: topology,
+      agents: parseAgents(drivers),
       workspace,
       cli: { root: "/opt/cli", entry: "src/main.ts" },
-      codexAuth: null,
+      codexAuth: { kind: "login", file: "/synthetic/codex-auth.json" },
       claudeAuth: "ANTHROPIC_API_KEY",
     };
     const { docker, calls } = fakeDocker((_call, command) => {
-      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_ClaudeOne01" }) };
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: `i_${command[command.indexOf("--name") + 1]}` }) };
       if (command[0] === "sharednet" && command[1] === "wait") {
         return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [{ kind: "closed" }], messages: [] }) };
       }
@@ -509,14 +517,24 @@ describe("a check", () => {
     // The checks' container has the shared workspace and nothing an Agent holds: no CLI, no sign-in.
     const checker = calls.find((call) => call.args[0] === "run" && call.args.includes(containerName(ROOM)))!;
     expect(checker.args).toEqual(["run", "--detach", "--name", containerName(ROOM), "--volume", `${workspace}:/workspace`, DEFAULT_IMAGE, "sleep", "infinity"]);
-    expect(calls.at(-1)!.args).toEqual(["rm", "--force", containerName(ROOM, "claude-code-1"), containerName(ROOM)]);
+    const homes = calls.filter(call => call.args.includes("join")).map(call => call.args.find(arg => arg.startsWith("HOME=")));
+    expect(new Set(homes).size).toBe(drivers.length);
+    expect(calls.filter(call => call.args[0] === "cp")).toHaveLength(drivers.length);
+    if (topology === "shared") {
+      expect(calls.filter(call => call.args[0] === "run")).toHaveLength(2);
+      const agentRun = calls.find(call => call.args[0] === "run" && call.args.includes(containerName(ROOM, "agents")))!;
+      expect(agentRun.args).toContain("/synthetic/codex-auth.json:/run/codex/auth.json");
+      expect(calls.filter(call => call.input?.includes("permissionDecision: 'deny'"))).toHaveLength(1);
+    }
+    expect(calls.at(-1)!.args).toEqual(["rm", "--force", ...runContainers(ROOM, plan.agents, topology)]);
   });
 });
 
 describe("a start that fails", () => {
-  it("closes the Room it opened, says why, and leaves no container", async () => {
+  it.each(["per-agent", "shared"] as const)("closes a failed %s start and leaves no container", async topology => {
     const out = await temporary();
     const plan: RunPlan = {
+      containerTopology: topology,
       image: DEFAULT_IMAGE,
       agents: parseAgents(["codex"]),
       workspace: out,
@@ -542,7 +560,7 @@ describe("a start that fails", () => {
       }),
     ).rejects.toMatchObject({ code: "join_failed" });
     expect(closes).toEqual([{ detail: expect.stringContaining("goal run could not start: codex-1 could not join the Room") }]);
-    expect(calls.at(-1)!.args).toEqual(["rm", "--force", ...runContainers(ROOM, plan.agents)]);
+    expect(calls.at(-1)!.args).toEqual(["rm", "--force", ...runContainers(ROOM, plan.agents, topology)]);
     // A key-signed Codex seat gets its key from the Docker client's environment, never from an argument.
     expect(calls.some((call) => call.args.includes("OPENAI_API_KEY"))).toBe(true);
   });

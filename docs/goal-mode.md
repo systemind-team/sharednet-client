@@ -99,9 +99,31 @@ the Room, and package registries.
 `1m`). An experiment that wants only the Room's own end to stop an agent sets it to its
 `after`. `episode.json` records it as `turn_limit_s`.
 
+### Experimental container topology
+
+`--container-topology per-agent` is the default. `--container-topology shared`
+puts all agent seats in one container, each with its own HOME, harness state,
+Room identity and resumed session. Both modes keep the checker in an additional,
+independent container: four agents therefore use five containers by default or
+two in shared mode. A common Codex login is reused across seats in either mode.
+
+This option changes container placement only. The prompts, model selection,
+turns, routing, workspace mount and checks are identical between modes. The
+opening prompt describes separate homes and the shared workspace in both arms.
+Shared mode provides no filesystem or process isolation between agents; separate
+homes are state organization, not a security boundary. It is intended for trusted
+same-owner experiments. It does not impose per-agent CPU or memory limits.
+
+`episode.json` records `container_topology`, `agent_containers`, and
+`checks_container`. Per-seat traces remain under `agents/<seat>/`, and each
+seat's home is copied out and scrubbed independently before container removal.
+Use separate copies of the same starting workspace, the same image/model/goal,
+and equal limits when comparing arms. Real model runs are required to compare
+quality or runtime; unit tests only verify lifecycle and identity routing.
+
 ## What happens during a run
 
-- **Each agent has its own container; the workspace is shared.** Your directory is mounted at
+- **By default each agent has its own container; the workspace is shared.** Your directory is mounted at
   `/workspace` in every container, and everything the agents write there lands in your
   directory. Everything else in a container belongs to its agent alone: its processes, its
   home (session, sign-in, guest seat in the Room) and anything it installs outside
