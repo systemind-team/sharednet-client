@@ -611,7 +611,7 @@ export async function runGoal(
     `${plan.workspace}:${CONTAINER_WORKSPACE}`,
     "--volume",
     `${plan.cli.root}:${CONTAINER_CLI}:ro`,
-    ...(seat.driver === "codex" && plan.codexAuth?.kind === "login" ? ["--volume", `${plan.codexAuth.file}:${CONTAINER_CODEX_AUTH}`] : []),
+    ...(seat.driver === "codex" && plan.codexAuth?.kind === "login" ? ["--volume", `${plan.codexAuth.file}:${CONTAINER_CODEX_AUTH}:ro`] : []),
     plan.image,
     "sleep",
     "infinity",
@@ -696,13 +696,17 @@ export async function runGoal(
         }
       }
       const home = `${CONTAINER_HOMES}/${seat.name}`;
-      const setup =
-        seat.driver === "codex"
-          ? plan.codexAuth?.kind === "login"
-            ? `mkdir -p ${home}/.codex && ln -sf ${CONTAINER_CODEX_AUTH} ${home}/.codex/auth.json`
-            : `mkdir -p ${home}/.codex && printf '{"OPENAI_API_KEY": "%s"}' "$OPENAI_API_KEY" > ${home}/.codex/auth.json && chmod 600 ${home}/.codex/auth.json`
-          : `mkdir -p ${home}`;
-      const prepared = await exec(seat, ["sh", "-c", setup]);
+      const prepared = seat.driver === "codex" && plan.codexAuth?.kind === "login"
+        ? await docker([
+            "exec", "--user", "root", container, "sh", "-c",
+            `mkdir -p '${home}/.codex' && cp ${CONTAINER_CODEX_AUTH} '${home}/.codex/auth.json' && chown -R ${AGENT_USER} '${home}' && chmod 600 '${home}/.codex/auth.json'`,
+          ])
+        : await exec(seat, [
+            "sh", "-c",
+            seat.driver === "codex"
+              ? `mkdir -p ${home}/.codex && printf '{"OPENAI_API_KEY": "%s"}' "$OPENAI_API_KEY" > ${home}/.codex/auth.json && chmod 600 ${home}/.codex/auth.json`
+              : `mkdir -p ${home}`,
+          ]);
       if (prepared.code !== 0) throw localError("container_failed", `${seat.name}'s home could not be made: ${prepared.stderr.trim()}`);
       // The driver's own marker names the seat's runtime on the Web; the invite travels by environment.
       const marker: Record<string, string> = seat.driver === "codex" ? { CODEX_SESSION_ID: `goal-${seat.name}` } : { CLAUDECODE: "1" };

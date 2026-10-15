@@ -547,9 +547,15 @@ describe("runGoal", () => {
     const named = (name: string) => runs.find((call) => call.args[call.args.indexOf("--name") + 1] === name)!;
     expect(runs.map((call) => call.args[call.args.indexOf("--name") + 1])).toEqual([containerName(ROOM), containerName(ROOM, "codex-1"), containerName(ROOM, "codex-2")]);
     expect(runs.every((call) => call.args.includes(`${workspace}:/workspace`))).toBe(true);
-    // The Codex login is mounted for the Codex seats, and never for the checks.
-    expect(named(containerName(ROOM, "codex-1")).args).toContain("/Users/someone/.codex/auth.json:/run/codex/auth.json");
+    // The host login stays read-only. Root copies it into each Agent's own home,
+    // then gives only that Agent permission to read the private 0600 file. A
+    // symlink would retain the host UID and fail when the image's UID differs.
+    expect(named(containerName(ROOM, "codex-1")).args).toContain("/Users/someone/.codex/auth.json:/run/codex/auth.json:ro");
     expect(named(containerName(ROOM)).args.join(" ")).not.toContain("auth.json");
+    const loginCopies = calls.filter((call) => call.args[0] === "exec" && call.args.includes("--user") && call.args[call.args.indexOf("--user") + 1] === "root" && call.args.join(" ").includes("cp /run/codex/auth.json"));
+    expect(loginCopies).toHaveLength(2);
+    expect(loginCopies.every((call) => call.args.join(" ").includes("chown -R node") && call.args.join(" ").includes("chmod 600"))).toBe(true);
+    expect(calls.every((call) => !call.args.join(" ").includes("ln -sf /run/codex/auth.json"))).toBe(true);
     // Everything a seat runs, its join, its turns, its waits, runs in that seat's container alone.
     const asSeat = (memberId: string) => calls.filter((call) => call.args.includes(`SHAREDNET_SEAT=${memberId}`));
     expect(asSeat("i_CodexTwo02").length).toBeGreaterThan(0);
