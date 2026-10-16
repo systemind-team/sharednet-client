@@ -156,7 +156,7 @@ describe("goal watch", () => {
     });
     // The scheduled check fails; the first claim's check fails; the second claim's passes.
     const outcomes = [{ exitCode: 1, output: "W3 fails" }, { exitCode: 1, output: "W3 fails" }, { exitCode: 0, output: "all pass" }];
-    const result = await goalWatch(client, "sni_member", "snk_owner", { roomId: ROOM, workspace: out, out, checkEveryMs: 3_600_000, quietChecks: false }, {
+    const result = await goalWatch(client, "sni_member", "snk_owner", { roomId: ROOM, workspace: out, out, checkEveryMs: 3_600_000, quietChecks: false, feedbackMention: "i_leader0001" }, {
       now: clock(),
       sleep: async () => undefined,
       check: async () => outcomes.shift() ?? { exitCode: 1, output: "" },
@@ -165,6 +165,7 @@ describe("goal watch", () => {
     const said = calls.filter((call) => call.path.endsWith("/owner-messages"));
     expect(said).toHaveLength(1);
     expect(said[0]!.body).toMatchObject({ as: "runner" });
+    expect((said[0]!.body as { content: string }).content).toMatch(/^@i_leader0001 /);
     expect((said[0]!.body as { content: string }).content).toContain("#2 says done");
     expect((said[0]!.body as { content: string }).content).toContain("W3 fails");
     // The runner's own line did not count as a claim; the second claim ended it, through the check.
@@ -181,6 +182,32 @@ describe("goal watch", () => {
     });
     expect(result.ended_by).toMatchObject({ trigger: "said DONE" });
     expect(quiet.calls.some((call) => call.path.endsWith("/owner-messages"))).toBe(false);
+  });
+
+  it("records runner machinery but does not let it satisfy message, said, or count triggers", async () => {
+    const out = await temporary();
+    const { client } = fakeRoom({
+      until: ["message", "said START", "count 1", "after 1h"],
+      pages: [
+        [{ sequence: 2, content: "START Goal #1", sender: HUMAN }],
+        [{ sequence: 3, content: "agent result", sender: AGENT }],
+      ],
+    });
+    const result = await goalWatch(client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: out,
+      out,
+      checkEveryMs: 60_000,
+      quietChecks: true,
+      ignoreThrough: 2,
+    }, {
+      now: clock(),
+      sleep: async () => undefined,
+      snapshot: null,
+    });
+    expect(result.ended_by).toMatchObject({ trigger: "message", detail: "agent result" });
+    const log = (await readFile(join(out, "room.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line).sequence);
+    expect(log).toEqual([2, 3]);
   });
 
   it("notices an end the service made by itself, and does not close it again", async () => {
