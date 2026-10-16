@@ -21,7 +21,7 @@ export function validTurnLimit(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 60_000 && value <= 24 * 60 * 60_000;
 }
 
-export type WakeDriver = "codex" | "claude-code" | "codebuddy" | "command";
+export type WakeDriver = "codex" | "claude-code" | "codebuddy" | "manus" | "command";
 
 export interface SeatWake {
   driver: WakeDriver;
@@ -45,6 +45,11 @@ export interface SeatWake {
    * which holds the session. A resume finds a session only under the directory it was made in.
    */
   config_dir?: string;
+  /**
+   * Manus (wake-manus.ts): the NAME of the environment variable that holds the API key in the process
+   * that runs `serve`. The key itself is never written to a seat file.
+   */
+  api_key_env?: string;
 }
 
 /** What one wake is about: where it was said, by whom, and the two prompts a plugin may hand on. */
@@ -68,6 +73,18 @@ export interface DeliveryContext {
   /** Whether a chat's process is still open. Tests replace it. */
   chatOpen: (pid: number) => boolean;
   timeoutMs: number;
+  /** Aborts when serve is stopping; an API plugin that waits must end its waiting and its requests. */
+  signal?: AbortSignal;
+  /** For a plugin that talks to an HTTP API instead of running a program. Tests replace it. */
+  api?: PluginNet;
+}
+
+/** What an API plugin needs from the outside world; each defaults to the real one. */
+export interface PluginNet {
+  fetch?: typeof globalThis.fetch;
+  /** Sleeps, and ends early (resolves) when the signal aborts. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  now?: () => number;
 }
 
 /**
@@ -109,6 +126,8 @@ export interface CheckOptions {
    * so only `sharednet wake check` asks for it; serve's start takes the steps that cost none.
    */
   call: boolean;
+  /** For a plugin that talks to an HTTP API instead of running a program. Tests replace it. */
+  api?: PluginNet;
 }
 
 export interface WakePlugin {
@@ -308,10 +327,50 @@ const HARNESS_SESSION_KEYS = new Set([
 // CLAUDE_CODE_* is mostly the host session's own wiring; these few are how a person signs in.
 const KEPT_CLAUDE_CODE_KEYS = new Set(["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"]);
 
-export function harnessFreeEnv(env: Environment): Record<string, string> {
+// The Manus API key (wake-manus.ts) is a credential only that plugin's own HTTP calls may read. On a machine
+// that holds a Manus seat, the variables those seats keep it in are withheld from every program started for a
+// seat (a resumed Codex or Claude turn, a `command` adapter, a `--run` command, the probes of a check): any of
+// them could otherwise read or print it. On a machine with no Manus seat nothing is withheld, so every program
+// gets exactly the environment it got before this plugin existed. A name is registered when a Manus seat is
+// read (wake-plugins.ts parseSeatWake); guest.ts reads every seat right before it starts such a program.
+// Only MANUS_API_KEY and MANUS_API_KEY_<SUFFIX> can be registered (`wake set manus --key-env` takes no other),
+// so a seat can never take a variable that Codex or Claude needs (OPENAI_API_KEY, PATH) away from them.
+const API_KEY_NAME = /^MANUS_API_KEY(?:_[A-Z0-9_]+)?$/i;
+/** Upper-cased: a Windows environment is read without regard to case, so it is withheld that way too. */
+const SECRET_ENV = new Set<string>();
+
+/** Whether an environment holds a variable a Manus seat could keep its key in: if not, there is nothing to withhold. */
+export function mayHoldApiKey(env: Environment): boolean {
+  for (const [key, value] of Object.entries(env)) if (value !== undefined && API_KEY_NAME.test(key)) return true;
+  return false;
+}
+
+/** A Manus seat keeps its key in this variable: from now on, in this process, no program started for a seat gets it. */
+export function withholdSecretEnv(name: string): void {
+  if (API_KEY_NAME.test(name)) SECRET_ENV.add(name.toUpperCase());
+}
+
+/** The variables the Manus seats on this machine name, read just now from every seat: exactly these are withheld. */
+export function setWithheldSecretEnv(names: Iterable<string>): void {
+  SECRET_ENV.clear();
+  for (const name of names) withholdSecretEnv(name);
+}
+
+const isSecretEnv = (key: string) => SECRET_ENV.size > 0 && SECRET_ENV.has(key.toUpperCase());
+
+/** The environment without the credentials of this machine's Manus seats; with no such seat, all of it. */
+export function withoutSecrets<T extends Environment>(env: T): Record<string, string> {
+  const kept: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) if (value !== undefined && !isSecretEnv(key)) kept[key] = value;
+  return kept;
+}
+
+/** `keepSecrets` is for the one process that is the credential's owner: the `serve` a join starts. */
+export function harnessFreeEnv(env: Environment, keepSecrets = false): Record<string, string> {
   const kept: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined || HARNESS_SESSION_KEYS.has(key)) continue;
+    if (!keepSecrets && isSecretEnv(key)) continue;
     if (key.startsWith("CLAUDE_CODE_") && !KEPT_CLAUDE_CODE_KEYS.has(key)) continue;
     kept[key] = value;
   }
@@ -468,7 +527,7 @@ export function startWakeService(input: { env: Environment; logFile: string; ent
     const child = spawn(input.execPath, [...input.execArgv, input.entry, "serve"], {
       detached: true,
       stdio: ["ignore", log, log],
-      env: harnessFreeEnv(input.env) as NodeJS.ProcessEnv,
+      env: harnessFreeEnv(input.env, true) as NodeJS.ProcessEnv,
       cwd: homedir(),
     });
     child.unref();

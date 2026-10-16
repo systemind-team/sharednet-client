@@ -12,7 +12,7 @@ import { runCli } from "./cli.ts";
 import type { CommandRunner } from "./guest.ts";
 import { processAlive, systemProcessProbe, type ProcessProbe } from "./process-identity.ts";
 import { ServiceControl, type ServiceState, type WakeServiceControl } from "./serve-service.ts";
-import type { CheckOptions, CheckResult, CheckStep, SeatWake, TurnRunner, TurnSpec } from "./wake-driver.ts";
+import { startWakeService, type CheckOptions, type CheckResult, type CheckStep, type SeatWake, type TurnRunner, type TurnSpec } from "./wake-driver.ts";
 
 const cleanup: string[] = [];
 
@@ -2030,6 +2030,360 @@ describe("sharednet say and wait", () => {
       expect(result.stderr).toContain("finished its turn: @host 2+2 is 4.");
     });
 
+    // The Manus plugin (#31) and everyone else. With no Manus seat on the machine, every program serve, join,
+    // `wake check` and `--run` start gets exactly what it got before the plugin, MANUS_API_KEY included.
+    describe("with the Manus plugin present, a machine with no Manus seat runs exactly as before", () => {
+      const MANUS_ENV = { MANUS_API_KEY: "synthetic-manus-default", MANUS_API_KEY_TEAM: "synthetic-manus-team" };
+      afterEach(() => {
+        vi.unstubAllEnvs();
+        vi.unstubAllGlobals();
+      });
+
+      it("serve: hands a resumed Codex turn the same environment, MANUS_API_KEY included, and talks to the Room in the same order", async () => {
+        const space = await workspace();
+        expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+        const { turns, runTurn } = turnsOf();
+        const service = { delivered_through: 1, acked_through: 1 };
+        const environment = {
+          ...CODEX,
+          ...MANUS_ENV,
+          PATH: "/usr/bin",
+          OPENAI_API_KEY: "synthetic-openai",
+          CLAUDE_CODE_OAUTH_TOKEN: "synthetic-oauth",
+          CLAUDE_CODE_ENTRYPOINT: "cli",
+          HTTPS_PROXY: "http://127.0.0.1:3128",
+        };
+        const result = await run(["serve", "--json"], space, [
+          page([addressed(2, "@codex hi")]),
+          page([addressed(2, "@codex hi")]),
+          { status: 201, body: { message: own(3, "@host 2+2 is 4.") } },
+          revoked(),
+        ], environment, { service, runTurn });
+        expect(result.exitCode).toBe(0);
+        expect(turns).toHaveLength(1);
+        // The same test passes unchanged on codex/bootstrap-base (194ad3c): harness markers and CLAUDE_CODE_*
+        // wiring dropped, sign-in variables and the Manus ones kept, the seat named.
+        expect(turns[0]!.env).toEqual({
+          HOME: space.env.HOME,
+          XDG_CONFIG_HOME: space.env.XDG_CONFIG_HOME,
+          XDG_STATE_HOME: space.env.XDG_STATE_HOME,
+          CODEX_HOME: "/codex-home",
+          PATH: "/usr/bin",
+          OPENAI_API_KEY: "synthetic-openai",
+          CLAUDE_CODE_OAUTH_TOKEN: "synthetic-oauth",
+          HTTPS_PROXY: "http://127.0.0.1:3128",
+          MANUS_API_KEY: "synthetic-manus-default",
+          MANUS_API_KEY_TEAM: "synthetic-manus-team",
+          SHAREDNET_SEAT: MEMBER_ID,
+        });
+        expect(result.requests.map((request) => `${request.init.method ?? "GET"} ${new URL(request.url).pathname}`)).toEqual([
+          `GET /api/v1/rooms/${ROOM_ID}/wait`,
+          `GET /api/v1/rooms/${ROOM_ID}/messages`,
+          `POST /api/v1/rooms/${ROOM_ID}/messages`,
+          `GET /api/v1/rooms/${ROOM_ID}/wait`,
+        ]);
+        expect(result.acks).toEqual([2]);
+      });
+
+      it("join: starts serve, a real process, with the whole environment, MANUS_API_KEY included", async () => {
+        const space = await workspace();
+        const out = join(space.root, "serve-env.txt");
+        const result = await run(["join", PASTED_INVITE, "--json"], space, [joined([message(1, "Welcome")])], { ...CODEX, ...MANUS_ENV, PATH: process.env.PATH! }, {
+          // The real launcher, with a shell standing in for `node sharednet.js serve`: it writes what it was given.
+          startWakeService: (input) => startWakeService({ ...input, entry: "serve-stand-in", execPath: "/bin/sh", execArgv: ["-c", `env > '${out}.part' && mv '${out}.part' '${out}'`] }),
+        });
+        expect(result.exitCode).toBe(0);
+        const lines = await vi.waitFor(async () => (await readFile(out, "utf8")).split("\n"));
+        expect(lines).toContain("MANUS_API_KEY=synthetic-manus-default");
+        expect(lines).toContain("MANUS_API_KEY_TEAM=synthetic-manus-team");
+        expect(lines).toContain("CODEX_HOME=/codex-home");
+        expect(lines.some((line) => line.startsWith("CODEX_SESSION_ID="))).toBe(false);
+      });
+
+      it("wake check: hands the probes MANUS_API_KEY as before", async () => {
+        const space = await workspace();
+        expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+        const bin = await mkdtemp(join(tmpdir(), "sharednet-fake-codex-"));
+        cleanup.push(bin);
+        await writeFile(join(bin, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+        const { turns, runTurn } = turnsOf({ stdout: "codex 0.162.0" });
+        await run(["wake", "check", "--as", MEMBER_ID, "--json"], space, [], { ...CODEX, ...MANUS_ENV, PATH: bin, SAFE_VARIABLE: "kept" }, { runTurn, checkWake: undefined });
+        expect(turns.length).toBeGreaterThanOrEqual(1);
+        for (const turn of turns) expect(turn.env).toMatchObject({ ...MANUS_ENV, SAFE_VARIABLE: "kept", PATH: bin });
+      });
+
+      it("--run: starts a `watch --run` command, a real process, with this process's environment, MANUS_API_KEY included", async () => {
+        const space = await workspace();
+        expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
+        const out = join(space.root, "run-env.txt");
+        vi.stubEnv("MANUS_API_KEY", "synthetic-manus-default");
+        vi.stubEnv("MANUS_API_KEY_TEAM", "synthetic-manus-team");
+        vi.stubEnv("SHAREDNET_TEST_KEPT", "kept");
+        const result = await run(["watch", "--on", "message", "--run", `env > '${out}'`, "--max-runs", "1", "--json"], space, [page([message(2, "hi")])]);
+        expect(result.exitCode).toBe(0);
+        const lines = (await readFile(out, "utf8")).split("\n");
+        expect(lines).toContain("SHAREDNET_TEST_KEPT=kept");
+        expect(lines).toContain("MANUS_API_KEY=synthetic-manus-default");
+        expect(lines).toContain("MANUS_API_KEY_TEAM=synthetic-manus-team");
+      });
+    });
+
+    describe("on a machine with a Manus seat, no program started for a seat is given its key", () => {
+      afterEach(() => vi.unstubAllEnvs());
+
+      /** A Manus seat in another Room, as `wake set manus` leaves it. */
+      async function addManusSeat(space: Awaited<ReturnType<typeof workspace>>, keyEnv?: string) {
+        const rooms = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms");
+        const seat = JSON.parse(await readFile(join(rooms, ROOM_ID, `${MEMBER_ID}.json`), "utf8"));
+        await mkdir(join(rooms, "rom_ManusRoom1"), { recursive: true, mode: 0o700 });
+        await writeFile(
+          join(rooms, "rom_ManusRoom1", "i_ManusSeat9.json"),
+          JSON.stringify({ ...seat, room_id: "rom_ManusRoom1", member_id: "i_ManusSeat9", name: "manus", wake: { driver: "manus", cwd: space.project, command: "https://api.manus.ai", ...(keyEnv ? { api_key_env: keyEnv } : {}) } }),
+          { mode: 0o600 },
+        );
+      }
+
+      it("wake check on another seat, in a fresh process that was asked only about that seat", async () => {
+        const space = await workspace();
+        expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+        await addManusSeat(space, "MANUS_API_KEY_PROBE");
+        const bin = await mkdtemp(join(tmpdir(), "sharednet-fake-codex-"));
+        cleanup.push(bin);
+        await writeFile(join(bin, "codex"), "#!/bin/sh\n", { mode: 0o755 });
+        const { turns, runTurn } = turnsOf({ stdout: "codex 0.162.0" });
+        await run(["wake", "check", "--as", MEMBER_ID, "--json"], space, [], { ...CODEX, PATH: bin, MANUS_API_KEY: "kept-no-seat-names-it", MANUS_API_KEY_PROBE: "synthetic", SAFE_VARIABLE: "kept" }, { runTurn, checkWake: undefined });
+        expect(turns.length).toBeGreaterThanOrEqual(1);
+        for (const turn of turns) {
+          expect(turn.env).toMatchObject({ SAFE_VARIABLE: "kept", MANUS_API_KEY: "kept-no-seat-names-it" });
+          expect(turn.env).not.toHaveProperty("MANUS_API_KEY_PROBE");
+        }
+      });
+
+      it("a long-running `watch --run` withholds the key of a Manus seat set after it started (third review, 7)", async () => {
+        const space = await workspace();
+        expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
+        const out = join(space.root, "runs.txt");
+        vi.stubEnv("MANUS_API_KEY", "synthetic-manus-default");
+        // Between the two runs, `wake set manus` binds a seat on this machine (default key variable): the second
+        // page is answered once the seat file is written.
+        const later: ReturnType<typeof page> & { entered?: () => void; wait?: Promise<void> } = page([message(3, "second")]);
+        later.entered = () => (later.wait = addManusSeat(space));
+        const result = await run(["watch", "--on", "message", "--run", `{ echo ---; env; } >> '${out}'`, "--max-runs", "2", "--json"], space, [page([message(2, "first")]), later]);
+        expect(result.exitCode).toBe(0);
+        const [first, second] = (await readFile(out, "utf8")).split("---\n").filter(Boolean).map((run) => run.split("\n"));
+        expect(first).toContain("MANUS_API_KEY=synthetic-manus-default");
+        expect(second!.filter((line) => line.startsWith("MANUS_API_KEY"))).toEqual([]);
+      });
+    });
+
+    describe("the Manus plugin through serve (a stand-in for api.manus.ai; no network, key or account)", () => {
+      const MANUS_SEAT = "i_ManusSeat1";
+      const SECOND_ROOM = "rom_SecondRoom";
+      afterEach(() => vi.unstubAllGlobals());
+
+      /** A Manus seat in another Room on this machine, as `wake set manus` leaves it (no task id: each wake starts one). */
+      async function manusSeat(space: Awaited<ReturnType<typeof workspace>>) {
+        const rooms = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms");
+        const seat = JSON.parse(await readFile(join(rooms, ROOM_ID, `${MEMBER_ID}.json`), "utf8"));
+        await mkdir(join(rooms, SECOND_ROOM), { recursive: true, mode: 0o700 });
+        await writeFile(
+          join(rooms, SECOND_ROOM, `${MANUS_SEAT}.json`),
+          JSON.stringify({ ...seat, room_id: SECOND_ROOM, member_id: MANUS_SEAT, name: "manus", wake: { driver: "manus", cwd: space.project, command: "https://api.manus.ai" } }),
+          { mode: 0o600 },
+        );
+      }
+
+      it("sends the key in a header to api.manus.ai only, and posts the task's reply once", async () => {
+        const received: Array<{ origin: string; path: string; key: string | undefined }> = [];
+        let sent = "";
+        const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200, headers: { "content-type": "application/json" } });
+        vi.stubGlobal("fetch", async (target: string | URL, init: RequestInit = {}) => {
+          const url = new URL(String(target));
+          received.push({ origin: url.origin, path: url.pathname, key: (init.headers as Record<string, string>)["x-manus-api-key"] });
+          if (url.pathname === "/v2/task.create") {
+            sent = JSON.parse(String(init.body)).message.content;
+            return json({ ok: true, task_id: "taskStandIn000000000001", task_url: "https://manus.im/app/taskStandIn000000000001" });
+          }
+          if (url.pathname === "/v2/task.listMessages") {
+            return json({ ok: true, has_more: false, messages: [
+              { id: "s3", type: "status_update", timestamp: 13, status_update: { agent_status: "stopped" } },
+              { id: "a2", type: "assistant_message", timestamp: 12, assistant_message: { content: "MANUS-OK", delivery_kind: "result" } },
+              { id: "u1", type: "user_message", timestamp: 11, user_message: { content: sent } },
+            ] });
+          }
+          if (url.pathname === "/v2/task.detail") return json({ ok: true, task: { id: "taskStandIn000000000001", status: "stopped", has_running_background_jobs: false } });
+          throw new Error(`unscripted ${url.pathname}`);
+        });
+        const space = await workspace();
+        expect((await run(["join", PASTED_INVITE, "--no-wake"], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
+        const env = { MANUS_API_KEY_STANDIN: "synthetic-key-not-a-secret" };
+        expect((await run(["wake", "set", "manus", "--key-env", "MANUS_API_KEY_STANDIN", "--json"], space, [], env)).exitCode).toBe(0);
+        const result = await run(["serve", "--json"], space, [
+          page([addressed(2, "@manus say MANUS-OK")]),
+          page([addressed(2, "@manus say MANUS-OK")]),
+          { status: 201, body: { message: own(3, "MANUS-OK") } },
+          revoked(),
+        ], env, { service: { delivered_through: 1, acked_through: 1 } });
+        expect(result.exitCode).toBe(0);
+        expect(received.filter((call) => call.path === "/v2/task.create")).toHaveLength(1);
+        expect(received.every((call) => call.origin === "https://api.manus.ai" && call.key === "synthetic-key-not-a-secret")).toBe(true);
+        const posted = result.requests.filter((request) => request.init.method === "POST");
+        expect(posted).toHaveLength(1);
+        expect(JSON.parse(String(posted[0]!.init.body)).content).toBe("MANUS-OK");
+        expect(result.acks).toEqual([2]);
+      }, 30_000);
+
+      // Third review, 6: a malformed 2xx used to throw a TypeError in the plugin, and a throw that is not a
+      // CliError ends serve for every seat. Each of these is now this one wake's clean failure.
+      it.each([
+        ["200 null", () => new Response("null", { status: 200, headers: { "content-type": "application/json" } })],
+        ["200 non-JSON", () => new Response("<html>proxy login</html>", { status: 200, headers: { "content-type": "text/html" } })],
+        ["200 array", () => new Response("[]", { status: 200 })],
+        ["200 without a task id", () => new Response('{"ok":true}', { status: 200 })],
+        ["a network error", () => Promise.reject(new TypeError("fetch failed"))],
+      ])("keeps serving when Manus answers task.create with %s: the seat says it failed, once, and nothing is sent again", async (_, answer) => {
+        const calls: string[] = [];
+        vi.stubGlobal("fetch", async (target: string | URL) => {
+          calls.push(new URL(String(target)).pathname);
+          return answer();
+        });
+        const space = await workspace();
+        expect((await run(["join", PASTED_INVITE, "--no-wake"], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
+        expect((await run(["wake", "set", "manus", "--json"], space, [], {})).exitCode).toBe(0);
+        const result = await run(["serve", "--json"], space, [
+          page([addressed(2, "@manus go")]),
+          page([addressed(2, "@manus go")]),
+          { status: 201, body: { message: own(3, "notice") } },
+          page([addressed(4, "@manus again")]),
+          page([addressed(4, "@manus again")]),
+          { status: 201, body: { message: own(5, "notice") } },
+          revoked(),
+        ], { MANUS_API_KEY: "synthetic-key-not-a-secret" }, { service: { delivered_through: 1, acked_through: 1 } });
+        expect(result.exitCode).toBe(0);
+        // Both wakes were handled (serve lived through the first), one create each: an unclear write is not repeated.
+        expect(calls).toEqual(["/v2/task.create", "/v2/task.create"]);
+        const notices = result.requests.filter((request) => request.init.method === "POST").map((request) => JSON.parse(String(request.init.body)).content as string);
+        expect(notices).toHaveLength(2);
+        for (const notice of notices) expect(notice).toMatch(/^\(claude-code was addressed, but its Manus session could not be resumed: /);
+        expect(notices.join(" ")).not.toContain("synthetic-key-not-a-secret");
+        expect(result.acks).toEqual([2, 4]);
+      });
+
+      it("keeps serving another seat when Manus answers with a malformed 2xx (third review, 6), and keeps the Manus seat too", async () => {
+        const space = await workspace();
+        expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+        await manusSeat(space);
+        let manusAsked!: () => void;
+        const manusStarted = new Promise<void>((resolve) => (manusAsked = resolve));
+        const manusCalls: string[] = [];
+        vi.stubGlobal("fetch", async (target: string | URL) => {
+          manusCalls.push(new URL(String(target)).pathname);
+          manusAsked();
+          return new Response("null", { status: 200, headers: { "content-type": "application/json" } });
+        });
+        const posted: Array<{ room: string; content: string }> = [];
+        const waits = new Map<string, number>();
+        const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+        const sharednet = async (target: string | URL | Request, init: RequestInit = {}) => {
+          const url = new URL(String(target));
+          const place = /\/rooms\/(rom_[A-Za-z0-9]+)\/(subscription|ack)$/.exec(url.pathname);
+          if (place) return json(200, { subscription: { room_id: place[1], delivered_through: 1, acked_through: 1 } });
+          const waited = /\/rooms\/(rom_[A-Za-z0-9]+)\/wait$/.exec(url.pathname)?.[1];
+          const room = /\/rooms\/(rom_[A-Za-z0-9]+)\/messages$/.exec(url.pathname)?.[1];
+          if (room && init.method === "POST") {
+            posted.push({ room, content: JSON.parse(String(init.body)).content });
+            return json(201, { message: own(3, "posted") });
+          }
+          const which = waited ?? room;
+          const who = which === ROOM_ID ? MEMBER_ID : MANUS_SEAT;
+          if (waited) {
+            const n = (waits.get(waited) ?? 0) + 1;
+            waits.set(waited, n);
+            // The Codex seat is addressed only once Manus has been asked (and has answered with null).
+            if (n === 1 && waited === ROOM_ID) await manusStarted;
+            if (n === 1) return json(200, { items: [{ ...message(2, "go"), mentions: [who] }], next_cursor: null, has_more: false });
+            return json(401, revoked().body);
+          }
+          if (room) return json(200, { items: [{ ...message(2, "go"), mentions: [who] }], next_cursor: null, has_more: false });
+          throw new Error(`unexpected ${init.method ?? "GET"} ${url.pathname}`);
+        };
+        const { turns, runTurn } = turnsOf();
+        const result = await run(["serve", "--json"], space, [], { ...CODEX, MANUS_API_KEY: "synthetic-key-not-a-secret" }, { fetch: sharednet as typeof globalThis.fetch, runTurn });
+        // serve ran both seats to their own ends (each Room refused the seat), rather than dying with a TypeError.
+        expect(result.exitCode).toBe(0);
+        expect(turns).toHaveLength(1);
+        expect(posted).toContainEqual({ room: ROOM_ID, content: "@host 2+2 is 4." });
+        expect(manusCalls).toEqual(["/v2/task.create"]);
+        expect(posted.find((item) => item.room === SECOND_ROOM)?.content).toMatch(/^\(manus was addressed, but its Manus session could not be resumed: Manus task creation may or may not have gone through .*; not sent again\)$/);
+        expect(waits.get(SECOND_ROOM)).toBe(2);
+      }, 30_000);
+
+      it("serves another seat while a Manus delivery is waiting on Manus, and serve's stop ends that wait", async () => {
+        const space = await workspace();
+        expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
+        await manusSeat(space);
+        const stopper = new AbortController();
+        let manusPending = false;
+        let manusAborted = false;
+        let manusAsked!: () => void;
+        const manusStarted = new Promise<void>((resolve) => (manusAsked = resolve));
+        // Manus takes the create and never answers: only the request's own signal ends it.
+        vi.stubGlobal("fetch", (_: string | URL, init: RequestInit = {}) => {
+          manusPending = true;
+          manusAsked();
+          return new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => {
+              manusPending = false;
+              manusAborted = true;
+              reject(new Error("aborted"));
+            }, { once: true });
+          });
+        });
+        const posted: Array<{ room: string; content: string; manusPending: boolean }> = [];
+        const waits = new Map<string, number>();
+        const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+        const sharednet = async (target: string | URL | Request, init: RequestInit = {}) => {
+          const url = new URL(String(target));
+          const place = /\/rooms\/(rom_[A-Za-z0-9]+)\/(subscription|ack)$/.exec(url.pathname);
+          if (place) return json(200, { subscription: { room_id: place[1], delivered_through: 1, acked_through: 1 } });
+          const waited = /\/rooms\/(rom_[A-Za-z0-9]+)\/wait$/.exec(url.pathname)?.[1];
+          const room = /\/rooms\/(rom_[A-Za-z0-9]+)\/messages$/.exec(url.pathname)?.[1];
+          if (room && init.method === "POST") {
+            posted.push({ room, content: JSON.parse(String(init.body)).content, manusPending });
+            return json(201, { message: own(3, "posted") });
+          }
+          if (waited) {
+            const n = (waits.get(waited) ?? 0) + 1;
+            waits.set(waited, n);
+            const who = waited === ROOM_ID ? MEMBER_ID : MANUS_SEAT;
+            // The Codex seat is addressed only once the Manus delivery is waiting on Manus.
+            if (n === 1 && waited === ROOM_ID) await manusStarted;
+            if (n === 1) return json(200, { items: [{ ...message(2, "go"), mentions: [who] }], next_cursor: null, has_more: false });
+            // The Codex seat is done; stop serve while the Manus delivery still waits.
+            setTimeout(() => stopper.abort(), 0);
+            return json(401, revoked().body);
+          }
+          if (room) {
+            const who = room === ROOM_ID ? MEMBER_ID : MANUS_SEAT;
+            return json(200, { items: [{ ...message(2, "go"), mentions: [who] }], next_cursor: null, has_more: false });
+          }
+          throw new Error(`unexpected ${init.method ?? "GET"} ${url.pathname}`);
+        };
+        const { turns, runTurn } = turnsOf();
+        const result = await run(["serve", "--json"], space, [], { ...CODEX, MANUS_API_KEY: "synthetic-key-not-a-secret" }, { fetch: sharednet as typeof globalThis.fetch, runTurn, signal: stopper.signal });
+        expect(result.exitCode).toBe(0);
+        expect(turns).toHaveLength(1);
+        // The Codex seat's reply went out while the Manus request was still open.
+        expect(posted).toContainEqual({ room: ROOM_ID, content: "@host 2+2 is 4.", manusPending: true });
+        // serve's stop ended the Manus request; the create may have been taken, so it is reported, not sent again.
+        expect(manusAborted).toBe(true);
+        const notice = posted.find((item) => item.room === SECOND_ROOM);
+        expect(notice?.content).toContain("not sent again");
+        // No Codex turn was given the Manus key.
+        expect(turns[0]!.env).not.toHaveProperty("MANUS_API_KEY");
+      }, 30_000);
+    });
+
     it("posts nothing for a turn that ends with nothing to say", async () => {
       const space = await workspace();
       expect((await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX)).exitCode).toBe(0);
@@ -2633,6 +2987,40 @@ describe("sharednet say and wait", () => {
       const by = await run(["wake", "set", "codebuddy", "--resume", "wb-session-0002", "--config-dir", "/home/yu/.workbuddy", "--json"], space, [], { CODEBUDDY_SESSION_ID: "" });
       expect(JSON.parse(by.stdout).wake).toMatchObject({ driver: "codebuddy", session: "wb-session-0002", config_dir: "/home/yu/.workbuddy" });
       expect((await run(["wake", "set", "codex", "--resume", "019a", "--config-dir", "/x", "--json"], space, [])).exitCode).not.toBe(0);
+    });
+
+    it("binds a seat to a Manus task by hand, naming the key's variable and never holding the key", async () => {
+      const space = await workspace();
+      expect((await run(["join", PASTED_INVITE, "--no-wake"], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
+
+      // Nothing in a cloud task's environment says which task a process is, so the task id is given.
+      const set = await run(["wake", "set", "manus", "--resume", "task_synthetic_0001", "--key-env", "MANUS_API_KEY_TEAM", "--json"], space, []);
+      expect(JSON.parse(set.stdout).wake).toEqual({ driver: "manus", session: "task_synthetic_0001", cwd: space.project, command: "https://api.manus.ai", api_key_env: "MANUS_API_KEY_TEAM" });
+      expect(set.stderr).toContain(`${MEMBER_ID} wakes manus task_synthetic_0001 when addressed`);
+      // A later set keeps what it is not told to change.
+      const again = await run(["wake", "set", "manus", "--json"], space, []);
+      expect(JSON.parse(again.stdout).wake).toMatchObject({ session: "task_synthetic_0001", api_key_env: "MANUS_API_KEY_TEAM" });
+
+      // Without a task, every wake starts one; and a pasted key is refused as a variable name.
+      expect((await run(["wake", "off", "--json"], space, [])).exitCode).toBe(0);
+      const fresh = await run(["wake", "set", "manus", "--json"], space, []);
+      expect(JSON.parse(fresh.stdout).wake).toEqual({ driver: "manus", cwd: space.project, command: "https://api.manus.ai" });
+      const pasted = await run(["wake", "set", "manus", "--key-env", "sk-synthetic-not-a-name", "--json"], space, []);
+      expect(pasted.exitCode).not.toBe(0);
+      expect(pasted.stdout + pasted.stderr).toContain("NAME of the environment variable");
+      // Only a name every process withholds from the programs it starts, by name alone, may hold the key.
+      const unwithheld = await run(["wake", "set", "manus", "--key-env", "TEAM_MANUS_KEY", "--json"], space, []);
+      expect(unwithheld.exitCode).not.toBe(0);
+      expect(unwithheld.stdout + unwithheld.stderr).toContain("MANUS_API_KEY_<SUFFIX>");
+      expect((await run(["wake", "set", "claude-code", "--resume", "6613bb00", "--key-env", "X", "--json"], space, [], { CLAUDE_SESSION_ID: "" })).exitCode).not.toBe(0);
+      // The key is only ever sent to the Manus API: another address is refused when the wake is set, not at the first wake.
+      const foreign = await run(["wake", "set", "manus", "--command", "https://attacker.example", "--json"], space, []);
+      expect(foreign.exitCode).not.toBe(0);
+      expect(foreign.stdout + foreign.stderr).toContain("only sent to https://api.manus.ai");
+      // No variable makes a loopback address acceptable (third review, 1): a model could set one.
+      const loopback = await run(["wake", "set", "manus", "--command", "http://127.0.0.1:8080", "--json"], space, [], { SHAREDNET_MANUS_ALLOW_LOOPBACK: "1" });
+      expect(loopback.exitCode).not.toBe(0);
+      expect(JSON.stringify(await credentialOf(space))).not.toContain("sk-synthetic");
     });
 
     it("leaves alone a seat no session took, unless --run gives it a command", async () => {
