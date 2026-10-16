@@ -117,12 +117,17 @@ function git(args: readonly string[], cwd: string): Promise<{ code: number; stdo
 }
 
 /** Do not mistake a consuming application's repository for the installed CLI's source. */
-async function repositoryCommit(cwd: string): Promise<string | null> {
+async function repositoryIdentity(cwd: string): Promise<{ commit: string | null; dirty: boolean | null }> {
   const remote = await git(["config", "--get", "remote.origin.url"], cwd);
-  if (remote.code !== 0 || !/(?:^|[/:])systemind-team\/sharednet-client(?:\.git)?$/.test(remote.stdout.trim())) return null;
+  if (remote.code !== 0 || !/(?:^|[/:])systemind-team\/sharednet-client(?:\.git)?$/.test(remote.stdout.trim())) {
+    return { commit: null, dirty: null };
+  }
   const head = await git(["rev-parse", "HEAD"], cwd);
   const commit = head.stdout.trim().toLowerCase();
-  return head.code === 0 && /^[0-9a-f]{40,64}$/.test(commit) ? commit : null;
+  const status = await git(["status", "--porcelain", "--untracked-files=all"], cwd);
+  if (head.code !== 0 || !/^[0-9a-f]{40,64}$/.test(commit) || status.code !== 0) return { commit: null, dirty: null };
+  const dirty = status.stdout.length > 0;
+  return { commit: dirty ? null : commit, dirty };
 }
 
 /** Package metadata survives npm installation even when the source repository and its commit do not. */
@@ -146,8 +151,60 @@ async function packageIdentity(root: string, entry: string): Promise<{
   return { packageVersion, packageManifestSha256, entrySha256 };
 }
 
-function sha256(value: string): string {
+async function codeTreeSha256(root: string, entry: string): Promise<string | null> {
+  const normalizedEntry = entry.replaceAll("\\", "/");
+  const roots = normalizedEntry.startsWith("src/") ? ["src"] : normalizedEntry.startsWith("bin/") ? ["bin", "dist"] : [normalizedEntry];
+  const files: string[] = [];
+  const collect = async (relativePath: string): Promise<void> => {
+    const absolutePath = join(root, relativePath);
+    try {
+      const entries = await readdir(absolutePath, { withFileTypes: true });
+      for (const child of entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
+        const childPath = `${relativePath.replaceAll("\\", "/")}/${child.name}`;
+        if (child.isDirectory()) await collect(childPath);
+        else if (child.isFile()) files.push(childPath);
+      }
+    } catch {
+      if (existsSync(absolutePath)) files.push(relativePath.replaceAll("\\", "/"));
+    }
+  };
+  for (const candidate of roots) await collect(candidate);
+  const runtimeFiles = files.filter((file) => !file.endsWith(".test.ts") && !file.endsWith(".test.js") && !file.endsWith(".map"));
+  if (runtimeFiles.length === 0) return null;
+  const digest = createHash("sha256");
+  for (const file of runtimeFiles.sort()) {
+    digest.update(file).update("\0").update(sha256(await readFile(join(root, file)))).update("\n");
+  }
+  return digest.digest("hex");
+}
+
+function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+export interface CodeProvenance {
+  clientCommit: string | null;
+  runnerCommit: string | null;
+  sourceWorktreeDirty: boolean | null;
+  packageVersion: string | null;
+  packageManifestSha256: string | null;
+  entrySha256: string | null;
+  codeTreeSha256: string | null;
+}
+
+export async function discoverCodeProvenance(cli: { root: string; entry: string }): Promise<CodeProvenance> {
+  const [repository, packageMetadata, codeTree] = await Promise.all([
+    repositoryIdentity(cli.root),
+    packageIdentity(cli.root, cli.entry),
+    codeTreeSha256(cli.root, cli.entry),
+  ]);
+  return {
+    clientCommit: repository.commit,
+    runnerCommit: repository.commit,
+    sourceWorktreeDirty: repository.dirty,
+    ...packageMetadata,
+    codeTreeSha256: codeTree,
+  };
 }
 
 /** The image the Agents run in when no --image is given; built on first use. */
@@ -487,10 +544,7 @@ export interface GoalRunInput {
   /** A canonical treatment selected by --harness-mode. Omission preserves legacy ad-hoc flags. */
   harnessMode?: GoalRunHarnessResolution;
   /** Tests and artifact builders may supply provenance; source runs discover repository and package identity. */
-  codeProvenance?: {
-    clientCommit: string | null;
-    runnerCommit: string | null;
-  };
+  codeProvenance?: CodeProvenance;
 }
 
 export interface GoalRunDependencies {
@@ -532,16 +586,14 @@ export async function runGoal(
   ) {
     throw localError("harness_mode_mismatch", `${input.harnessMode.name} does not match the resolved Room, gate, and routing controls.`);
   }
+  if (input.harnessMode && plan.agents.some((agent) => agent.model === null)) {
+    throw localError("harness_model_required", "A frozen --harness-mode requires every Agent to pin its model.");
+  }
   if (input.roomType === "compiled" && (input.mentionGate || input.taskGate || messageRouting === "mentions")) throw localError("invalid_arguments", "The mention/task controls are for plain board Rooms.");
-  const discoveredCommit = input.codeProvenance ? null : await repositoryCommit(plan.cli.root);
-  const discoveredPackage = await packageIdentity(plan.cli.root, plan.cli.entry);
-  const codeProvenance = {
-    ...(input.codeProvenance ?? {
-      clientCommit: discoveredCommit,
-      runnerCommit: discoveredCommit,
-    }),
-    ...discoveredPackage,
-  };
+  const codeProvenance = input.codeProvenance ?? await discoverCodeProvenance(plan.cli);
+  if (input.harnessMode && codeProvenance.sourceWorktreeDirty) {
+    throw localError("dirty_harness_source", "A frozen --harness-mode cannot run from a dirty sharednet-client checkout; commit or stash the CLI changes first.");
+  }
   const openingPromptHashes: Record<string, string> = {};
   await mkdir(input.out, { recursive: true });
   const wakeLog = join(input.out, "wakes.ndjson");
@@ -854,9 +906,11 @@ export async function runGoal(
             },
             client_commit: codeProvenance.clientCommit,
             runner_commit: codeProvenance.runnerCommit,
+            source_worktree_dirty: codeProvenance.sourceWorktreeDirty,
             package_version: codeProvenance.packageVersion,
             package_manifest_sha256: codeProvenance.packageManifestSha256,
             entry_sha256: codeProvenance.entrySha256,
+            code_tree_sha256: codeProvenance.codeTreeSha256,
             image: plan.image,
             models: records.map((seat) => ({ seat: seat.name, driver: seat.driver, model: seat.model })),
             goal_sha256: sha256(input.goal),

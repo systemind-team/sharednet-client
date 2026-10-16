@@ -48,7 +48,7 @@ interface DependencyHarnessMode {
 interface HarnessModeProvenance {
   readonly repository: "systemind-team/sharednet-client";
   readonly mechanism_commit: string;
-  readonly verified_against: "6c56615e4fe389ce43f9addc1cdc79a1f8ba39a8";
+  readonly verified_against: string;
   readonly source: readonly string[];
 }
 
@@ -97,7 +97,7 @@ const researchProvenance = {
 const runtimeProvenance = {
   repository: "systemind-team/sharednet-client",
   mechanism_commit: "e77597df9e2fae3d83c8c518c1c815eb7a3ede5d",
-  verified_against: "6c56615e4fe389ce43f9addc1cdc79a1f8ba39a8",
+  verified_against: "e77597df9e2fae3d83c8c518c1c815eb7a3ede5d",
   source: ["packages/cli/src/goal-serve-demo.ts"],
 } as const;
 
@@ -187,7 +187,9 @@ function canonicalJson(value: unknown): string {
 }
 
 export function harnessModeSpecHash(spec: HarnessModeSpec): string {
-  return createHash("sha256").update(canonicalJson(spec)).digest("hex");
+  const { availability: _availability, provenance, ...semantics } = spec;
+  const { verified_against: _verifiedAgainst, ...mechanismProvenance } = provenance;
+  return createHash("sha256").update(canonicalJson({ ...semantics, provenance: mechanismProvenance })).digest("hex");
 }
 
 export function getHarnessModeSpec(name: string): HarnessModeSpec {

@@ -58,6 +58,16 @@ describe("frozen harness mode registry", () => {
     expect(harnessModeSpecHash(getHarnessModeSpec("research/both@1"))).toBe(hashes[3]);
   });
 
+  it("keeps mutable availability and re-verification metadata outside the immutable spec hash", () => {
+    const spec = getHarnessModeSpec("runtime/serve-first@1");
+    const changed = {
+      ...spec,
+      availability: { state: "available", command: "goal serve-demo" },
+      provenance: { ...spec.provenance, verified_against: "a".repeat(40) },
+    } as unknown as typeof spec;
+    expect(harnessModeSpecHash(changed)).toBe(harnessModeSpecHash(spec));
+  });
+
   it.each(["baseline", "research/baseline", "research/baseline@2", "research/unknown@1", "Research/baseline@1"]) (
     "refuses non-canonical mode %s",
     (name) => {

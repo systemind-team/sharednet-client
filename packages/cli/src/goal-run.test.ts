@@ -1,6 +1,7 @@
 // @vitest-environment node
 
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,6 +17,7 @@ import {
   TurnReader,
   codexSessionUsage,
   containerName,
+  discoverCodeProvenance,
   freshTokens,
   loopbackPort,
   openingPrompt,
@@ -252,6 +254,33 @@ describe("prepareRun", () => {
 });
 
 describe("runGoal", () => {
+  it("does not report a dirty source checkout as the clean client and runner commit", async () => {
+    const root = await temporary();
+    await mkdir(join(root, "src"));
+    await writeFile(join(root, "package.json"), '{"name":"sharednet","version":"0.1.16"}\n');
+    await writeFile(join(root, "src", "main.ts"), "export const version = 1;\n");
+    for (const args of [
+      ["init", "-q"],
+      ["config", "user.name", "Harness Test"],
+      ["config", "user.email", "harness@example.invalid"],
+      ["remote", "add", "origin", "https://github.com/systemind-team/sharednet-client.git"],
+      ["add", "."],
+      ["commit", "-qm", "fixture"],
+    ]) execFileSync("git", args, { cwd: root });
+
+    const clean = await discoverCodeProvenance({ root, entry: "src/main.ts" });
+    expect(clean).toMatchObject({
+      clientCommit: expect.stringMatching(/^[0-9a-f]{40}$/),
+      runnerCommit: expect.stringMatching(/^[0-9a-f]{40}$/),
+      sourceWorktreeDirty: false,
+      codeTreeSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    await writeFile(join(root, "src", "main.ts"), "export const version = 2;\n");
+    const dirty = await discoverCodeProvenance({ root, entry: "src/main.ts" });
+    expect(dirty).toMatchObject({ clientCommit: null, runnerCommit: null, sourceWorktreeDirty: true });
+    expect(dirty.codeTreeSha256).not.toBe(clean.codeTreeSha256);
+  });
+
   it("refuses metadata that names a frozen mode but resolves to different controls", async () => {
     const out = await temporary();
     const plan: RunPlan = {
@@ -286,6 +315,49 @@ describe("runGoal", () => {
     expect(dockerCalls).toBe(0);
   });
 
+  it("refuses a frozen mode from a dirty source checkout before Docker work", async () => {
+    const out = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents(["codex:gpt-6.1-sol"]),
+      workspace: out,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "api-key" },
+      claudeAuth: null,
+    };
+    let dockerCalls = 0;
+    await expect(runGoal(
+      {} as ApiClient,
+      "sni_owner-seat",
+      OWNER_KEY,
+      {
+        plan,
+        roomType: "board",
+        roomId: ROOM,
+        inviteToken: INVITE,
+        goal: "g",
+        goalSequence: 1,
+        until: ["after 1h"],
+        baseUrl: "https://www.sharednet.ai",
+        out,
+        checkEveryMs: 60_000,
+        quietChecks: false,
+        harnessMode: resolveGoalRunHarnessMode("research/baseline@1"),
+        codeProvenance: {
+          clientCommit: null,
+          runnerCommit: null,
+          sourceWorktreeDirty: true,
+          packageVersion: "0.1.16",
+          packageManifestSha256: "1".repeat(64),
+          entrySha256: "2".repeat(64),
+          codeTreeSha256: "3".repeat(64),
+        },
+      },
+      { docker: async () => { dockerCalls += 1; return { code: 0, stdout: "", stderr: "" }; }, now: () => new Date() },
+    )).rejects.toMatchObject({ code: "dirty_harness_source" });
+    expect(dockerCalls).toBe(0);
+  });
+
   it.each([["board", false, false], ["compiled", false, false], ["board", true, false], ["board", false, true], ["board", true, true]] as const)("runs every %s seat with mention=%s task=%s until the budget is spent and keeps credentials private", async (roomType, mentionGate, taskGate) => {
     const out = await temporary();
     const workspace = await temporary();
@@ -297,7 +369,7 @@ describe("runGoal", () => {
     await writeFile(join(cliRoot, "src", "main.ts"), entrySource);
     const plan: RunPlan = {
       image: DEFAULT_IMAGE,
-      agents: parseAgents(["codex:gpt-6-luna", "codex"]),
+      agents: parseAgents(["codex:gpt-6-luna", "codex:gpt-6.1-sol"]),
       workspace,
       cli: { root: cliRoot, entry: "src/main.ts" },
       codexAuth: { kind: "login", file: "/Users/someone/.codex/auth.json" },
@@ -401,10 +473,6 @@ describe("runGoal", () => {
         quietChecks: false,
         ...(harnessMode ? {
           harnessMode,
-          codeProvenance: {
-            clientCommit: "1111111111111111111111111111111111111111",
-            runnerCommit: "2222222222222222222222222222222222222222",
-          },
         } : {}),
       },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
@@ -531,15 +599,17 @@ describe("runGoal", () => {
           turn_limit_s: 1200,
           until: goal.until,
         },
-        client_commit: "1111111111111111111111111111111111111111",
-        runner_commit: "2222222222222222222222222222222222222222",
+        client_commit: null,
+        runner_commit: null,
+        source_worktree_dirty: null,
         package_version: "0.1.16-test",
         package_manifest_sha256: createHash("sha256").update(packageManifest).digest("hex"),
         entry_sha256: createHash("sha256").update(entrySource).digest("hex"),
+        code_tree_sha256: createHash("sha256").update(`src/main.ts\0${createHash("sha256").update(entrySource).digest("hex")}\n`).digest("hex"),
         image: DEFAULT_IMAGE,
         models: [
           { seat: "codex-1", driver: "codex", model: "gpt-6-luna" },
-          { seat: "codex-2", driver: "codex", model: null },
+          { seat: "codex-2", driver: "codex", model: "gpt-6.1-sol" },
         ],
         goal_sha256: createHash("sha256").update("Make it pass.").digest("hex"),
       });

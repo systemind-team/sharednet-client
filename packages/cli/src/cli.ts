@@ -10,7 +10,7 @@ import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner, type GuestDependencies } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
-import { dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type DockerRunner } from "./goal-run.ts";
+import { cliPackage, discoverCodeProvenance, dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner } from "./goal-run.ts";
 import { resolveGoalRunHarnessMode } from "./harness-modes.ts";
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
@@ -598,6 +598,18 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
       "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--harness-mode research/<mode>@1 | --mention-gate/--task-gate/--message-routing]",
     );
   }
+  const agents = parseAgents(parsed.repeated.get("agent") ?? []);
+  if (harnessMode && agents.some((agent) => agent.model === null)) {
+    throw localError("harness_model_required", "A frozen --harness-mode requires every --agent to pin its model, for example --agent codex:<model>.");
+  }
+  const cliEntry = dependencies.cliEntry ?? realpathSync(process.argv[1]!);
+  let codeProvenance: CodeProvenance | undefined;
+  if (harnessMode) {
+    codeProvenance = await discoverCodeProvenance(cliPackage(cliEntry));
+    if (codeProvenance.sourceWorktreeDirty) {
+      throw localError("dirty_harness_source", "A frozen --harness-mode cannot run from a dirty sharednet-client checkout; commit or stash the CLI changes first.");
+    }
+  }
   const webSearch = option(parsed, "web-search") ?? "live";
   if (webSearch !== "live" && webSearch !== "off") {
     throw localError("invalid_arguments", "--web-search is live or off.");
@@ -608,7 +620,6 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   }
   const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
   const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime(), { budget: true });
-  const agents = parseAgents(parsed.repeated.get("agent") ?? []);
   const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
   if (!(await stat(workspace).then((entry) => entry.isDirectory(), () => false))) {
     throw localError("invalid_arguments", `--workspace ${workspace} is not a directory.`);
@@ -624,7 +635,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
       workspace,
       env: dependencies.env,
       home: dependencies.env.HOME ?? homedir(),
-      entry: dependencies.cliEntry ?? realpathSync(process.argv[1]!),
+      entry: cliEntry,
     },
     docker,
     dependencies.stderr,
@@ -676,6 +687,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           taskGate,
           ...(messageRouting ? { messageRouting } : {}),
           ...(harnessMode ? { harnessMode } : {}),
+          ...(codeProvenance ? { codeProvenance } : {}),
           webSearch,
           ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
         },

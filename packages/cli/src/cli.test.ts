@@ -356,6 +356,14 @@ describe("reach: forming a group from the account CLI", () => {
     expect(unavailable.stderr.join(" ")).toContain("harness_mode_unavailable");
     expect(unavailable.stderr.join(" ")).toContain("PR #48");
     expect(unavailable.requests).toEqual([]);
+
+    const unpinnedModel = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "research/baseline@1",
+    ]);
+    expect(unpinnedModel.exitCode).toBe(2);
+    expect(unpinnedModel.stderr.join(" ")).toContain("harness_model_required");
+    expect(unpinnedModel.stderr.join(" ")).toContain("codex:<model>");
+    expect(unpinnedModel.requests).toEqual([]);
   });
 
   it("does not let low-level controls or compiled Rooms drift from a named harness profile", async () => {
