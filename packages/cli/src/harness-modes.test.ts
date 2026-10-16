@@ -1,5 +1,7 @@
 // @vitest-environment node
 
+import { readFile } from "node:fs/promises";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -74,4 +76,14 @@ describe("frozen harness mode registry", () => {
       );
     },
   );
+
+  it("keeps the published catalog tied to every canonical name and spec hash", async () => {
+    const catalog = await readFile(new URL("../../../docs/harness-modes.md", import.meta.url), "utf8");
+    for (const spec of HARNESS_MODE_REGISTRY) {
+      expect(catalog).toContain(`\`${spec.name}\``);
+      expect(catalog).toContain(`\`${harnessModeSpecHash(spec)}\``);
+    }
+    expect(catalog).toContain("PR #48");
+    expect(catalog).toContain("unavailable");
+  });
 });

@@ -125,6 +125,27 @@ async function repositoryCommit(cwd: string): Promise<string | null> {
   return head.code === 0 && /^[0-9a-f]{40,64}$/.test(commit) ? commit : null;
 }
 
+/** Package metadata survives npm installation even when the source repository and its commit do not. */
+async function packageIdentity(root: string, entry: string): Promise<{
+  packageVersion: string | null;
+  packageManifestSha256: string | null;
+  entrySha256: string | null;
+}> {
+  let packageVersion: string | null = null;
+  let packageManifestSha256: string | null = null;
+  let entrySha256: string | null = null;
+  try {
+    const manifest = await readFile(join(root, "package.json"), "utf8");
+    const parsed = JSON.parse(manifest) as { version?: unknown };
+    packageVersion = typeof parsed.version === "string" && parsed.version.length > 0 ? parsed.version : null;
+    packageManifestSha256 = sha256(manifest);
+  } catch {}
+  try {
+    entrySha256 = sha256(await readFile(join(root, entry), "utf8"));
+  } catch {}
+  return { packageVersion, packageManifestSha256, entrySha256 };
+}
+
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -465,8 +486,11 @@ export interface GoalRunInput {
   messageRouting?: MessageRouting;
   /** A canonical treatment selected by --harness-mode. Omission preserves legacy ad-hoc flags. */
   harnessMode?: GoalRunHarnessResolution;
-  /** Tests and artifact builders may supply commits; source runs discover this repository's HEAD. */
-  codeProvenance?: { clientCommit: string | null; runnerCommit: string | null };
+  /** Tests and artifact builders may supply provenance; source runs discover repository and package identity. */
+  codeProvenance?: {
+    clientCommit: string | null;
+    runnerCommit: string | null;
+  };
 }
 
 export interface GoalRunDependencies {
@@ -510,7 +534,14 @@ export async function runGoal(
   }
   if (input.roomType === "compiled" && (input.mentionGate || input.taskGate || messageRouting === "mentions")) throw localError("invalid_arguments", "The mention/task controls are for plain board Rooms.");
   const discoveredCommit = input.codeProvenance ? null : await repositoryCommit(plan.cli.root);
-  const codeProvenance = input.codeProvenance ?? { clientCommit: discoveredCommit, runnerCommit: discoveredCommit };
+  const discoveredPackage = await packageIdentity(plan.cli.root, plan.cli.entry);
+  const codeProvenance = {
+    ...(input.codeProvenance ?? {
+      clientCommit: discoveredCommit,
+      runnerCommit: discoveredCommit,
+    }),
+    ...discoveredPackage,
+  };
   const openingPromptHashes: Record<string, string> = {};
   await mkdir(input.out, { recursive: true });
   const wakeLog = join(input.out, "wakes.ndjson");
@@ -823,6 +854,9 @@ export async function runGoal(
             },
             client_commit: codeProvenance.clientCommit,
             runner_commit: codeProvenance.runnerCommit,
+            package_version: codeProvenance.packageVersion,
+            package_manifest_sha256: codeProvenance.packageManifestSha256,
+            entry_sha256: codeProvenance.entrySha256,
             image: plan.image,
             models: records.map((seat) => ({ seat: seat.name, driver: seat.driver, model: seat.model })),
             goal_sha256: sha256(input.goal),

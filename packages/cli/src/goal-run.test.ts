@@ -289,11 +289,17 @@ describe("runGoal", () => {
   it.each([["board", false, false], ["compiled", false, false], ["board", true, false], ["board", false, true], ["board", true, true]] as const)("runs every %s seat with mention=%s task=%s until the budget is spent and keeps credentials private", async (roomType, mentionGate, taskGate) => {
     const out = await temporary();
     const workspace = await temporary();
+    const cliRoot = await temporary();
+    const packageManifest = '{"name":"sharednet","version":"0.1.16-test"}\n';
+    const entrySource = 'import "../dist/main.js";\n';
+    await mkdir(join(cliRoot, "src"), { recursive: true });
+    await writeFile(join(cliRoot, "package.json"), packageManifest);
+    await writeFile(join(cliRoot, "src", "main.ts"), entrySource);
     const plan: RunPlan = {
       image: DEFAULT_IMAGE,
       agents: parseAgents(["codex:gpt-6-luna", "codex"]),
       workspace,
-      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      cli: { root: cliRoot, entry: "src/main.ts" },
       codexAuth: { kind: "login", file: "/Users/someone/.codex/auth.json" },
       claudeAuth: null,
     };
@@ -527,6 +533,9 @@ describe("runGoal", () => {
         },
         client_commit: "1111111111111111111111111111111111111111",
         runner_commit: "2222222222222222222222222222222222222222",
+        package_version: "0.1.16-test",
+        package_manifest_sha256: createHash("sha256").update(packageManifest).digest("hex"),
+        entry_sha256: createHash("sha256").update(entrySource).digest("hex"),
         image: DEFAULT_IMAGE,
         models: [
           { seat: "codex-1", driver: "codex", model: "gpt-6-luna" },

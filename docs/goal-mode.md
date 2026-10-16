@@ -9,6 +9,8 @@ workspace at each step.
 
 For optional title claims and before-post mention delivery, see
 [board controls](task-mention-gates.md). They are off by default.
+For reproducible research treatments, use the immutable names in the
+[frozen harness mode catalog](harness-modes.md).
 
 ```bash
 sharednet goal run TASK.md --agent codex --agent codex --agent codex \

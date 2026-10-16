@@ -351,6 +351,10 @@
     "packages/cli/src/process-identity.test.ts",
     "docs/serve-service.md",
     "packages/cli/src/serve-service.ts",
-    "packages/cli/src/serve-service.test.ts"
+    "packages/cli/src/serve-service.test.ts",
+    "docs/harness-modes.md",
+    "docs/superpowers/plans/2026-10-16-harness-mode-registry.md",
+    "packages/cli/src/harness-modes.ts",
+    "packages/cli/src/harness-modes.test.ts"
   ]
 }
