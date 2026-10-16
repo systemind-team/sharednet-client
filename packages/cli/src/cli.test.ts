@@ -340,6 +340,46 @@ describe("reach: forming a group from the account CLI", () => {
     expect(refused.requests).toEqual([]);
   });
 
+  it("validates canonical harness modes before reading the goal or making a request", async () => {
+    const malformed = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "research/baseline",
+    ]);
+    expect(malformed.exitCode).toBe(2);
+    expect(malformed.stderr.join(" ")).toContain("invalid_harness_mode");
+    expect(malformed.stderr.join(" ")).toContain("research/baseline@1");
+    expect(malformed.requests).toEqual([]);
+
+    const unavailable = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "runtime/serve-first@1",
+    ]);
+    expect(unavailable.exitCode).toBe(2);
+    expect(unavailable.stderr.join(" ")).toContain("harness_mode_unavailable");
+    expect(unavailable.stderr.join(" ")).toContain("PR #48");
+    expect(unavailable.requests).toEqual([]);
+  });
+
+  it("does not let low-level controls or compiled Rooms drift from a named harness profile", async () => {
+    for (const extra of [
+      ["--mention-gate"],
+      ["--task-gate"],
+      ["--message-routing", "broadcast"],
+    ]) {
+      const refused = await harness([
+        "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "research/both@1", ...extra,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr.join(" ")).toContain("fixes the gate and routing controls");
+      expect(refused.requests).toEqual([]);
+    }
+
+    const compiled = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--type", "compiled", "--harness-mode", "research/baseline@1",
+    ]);
+    expect(compiled.exitCode).toBe(2);
+    expect(compiled.stderr.join(" ")).toContain("requires a board Room");
+    expect(compiled.requests).toEqual([]);
+  });
+
   it("accepts independent board gates before validating the rest of a run", async () => {
     for (const flags of [["--mention-gate"], ["--task-gate"], ["--mention-gate", "--task-gate"]]) {
       const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after 1h", "--turn-limit", "30s", ...flags], []);

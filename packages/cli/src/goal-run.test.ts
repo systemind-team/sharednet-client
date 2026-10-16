@@ -1,5 +1,6 @@
 // @vitest-environment node
 
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,6 +9,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ApiClient } from "./api-client.ts";
+import { resolveGoalRunHarnessMode } from "./harness-modes.ts";
 import {
   AGENT_DOCKERFILE,
   DEFAULT_IMAGE,
@@ -250,6 +252,40 @@ describe("prepareRun", () => {
 });
 
 describe("runGoal", () => {
+  it("refuses metadata that names a frozen mode but resolves to different controls", async () => {
+    const out = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents(["codex"]),
+      workspace: out,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "api-key" },
+      claudeAuth: null,
+    };
+    let dockerCalls = 0;
+    await expect(runGoal(
+      {} as ApiClient,
+      "sni_owner-seat",
+      OWNER_KEY,
+      {
+        plan,
+        roomId: ROOM,
+        inviteToken: INVITE,
+        goal: "g",
+        goalSequence: 1,
+        until: ["after 1h"],
+        baseUrl: "https://www.sharednet.ai",
+        out,
+        checkEveryMs: 60_000,
+        quietChecks: false,
+        mentionGate: true,
+        harnessMode: resolveGoalRunHarnessMode("research/baseline@1"),
+      },
+      { docker: async () => { dockerCalls += 1; return { code: 0, stdout: "", stderr: "" }; }, now: () => new Date() },
+    )).rejects.toMatchObject({ code: "harness_mode_mismatch" });
+    expect(dockerCalls).toBe(0);
+  });
+
   it.each([["board", false, false], ["compiled", false, false], ["board", true, false], ["board", false, true], ["board", true, true]] as const)("runs every %s seat with mention=%s task=%s until the budget is spent and keeps credentials private", async (roomType, mentionGate, taskGate) => {
     const out = await temporary();
     const workspace = await temporary();
@@ -336,11 +372,35 @@ describe("runGoal", () => {
     } as unknown as ApiClient;
 
     let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    const harnessMode = roomType === "board" && !mentionGate && !taskGate
+      ? resolveGoalRunHarnessMode("research/baseline@1")
+      : undefined;
     const result = await runGoal(
       client,
       "sni_owner-seat",
       OWNER_KEY,
-      { plan, roomType, mentionGate, taskGate, roomId: ROOM, inviteToken: INVITE, goal: "Make it pass.", goalSequence: 1, until: goal.until, baseUrl: "http://127.0.0.1:3117", out, checkEveryMs: 60_000, quietChecks: false },
+      {
+        plan,
+        roomType,
+        mentionGate,
+        taskGate,
+        roomId: ROOM,
+        inviteToken: INVITE,
+        goal: "Make it pass.",
+        goalSequence: 1,
+        until: goal.until,
+        baseUrl: "http://127.0.0.1:3117",
+        out,
+        checkEveryMs: 60_000,
+        quietChecks: false,
+        ...(harnessMode ? {
+          harnessMode,
+          codeProvenance: {
+            clientCommit: "1111111111111111111111111111111111111111",
+            runnerCommit: "2222222222222222222222222222222222222222",
+          },
+        } : {}),
+      },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
     );
 
@@ -449,6 +509,36 @@ describe("runGoal", () => {
     const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
     expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", turn_limit_s: 1200, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
     expect(episode.agents).toHaveLength(2);
+    if (harnessMode) {
+      expect(episode.harness).toMatchObject({
+        mode: "research/baseline@1",
+        spec_sha256: harnessMode.specSha256,
+        resolved_profile: {
+          command: "goal run",
+          room_type: "board",
+          delivery: "runner-owned-turn-loop",
+          initial_wake: "all-seats",
+          mention_gate: false,
+          task_gate: false,
+          message_routing: "broadcast",
+          web_search: "live",
+          turn_limit_s: 1200,
+          until: goal.until,
+        },
+        client_commit: "1111111111111111111111111111111111111111",
+        runner_commit: "2222222222222222222222222222222222222222",
+        image: DEFAULT_IMAGE,
+        models: [
+          { seat: "codex-1", driver: "codex", model: "gpt-6-luna" },
+          { seat: "codex-2", driver: "codex", model: null },
+        ],
+        goal_sha256: createHash("sha256").update("Make it pass.").digest("hex"),
+      });
+      expect(episode.harness.opening_prompt_sha256).toEqual({
+        "codex-1": expect.stringMatching(/^[0-9a-f]{64}$/),
+        "codex-2": expect.stringMatching(/^[0-9a-f]{64}$/),
+      });
+    }
   });
 });
 

@@ -11,6 +11,7 @@ import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type Command
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
 import { dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type DockerRunner } from "./goal-run.ts";
+import { resolveGoalRunHarnessMode } from "./harness-modes.ts";
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
@@ -129,6 +130,7 @@ const optionValueNames = new Set([
   "web-search",
   "turn-limit",
   "message-routing",
+  "harness-mode",
   "type",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate"]);
@@ -571,17 +573,29 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing"]);
-  const type = roomType(parsed);
-  const messageRouting = option(parsed, "message-routing");
-  if (messageRouting !== undefined && messageRouting !== "broadcast" && messageRouting !== "mentions") throw localError("invalid_arguments", "--message-routing must be broadcast or mentions.");
-  if (type === "compiled" && (parsed.options.has("mention-gate") || parsed.options.has("task-gate") || messageRouting === "mentions")) {
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "harness-mode"]);
+  const requestedType = roomType(parsed);
+  const namedMode = option(parsed, "harness-mode");
+  if (namedMode !== undefined && ["mention-gate", "task-gate", "message-routing"].some((name) => parsed.options.has(name))) {
+    throw localError("invalid_arguments", "--harness-mode fixes the gate and routing controls; do not combine it with --mention-gate, --task-gate, or --message-routing.");
+  }
+  const harnessMode = namedMode === undefined ? undefined : resolveGoalRunHarnessMode(namedMode);
+  if (harnessMode && requestedType === "compiled") {
+    throw localError("invalid_arguments", `${harnessMode.name} requires a board Room.`);
+  }
+  const type = harnessMode ? "board" : requestedType;
+  const manualMessageRouting = option(parsed, "message-routing");
+  if (manualMessageRouting !== undefined && manualMessageRouting !== "broadcast" && manualMessageRouting !== "mentions") throw localError("invalid_arguments", "--message-routing must be broadcast or mentions.");
+  const mentionGate = harnessMode?.profile.mention_gate ?? (parsed.options.get("mention-gate") === true);
+  const taskGate = harnessMode?.profile.task_gate ?? (parsed.options.get("task-gate") === true);
+  const messageRouting = harnessMode?.profile.message_routing ?? manualMessageRouting;
+  if (type === "compiled" && (mentionGate || taskGate || messageRouting === "mentions")) {
     throw localError("invalid_arguments", "The mention/task gates are for plain board Rooms.");
   }
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--mention-gate] [--task-gate] [--message-routing broadcast|mentions]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--harness-mode research/<mode>@1 | --mention-gate/--task-gate/--message-routing]",
     );
   }
   const webSearch = option(parsed, "web-search") ?? "live";
@@ -658,9 +672,10 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           out,
           checkEveryMs,
           quietChecks: parsed.options.get("quiet-checks") === true,
-          mentionGate: parsed.options.get("mention-gate") === true,
-          taskGate: parsed.options.get("task-gate") === true,
+          mentionGate,
+          taskGate,
           ...(messageRouting ? { messageRouting } : {}),
+          ...(harnessMode ? { harnessMode } : {}),
           webSearch,
           ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
         },

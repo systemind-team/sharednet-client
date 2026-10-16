@@ -1,7 +1,8 @@
 import { compiledPrompt, COMPILED_HELP, type CompiledState } from "./compiled.ts";
 import { controlPaths, isTaskMessage } from "./board-controls.ts";
 import { TASK_HELP, MENTION_HELP, TASK_PROFILE, TASK_HOOK, TASK_HOOK_SETTINGS } from "./task-guard.ts";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
@@ -9,6 +10,7 @@ import { dirname, join, relative } from "node:path";
 import type { ApiClient } from "./api-client.ts";
 import { localError } from "./errors.ts";
 import { goalWatch, type GoalWatchResult } from "./goal.ts";
+import type { GoalRunHarnessResolution } from "./harness-modes.ts";
 import { mentions } from "./triggers.ts";
 
 /**
@@ -104,6 +106,27 @@ export function dockerRunner(baseEnv: Record<string, string | undefined>): Docke
       });
       child.stdin.end(options.input ?? "");
     });
+}
+
+function git(args: readonly string[], cwd: string): Promise<{ code: number; stdout: string }> {
+  return new Promise((resolveGit) => {
+    execFile("git", [...args], { cwd, maxBuffer: 64 * 1024 }, (error, stdout) => {
+      resolveGit({ code: error ? 1 : 0, stdout: String(stdout) });
+    });
+  });
+}
+
+/** Do not mistake a consuming application's repository for the installed CLI's source. */
+async function repositoryCommit(cwd: string): Promise<string | null> {
+  const remote = await git(["config", "--get", "remote.origin.url"], cwd);
+  if (remote.code !== 0 || !/(?:^|[/:])systemind-team\/sharednet-client(?:\.git)?$/.test(remote.stdout.trim())) return null;
+  const head = await git(["rev-parse", "HEAD"], cwd);
+  const commit = head.stdout.trim().toLowerCase();
+  return head.code === 0 && /^[0-9a-f]{40,64}$/.test(commit) ? commit : null;
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 /** The image the Agents run in when no --image is given; built on first use. */
@@ -440,6 +463,10 @@ export interface GoalRunInput {
   mentionGate?: boolean;
   taskGate?: boolean;
   messageRouting?: MessageRouting;
+  /** A canonical treatment selected by --harness-mode. Omission preserves legacy ad-hoc flags. */
+  harnessMode?: GoalRunHarnessResolution;
+  /** Tests and artifact builders may supply commits; source runs discover this repository's HEAD. */
+  codeProvenance?: { clientCommit: string | null; runnerCommit: string | null };
 }
 
 export interface GoalRunDependencies {
@@ -470,7 +497,21 @@ export async function runGoal(
   const turnLimitSeconds = Math.round((input.turnLimitMs ?? TURN_LIMIT_SECONDS * 1000) / 1000);
   const base = input.baseUrl;
   const messageRouting = input.messageRouting ?? (input.mentionGate ? "mentions" : "broadcast");
+  const mentionGate = input.mentionGate ?? false;
+  const taskGate = input.taskGate ?? false;
+  if (
+    input.harnessMode
+    && (input.roomType !== input.harnessMode.profile.room_type
+      || mentionGate !== input.harnessMode.profile.mention_gate
+      || taskGate !== input.harnessMode.profile.task_gate
+      || messageRouting !== input.harnessMode.profile.message_routing)
+  ) {
+    throw localError("harness_mode_mismatch", `${input.harnessMode.name} does not match the resolved Room, gate, and routing controls.`);
+  }
   if (input.roomType === "compiled" && (input.mentionGate || input.taskGate || messageRouting === "mentions")) throw localError("invalid_arguments", "The mention/task controls are for plain board Rooms.");
+  const discoveredCommit = input.codeProvenance ? null : await repositoryCommit(plan.cli.root);
+  const codeProvenance = input.codeProvenance ?? { clientCommit: discoveredCommit, runnerCommit: discoveredCommit };
+  const openingPromptHashes: Record<string, string> = {};
   await mkdir(input.out, { recursive: true });
   const wakeLog = join(input.out, "wakes.ndjson");
   await writeFile(wakeLog, "");
@@ -677,6 +718,7 @@ export async function runGoal(
     // Every seat starts once. Subsequent wakes follow the configured routing policy.
     const seatLoop = async (seat: SeatRecord) => {
       let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting });
+      openingPromptHashes[seat.name] = sha256(prompt);
       let wake: WakeShape | null = null;
       let failedInARow = 0;
       while (!ended) {
@@ -749,6 +791,16 @@ export async function runGoal(
     }
     const episodePath = join(input.out, "episode.json");
     const episode = JSON.parse(await readFile(episodePath, "utf8")) as Record<string, unknown>;
+    const adHocProfile = {
+      command: "goal run",
+      room_type: input.roomType ?? "board",
+      delivery: "runner-owned-turn-loop",
+      initial_wake: "all-seats",
+      mention_gate: mentionGate,
+      task_gate: taskGate,
+      message_routing: messageRouting,
+    };
+    const profile = input.harnessMode?.profile ?? adHocProfile;
     await writeFile(
       episodePath,
       `${JSON.stringify(
@@ -760,6 +812,22 @@ export async function runGoal(
           mention_gate: input.mentionGate ?? false,
           task_gate: input.taskGate ?? false,
           message_routing: messageRouting,
+          harness: {
+            mode: input.harnessMode?.name ?? null,
+            spec_sha256: input.harnessMode?.specSha256 ?? null,
+            resolved_profile: {
+              ...profile,
+              web_search: input.webSearch ?? "live",
+              turn_limit_s: turnLimitSeconds,
+              until: input.until,
+            },
+            client_commit: codeProvenance.clientCommit,
+            runner_commit: codeProvenance.runnerCommit,
+            image: plan.image,
+            models: records.map((seat) => ({ seat: seat.name, driver: seat.driver, model: seat.model })),
+            goal_sha256: sha256(input.goal),
+            opening_prompt_sha256: Object.fromEntries(records.map((seat) => [seat.name, openingPromptHashes[seat.name] ?? null])),
+          },
           agents: records,
           totals: { ...(episode.totals as object), tokens: spend(), cached_tokens: records.reduce((sum, seat) => sum + seat.usage.cached, 0) },
         },
