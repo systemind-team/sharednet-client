@@ -122,7 +122,17 @@ async function run(
   const { service: kept, ackFailure, fetch: fetchOverride, onStderr, ...dependencyOverrides } = overrides;
   const service = kept ?? { delivered_through: 0, acked_through: 0 };
   const acks: number[] = [];
+  const heartbeats: Array<{ through: number }> = [];
   const scriptedFetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+    const heartbeat = /\/api\/v1\/rooms\/rom_[A-Za-z0-9]+\/subscription\/heartbeat$/.exec(new URL(String(input)).pathname);
+    if (heartbeat) {
+      const body = JSON.parse(String(init.body)) as { through: number };
+      heartbeats.push(body);
+      return new Response(JSON.stringify({ renewed: true, subscription: { room_id: ROOM_ID, ...service } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     const place = /\/api\/v1\/rooms\/(rom_[A-Za-z0-9]+)\/(subscription|ack)$/.exec(new URL(String(input)).pathname);
     if (place) {
       if (place[2] === "ack" && ackFailure) {
@@ -181,7 +191,7 @@ async function run(
     },
     ...(dependencyOverrides as Parameters<typeof runCli>[1]),
   });
-  return { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), requests, acks, service };
+  return { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), requests, acks, heartbeats, service };
 }
 
 function own(sequence: number, content: string) {
@@ -2230,6 +2240,7 @@ describe("sharednet say and wait", () => {
       // The open chat answers for itself; serve says nothing, and the queue keeps the line.
       expect(result.requests.filter((request) => request.init.method === "POST")).toHaveLength(0);
       expect(result.acks).toEqual([2]);
+      expect(result.heartbeats).toEqual([{ through: 2 }]);
       expect(result.stderr).toContain("queued into its open Codex chat (thread 019a-codex-thread); it answers in the Room itself");
     });
 
@@ -2371,6 +2382,7 @@ describe("sharednet say and wait", () => {
       expect(new URL(result.requests[2]!.url).searchParams.get("after")).toBe("1");
       expect(JSON.parse(String(result.requests[4]!.init.body))).toEqual({ content: "@host 2+2 is 4." });
       expect(result.acks).toEqual([2]);
+      expect(result.heartbeats).toEqual([{ through: 2 }, { through: 2 }]);
     });
 
     it("reads none of a seat's lines while its wake program does not start, and looks again until it does", async () => {
@@ -4647,9 +4659,10 @@ describe("seats that resume one session take turns", () => {
     await writeFile(join(paths.roomsDir, roomId, `${MEMBER_ID}.serve-cursor`), "1\n", { mode: 0o600 });
   }
 
-  function multiRoomWakeService(roomIds: string[]) {
+  function multiRoomWakeService(roomIds: string[], heartbeatStatus: number | "hang" = 200) {
     const waits = new Map<string, number>();
     const acknowledged = new Map(roomIds.map((roomId) => [roomId, 1]));
+    const heartbeats: Array<{ roomId: string; through: number }> = [];
     const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
       status,
       headers: { "content-type": "application/json" },
@@ -4661,6 +4674,17 @@ describe("seats that resume one session take turns", () => {
     });
     const fetch: typeof globalThis.fetch = async (input, init = {}) => {
       const url = new URL(String(input));
+      const heartbeat = /\/rooms\/(rom_[A-Za-z0-9]+)\/subscription\/heartbeat$/.exec(url.pathname);
+      if (heartbeat && roomIds.includes(heartbeat[1]!)) {
+        const { through } = JSON.parse(String(init.body)) as { through: number };
+        heartbeats.push({ roomId: heartbeat[1]!, through });
+        if (heartbeatStatus === "hang") return new Promise<Response>(() => undefined);
+        if (heartbeatStatus !== 200) return response({ error: { code: "route_not_found", message: "Not found" } }, heartbeatStatus);
+        return response({
+          renewed: true,
+          subscription: { room_id: heartbeat[1], delivered_through: through, acked_through: acknowledged.get(heartbeat[1]!) },
+        });
+      }
       const match = /\/rooms\/(rom_[A-Za-z0-9]+)(?:\/(subscription|ack|wait|messages))?$/.exec(url.pathname);
       if (!match || !roomIds.includes(match[1]!)) throw new Error(`Unexpected request ${init.method ?? "GET"} ${url}`);
       const roomId = match[1]!;
@@ -4689,8 +4713,128 @@ describe("seats that resume one session take turns", () => {
       if (route === undefined) return response({ room: { id: roomId, type: "board" } });
       throw new Error(`Unexpected request ${init.method ?? "GET"} ${url}`);
     };
-    return { acknowledged, fetch };
+    return { acknowledged, heartbeats, fetch };
   }
+
+  it("heartbeats only the Room span owned by a running resumed turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const space = await workspace();
+      const wake: SeatWake = { driver: "codex", session: "session-one", cwd: space.project, command: "codex", codex_home: "/codex-home" };
+      await storeDrivenSeat(space, ROOM_ID, wake);
+      const service = multiRoomWakeService([ROOM_ID]);
+      const started = deferred();
+      const finish = deferred();
+      const serving = run(["serve", "--json"], space, [], CODEX_RUNTIME, {
+        fetch: service.fetch,
+        runTurn: async (spec) => {
+          started.resolve();
+          await finish.promise;
+          return noReply(spec);
+        },
+      });
+
+      await started.promise;
+      expect(service.heartbeats).toEqual([{ roomId: ROOM_ID, through: 2 }]);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(service.heartbeats).toEqual([
+        { roomId: ROOM_ID, through: 2 },
+        { roomId: ROOM_ID, through: 2 },
+        { roomId: ROOM_ID, through: 2 },
+      ]);
+
+      finish.resolve();
+      const result = await serving;
+      expect(result.exitCode).toBe(0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(service.heartbeats).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps working against an older server that has no heartbeat route", async () => {
+    const space = await workspace();
+    const wake: SeatWake = { driver: "codex", session: "session-one", cwd: space.project, command: "codex", codex_home: "/codex-home" };
+    await storeDrivenSeat(space, ROOM_ID, wake);
+    const service = multiRoomWakeService([ROOM_ID], 404);
+
+    const result = await run(["serve", "--json"], space, [], CODEX_RUNTIME, {
+      fetch: service.fetch,
+      runTurn: async (spec) => noReply(spec),
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(service.heartbeats).toEqual([{ roomId: ROOM_ID, through: 2 }]);
+    expect(service.acknowledged.get(ROOM_ID)).toBe(2);
+  });
+
+  it("stops renewing after an open chat takes the handoff", async () => {
+    const space = await workspace();
+    const wake: SeatWake = { driver: "codex", session: "session-one", cwd: space.project, command: "codex", codex_home: "/codex-home" };
+    await storeDrivenSeat(space, ROOM_ID, wake);
+    const service = multiRoomWakeService([ROOM_ID]);
+    let turn = 0;
+
+    const result = await run(["serve", "--json"], space, [], CODEX_RUNTIME, {
+      fetch: service.fetch,
+      runTurn: async () => {
+        turn += 1;
+        return turn === 1
+          ? { exitCode: 1, stdout: "", stderr: "thread already has an active writer", timedOut: false }
+          : { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(service.heartbeats).toEqual([{ roomId: ROOM_ID, through: 2 }]);
+    expect(service.acknowledged.get(ROOM_ID)).toBe(2);
+  });
+
+  it("leaves a busy connector's renewed span unacknowledged without a racy release", async () => {
+    const space = await workspace();
+    const wake: SeatWake = { driver: "codex", session: "session-one", cwd: space.project, command: "codex", codex_home: "/codex-home" };
+    await storeDrivenSeat(space, ROOM_ID, wake);
+    const service = multiRoomWakeService([ROOM_ID]);
+    let turn = 0;
+
+    const result = await run(["serve", "--json"], space, [], CODEX_RUNTIME, {
+      fetch: service.fetch,
+      sleep: async () => undefined,
+      runTurn: async () => {
+        turn += 1;
+        return turn === 1
+          ? { exitCode: 1, stdout: "", stderr: "thread already has an active writer", timedOut: false }
+          : { exitCode: 2, stdout: "", stderr: "queue unavailable", timedOut: false };
+      },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(service.heartbeats).toEqual([{ roomId: ROOM_ID, through: 2 }]);
+    expect(service.acknowledged.get(ROOM_ID)).toBe(1);
+  });
+
+  it("does not delay a handoff when advisory heartbeat I/O never answers", async () => {
+    const space = await workspace();
+    const wake: SeatWake = { driver: "codex", session: "session-one", cwd: space.project, command: "codex", codex_home: "/codex-home" };
+    await storeDrivenSeat(space, ROOM_ID, wake);
+    const service = multiRoomWakeService([ROOM_ID], "hang");
+    let turn = 0;
+
+    const result = await run(["serve", "--json"], space, [], CODEX_RUNTIME, {
+      fetch: service.fetch,
+      runTurn: async () => {
+        turn += 1;
+        return turn === 1
+          ? { exitCode: 1, stdout: "", stderr: "thread already has an active writer", timedOut: false }
+          : { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(service.heartbeats).toEqual([{ roomId: ROOM_ID, through: 2 }]);
+    expect(service.acknowledged.get(ROOM_ID)).toBe(2);
+  });
 
   it("does not run a same-session wake that was turned off while it waited", async () => {
     const space = await workspace();
@@ -4722,6 +4866,8 @@ describe("seats that resume one session take turns", () => {
     });
     await firstStarted.promise;
     await vi.waitFor(() => expect(waitingRoom).not.toBeNull());
+    expect(service.heartbeats).toHaveLength(1);
+    expect(service.heartbeats[0]!.roomId).not.toBe(waitingRoom);
     const { getStoragePaths, readRoomCredential, writeRoomCredential } = await import("./storage.ts");
     const paths = getStoragePaths(space.env);
     const queued = (await readRoomCredential(paths, waitingRoom!, MEMBER_ID))!;
@@ -4732,6 +4878,7 @@ describe("seats that resume one session take turns", () => {
     const result = await serving;
     expect(result.exitCode).toBe(0);
     expect(turns).toHaveLength(1);
+    expect(service.heartbeats).toHaveLength(1);
     expect(service.acknowledged.get(waitingRoom!)).toBe(1);
   });
 

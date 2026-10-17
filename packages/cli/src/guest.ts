@@ -2721,6 +2721,37 @@ async function saveWakeProgress(path: string, value: unknown): Promise<void> {
  * and still carries everything said meanwhile.
  */
 const MAX_TURNS_PER_HOUR = 30;
+/** Renew an active Room span well inside the server's legacy 20-minute inference window. */
+const ACTIVE_TURN_HEARTBEAT_MS = 30_000;
+
+/**
+ * Keep one requested Room handover visibly owned during a driven plugin delivery attempt. The heartbeat is
+ * advisory: an older server may not have the endpoint, and a network failure must not cancel model
+ * work. The server accepts a pulse only while `acked < through === delivered` for this seat+Room.
+ */
+async function withActiveTurnHeartbeat(
+  heartbeat: () => Promise<unknown>,
+  work: () => Promise<Delivery>,
+): Promise<Delivery> {
+  let heartbeatInFlight: Promise<void> | null = null;
+  const pulse = () => {
+    if (heartbeatInFlight !== null) return;
+    heartbeatInFlight = heartbeat()
+      .then(() => undefined, () => undefined)
+      .finally(() => { heartbeatInFlight = null; });
+  };
+  // The span may have waited behind another Room using the same session for longer than the
+  // server's legacy window. Mark the plugin delivery attempt without waiting for the first interval.
+  pulse();
+  const timer = setInterval(pulse, ACTIVE_TURN_HEARTBEAT_MS);
+  timer.unref();
+  try {
+    return await work();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 /**
  * Seats that resume the same session take turns. While one seat's turn holds the session, a second
  * resume would find an "active writer" and queue its lines into that turn, which neither belongs to
@@ -3086,7 +3117,15 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         const deadline = started + timeoutMs;
         const checkpointAt = deadline - Math.min(120_000, timeoutMs / 4);
         const prompt = wakeTurnPrompt(about) + `\n\nExecution budget: ${timeoutMs / 60_000} minutes; deadline ${new Date(deadline).toISOString()}. Save progress by ${new Date(checkpointAt).toISOString()} and after each significant milestone: sharednet wake checkpoint "completed; next step; blockers; evidence paths" --as ${seat.member_id}. Keep secrets out. Previous checkpoint (if any): ${checkpoint}. Read it to recover context, then verify current state before repeating actions. A checkpoint does not authorize automatic retries. You can set the NEXT turn's limit with sharednet wake limit 60m --as ${seat.member_id}; this does not extend this running turn. This budget applies to headless execution, not a handoff into an open chat.${compiled}`;
-        const delivery = await plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs });
+        const delivery = await withActiveTurnHeartbeat(
+          () => client.request(
+            "POST",
+            `/rooms/${encodeURIComponent(seat.room_id)}/subscription/heartbeat`,
+            seat.member_token,
+            { through },
+          ),
+          () => plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs }),
+        );
         return { state: "delivered", delivery, pluginLabel: plugin.label, started, timeoutMs };
       };
       let ran: WakeRun;
