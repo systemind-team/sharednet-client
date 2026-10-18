@@ -34,8 +34,10 @@ async function lifecycleScenario(options: {
   remainingAfterRemove?: boolean;
   createFailureFor?: string;
   startFailureFor?: string;
+  holdFirstCreate?: boolean;
   holdWatch?: boolean;
   signals?: boolean;
+  signalOnSubscribe?: ServeDemoSignal;
   watchError?: string;
 } = {}) {
   const out = await temporary();
@@ -46,8 +48,18 @@ async function lifecycleScenario(options: {
     ["codex-2", "i_AgentTwo02"],
     ["codex-3", "i_AgentTre03"],
   ]);
+  let enterFirstCreate!: () => void;
+  const firstCreateEntered = new Promise<void>((resolve) => { enterFirstCreate = resolve; });
+  let finishFirstCreate!: () => void;
+  const heldFirstCreate = new Promise<void>((resolve) => { finishFirstCreate = resolve; });
+  let firstCreateHeld = false;
   const docker: DockerRunner = async (args) => {
     calls.push([...args]);
+    if (options.holdFirstCreate && args[0] === "create" && !firstCreateHeld) {
+      firstCreateHeld = true;
+      enterFirstCreate();
+      await heldFirstCreate;
+    }
     if (args[0] === "create" && args.includes(containerName(ROOM, options.createFailureFor ?? "missing"))) {
       return { code: 125, stdout: "", stderr: "name already exists" };
     }
@@ -73,10 +85,15 @@ async function lifecycleScenario(options: {
     }
     return { code: 0, stdout: "", stderr: "" };
   };
+  const closes: Array<Record<string, unknown>> = [];
   const client = {
-    async request(method: string, path: string) {
+    async request(method: string, path: string, _token: string, body?: unknown) {
       if (method === "POST" && path.endsWith("/goal")) return { room: {}, message: { sequence: 1 } };
       if (method === "POST" && path.endsWith("/owner-messages")) return { message: { sequence: 2 } };
+      if (method === "POST" && path.endsWith("/close")) {
+        closes.push(body as Record<string, unknown>);
+        return { room: { state: "closed" } };
+      }
       return {};
     },
   } as unknown as ApiClient;
@@ -94,10 +111,17 @@ async function lifecycleScenario(options: {
   const heldWatch = new Promise<void>((resolve) => { finishWatch = resolve; });
   const handlers = new Map<ServeDemoSignal, () => void>();
   const exits: number[] = [];
+  let subscribedSignalFired = false;
   let recordExit!: () => void;
   const exitCalled = new Promise<void>((resolve) => { recordExit = resolve; });
   const signalHost: ServeDemoSignalHost | undefined = options.signals ? {
-    on: (signal, listener) => { handlers.set(signal, listener); },
+    on: (signal, listener) => {
+      handlers.set(signal, listener);
+      if (signal === options.signalOnSubscribe && !subscribedSignalFired) {
+        subscribedSignalFired = true;
+        listener();
+      }
+    },
     off: (signal, listener) => { if (handlers.get(signal) === listener) handlers.delete(signal); },
     exit: (code) => { exits.push(code); recordExit(); },
   } : undefined;
@@ -126,7 +150,7 @@ async function lifecycleScenario(options: {
       return { room_id: ROOM, ended_by: { trigger: "after 20m", at: "2026-10-14T20:20:00.000Z", detail: null }, messages: 2, checks: 0, snapshots: 0, out };
     },
   });
-  return { calls, exits, exitCalled, finishWatch, handlers, promise, watchEntered };
+  return { calls, closes, exits, exitCalled, finishFirstCreate, finishWatch, firstCreateEntered, handlers, promise, watchEntered };
 }
 
 describe("serve-first Goal demo", () => {
@@ -423,7 +447,32 @@ describe("serve-first Goal demo", () => {
     expect(scenario.exits).toEqual([exitCode]);
     expect(scenario.calls.filter((args) => args[0] === "stop")).toHaveLength(1);
     expect(scenario.calls.filter((args) => args[0] === "rm")).toHaveLength(1);
+    expect(scenario.closes).toEqual([]);
     expect(scenario.handlers).toHaveLength(0);
+  });
+
+  it("keeps the Room open when SIGINT arrives before startup begins", async () => {
+    const scenario = await lifecycleScenario({ signals: true, signalOnSubscribe: "SIGINT" });
+
+    await scenario.exitCalled;
+    await expect(scenario.promise).rejects.toMatchObject({ code: "goal_interrupted" });
+    expect(scenario.calls.filter((args) => args[0] === "create")).toHaveLength(0);
+    expect(scenario.closes).toEqual([]);
+    expect(scenario.exits).toEqual([130]);
+  });
+
+  it("keeps the Room open when SIGINT arrives during startup", async () => {
+    const scenario = await lifecycleScenario({ signals: true, holdFirstCreate: true });
+    await scenario.firstCreateEntered;
+
+    scenario.handlers.get("SIGINT")?.();
+    scenario.finishFirstCreate();
+    await scenario.exitCalled;
+
+    await expect(scenario.promise).rejects.toMatchObject({ code: "goal_interrupted" });
+    expect(scenario.calls.filter((args) => args[0] === "create")).toHaveLength(1);
+    expect(scenario.closes).toEqual([]);
+    expect(scenario.exits).toEqual([130]);
   });
 
   it("surfaces a failed docker stop and still attempts the final removal", async () => {

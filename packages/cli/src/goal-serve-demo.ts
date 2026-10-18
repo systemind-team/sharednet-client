@@ -332,6 +332,7 @@ export async function runServeGoalDemo(
   };
 
   const closeFailedStart = async (reason: string) => {
+    if (interrupted) return;
     await client.request("POST", `/rooms/${encodeURIComponent(input.roomId)}/close`, apiKey, { detail: `goal serve-demo could not start: ${reason}`.slice(0, 2_000) }).catch(() => undefined);
   };
 
@@ -477,10 +478,12 @@ export async function runServeGoalDemo(
       );
       if (interrupted) throw interruptedError();
     } catch (error) {
-      await client.request("POST", `/rooms/${encodeURIComponent(input.roomId)}/close`, apiKey, {
-        trigger: "runner_error",
-        detail: `goal serve-demo stopped: ${error instanceof Error ? error.message : "watcher failed"}`.slice(0, 2_000),
-      }).catch(() => undefined);
+      if (!interrupted) {
+        await client.request("POST", `/rooms/${encodeURIComponent(input.roomId)}/close`, apiKey, {
+          trigger: "runner_error",
+          detail: `goal serve-demo stopped: ${error instanceof Error ? error.message : "watcher failed"}`.slice(0, 2_000),
+        }).catch(() => undefined);
+      }
       throw error;
     }
 
