@@ -85,7 +85,7 @@ Every workspace has exactly these roles:
 | Role | Stable seat name | Responsibility |
 | --- | --- | --- |
 | Coordinator | `coordinator` | Decompose the goal, issue typed work, route exact handoffs, resolve the final work, and synthesize the result. |
-| Builder | `builder` | Accept the typed work, change the shared workspace, upload the final `submission` artifact, and report its result reference and digest. |
+| Builder | `builder` | Accept the typed work, change the shared workspace, upload exactly one workspace-rooted tar artifact named `submission`, and report its result reference and digest. |
 | Reviewer | `reviewer` | Independently download and inspect the exact submitted artifact, upload review evidence, and issue `verification.pass` for the current result. |
 
 All three roles use Codex in v1. One model is shared by the team. The number of
@@ -221,19 +221,28 @@ all of these conditions in order:
 6. A post-check read returns the same compiled digest and candidate revision,
    the same three receipts, and the same idle/no-handoff state.
 
-The semantic check runs only after conditions 1 through 4 hold. It runs in the
-fresh checker container inherited from PR 48, with the workspace mounted at
-`/workspace` and these non-secret environment variables:
+Local v1 accepts exactly one deliverable named `submission`, encoded as a tar
+archive rooted at the workspace to check. The runner downloads that exact
+artifact and verifies its bytes against the compiled artifact receipt. It announces the candidate
+revision and the deterministic artifact-snapshot digest so each role has an
+actionable receipt value. The semantic check runs only after conditions 1
+through 4 hold. It runs in a fresh, network-disabled checker container with a
+read-only root: the tar is mounted read-only and extracted into disposable
+`/workspace` tmpfs, while a separate writable `/tmp` tmpfs supports ordinary
+test and build tools. The snapshot manifest remains in the read-only
+`/prometheus-input` mount. The mutable shared workspace is never mounted. The
+checker receives these non-secret environment variables:
 
 ```text
 SHAREDNET_PROMETHEUS_RUN_ID
 SHAREDNET_PROMETHEUS_WORK_ID
 SHAREDNET_PROMETHEUS_RESULT_REF
 SHAREDNET_PROMETHEUS_REVISION_SHA256
+SHAREDNET_PROMETHEUS_ARTIFACT_SNAPSHOT_SHA256
 ```
 
 The run record stores its start and finish times, exit code, bounded output,
-output SHA-256, and candidate revision. A nonzero check blocks that exact
+output SHA-256, candidate revision, and artifact-snapshot SHA-256. A nonzero check blocks that exact
 revision and produces one bounded, exact-`@coordinator` feedback message. It is
 not retried until compiled work produces a different revision. A passing check
 is discarded if the post-check read sees a different revision or any new

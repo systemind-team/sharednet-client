@@ -291,6 +291,25 @@ describe("Prometheus candidate revisions", () => {
   });
 
   it.each([
+    ["renamed", ["bundle"], { bundle: SUBMISSION }],
+    ["multiple", ["submission", "report"], { submission: SUBMISSION, report: "art_Report0001" }],
+  ])("rejects a %s local-v1 deliverable contract", (_case, deliverables, artifacts) => {
+    const state = candidateFixture();
+    state.projection.work.W1!.deliverables = deliverables;
+    state.projection.work.W1!.artifacts = artifacts;
+    state.events[4]!.refs.artifacts = artifacts;
+    if (deliverables.length > 1) {
+      (state.events[4]!.refs.artifact_receipts as Record<string, unknown>)["art_Report0001"] = {
+        id: "art_Report0001",
+        sha256: "c".repeat(64),
+      };
+    }
+    const parsed = parsePrometheusCandidate(state, ROSTER);
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) expect(parsed.reasons).toContain("invalid-submission-artifact");
+  });
+
+  it.each([
     ["nonterminal-work", (state: TestCompiledState) => { state.projection.work.W0!.state = "OPEN"; }],
     ["ambiguous-head", (state: TestCompiledState) => {
       state.projection.work.W2 = { ...structuredClone(state.projection.work.W0!), supersedes: null };
@@ -324,22 +343,13 @@ describe("Prometheus candidate revisions", () => {
     if (!parsed.ok) expect(parsed.reasons).toContain(reason);
   });
 
-  it("sorts work artifacts and verification evidence before hashing the revision", () => {
+  it("sorts verification evidence before hashing the revision", () => {
     const first = candidateFixture();
     const head = first.projection.work.W1!;
     const result = first.events[4]!;
-    const report = "art_Report0001";
-    const reportSha256 = "c".repeat(64);
     const secondRequirement = "verify:secondary";
     const secondEvidence = "art_Proof00001";
     const secondEvidenceSha256 = "e".repeat(64);
-    head.deliverables = ["report", "submission"];
-    head.artifacts = { report, submission: SUBMISSION };
-    result.refs.artifacts = { report, submission: SUBMISSION };
-    result.refs.artifact_receipts = {
-      [report]: { id: report, sha256: reportSha256 },
-      [SUBMISSION]: { id: SUBMISSION, sha256: SUBMISSION_SHA256 },
-    };
     head.requirements = {
       [secondRequirement]: {
         kind: "verify", eligible: [REVIEWER], q: 1, predicate: null,
@@ -361,15 +371,9 @@ describe("Prometheus candidate revisions", () => {
 
     const second = structuredClone(first);
     const secondHead = second.projection.work.W1!;
-    secondHead.artifacts = { submission: SUBMISSION, report };
     secondHead.requirements = {
       [REQUIREMENT]: secondHead.requirements[REQUIREMENT]!,
       [secondRequirement]: secondHead.requirements[secondRequirement]!,
-    };
-    second.events[4]!.refs.artifacts = { submission: SUBMISSION, report };
-    second.events[4]!.refs.artifact_receipts = {
-      [SUBMISSION]: { id: SUBMISSION, sha256: SUBMISSION_SHA256 },
-      [report]: { id: report, sha256: reportSha256 },
     };
 
     const one = parsePrometheusCandidate(first, ROSTER);
@@ -378,7 +382,7 @@ describe("Prometheus candidate revisions", () => {
     expect(one.ok).toBe(true);
     expect(two.ok).toBe(true);
     if (one.ok && two.ok) {
-      expect(one.candidate.artifacts.map((artifact) => artifact.name)).toEqual(["report", "submission"]);
+      expect(one.candidate.artifacts.map((artifact) => artifact.name)).toEqual(["submission"]);
       expect(one.candidate.verifications.map((verification) => verification.eventHash)).toEqual([
         VERIFICATION_HASH,
         `sha256:${"7".repeat(24)}`,

@@ -1,8 +1,11 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
+import type { ApiClient } from "./api-client.ts";
 import { localError } from "./errors.ts";
 import { type DockerRunner, type RunPlan } from "./goal-run.ts";
-import { PROMETHEUS_ROLES, type PrometheusRole } from "./prometheus-protocol.ts";
+import { PROMETHEUS_ROLES, type CandidateArtifact, type PrometheusRole } from "./prometheus-protocol.ts";
 import type { PrometheusRoster, PrometheusTeamState } from "./prometheus-state.ts";
 
 const CONTAINER_WORKSPACE = "/workspace";
@@ -12,6 +15,7 @@ const CONTAINER_AUTH = "/run/codex/auth.json";
 const THREAD_MARKER = `${CONTAINER_HOME}/.prometheus-thread-id`;
 const MAX_OUTPUT_BYTES = 64_000;
 const PROMETHEUS_LABEL = "io.sharednet.prometheus";
+const ARTIFACT_MANIFEST = ".sharednet-artifacts.json";
 
 export interface PrometheusRuntimeDependencies {
   docker: DockerRunner;
@@ -406,25 +410,128 @@ function bounded(raw: string): string {
   return bytes.byteLength <= MAX_OUTPUT_BYTES ? raw : bytes.subarray(bytes.byteLength - MAX_OUTPUT_BYTES).toString("utf8");
 }
 
+interface ArtifactSnapshotManifest {
+  schema_version: 1;
+  artifacts: Array<{ name: string; artifact_id: string; sha256: string; file: string }>;
+  snapshot_sha256: string;
+}
+
+export interface PrometheusArtifactSnapshot {
+  path: string;
+  sha256: string;
+  artifacts: ArtifactSnapshotManifest["artifacts"];
+}
+
+function snapshotDigest(artifacts: ArtifactSnapshotManifest["artifacts"]): string {
+  return createHash("sha256").update(JSON.stringify({ schema_version: 1, artifacts }), "utf8").digest("hex");
+}
+
+async function verifyArtifactSnapshot(target: string, expected: readonly CandidateArtifact[]): Promise<PrometheusArtifactSnapshot> {
+  let parsed: ArtifactSnapshotManifest;
+  try {
+    parsed = JSON.parse(await readFile(`${target}/${ARTIFACT_MANIFEST}`, "utf8")) as ArtifactSnapshotManifest;
+  } catch {
+    throw localError("prometheus_artifact_snapshot_invalid", "The saved Prometheus artifact snapshot is missing or invalid.");
+  }
+  if (parsed.schema_version !== 1 || !Array.isArray(parsed.artifacts) || !/^[0-9a-f]{64}$/.test(parsed.snapshot_sha256)) {
+    throw localError("prometheus_artifact_snapshot_invalid", "The saved Prometheus artifact snapshot is invalid.");
+  }
+  const wanted = expected.map((artifact) => ({ name: artifact.name, artifact_id: artifact.artifactId, sha256: artifact.sha256 }));
+  const actual = parsed.artifacts.map(({ name, artifact_id, sha256 }) => ({ name, artifact_id, sha256 }));
+  if (JSON.stringify(actual) !== JSON.stringify(wanted) || snapshotDigest(parsed.artifacts) !== parsed.snapshot_sha256) {
+    throw localError("prometheus_artifact_snapshot_invalid", "The saved Prometheus artifact snapshot does not match the current reviewed artifacts.");
+  }
+  for (const artifact of parsed.artifacts) {
+    if (artifact.file !== "submission.tar") {
+      throw localError("prometheus_artifact_snapshot_invalid", "The saved Prometheus artifact snapshot contains an unsafe filename.");
+    }
+    const bytes = await readFile(`${target}/${artifact.file}`).catch(() => null);
+    if (bytes === null || createHash("sha256").update(bytes).digest("hex") !== artifact.sha256) {
+      throw localError("prometheus_artifact_snapshot_invalid", "The saved Prometheus artifact bytes no longer match their reviewed digest.");
+    }
+  }
+  return { path: target, sha256: parsed.snapshot_sha256, artifacts: parsed.artifacts };
+}
+
+/** Download the service-attested deliverables once and expose only those immutable bytes to the semantic checker. */
+export async function materializePrometheusArtifactSnapshot(
+  artifacts: readonly CandidateArtifact[],
+  client: Pick<ApiClient, "requestBytes">,
+  memberToken: string,
+  target: string,
+): Promise<PrometheusArtifactSnapshot> {
+  if (artifacts.length !== 1 || artifacts[0]?.name !== "submission") {
+    throw localError("prometheus_artifact_snapshot_invalid", "Prometheus local v1 requires exactly one submission tar artifact.");
+  }
+  try {
+    return await verifyArtifactSnapshot(target, artifacts);
+  } catch (error) {
+    if ((error as { code?: string }).code !== "prometheus_artifact_snapshot_invalid") throw error;
+    const exists = await readFile(`${target}/${ARTIFACT_MANIFEST}`).then(() => true, () => false);
+    if (exists) throw error;
+  }
+
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  const temporary = `${target}.tmp-${randomUUID()}`;
+  await mkdir(temporary, { mode: 0o700 });
+  try {
+    const manifestArtifacts: ArtifactSnapshotManifest["artifacts"] = [];
+    for (const artifact of artifacts) {
+      const downloaded = await client.requestBytes(`/artifacts/${encodeURIComponent(artifact.artifactId)}/content`, memberToken);
+      const digest = createHash("sha256").update(downloaded.bytes).digest("hex");
+      if (digest !== artifact.sha256 || (downloaded.sha256 !== null && downloaded.sha256 !== artifact.sha256)) {
+        throw localError("prometheus_artifact_changed", `Artifact ${artifact.artifactId} does not match its compiled receipt.`);
+      }
+      const file = "submission.tar";
+      await writeFile(`${temporary}/${file}`, downloaded.bytes, { flag: "wx", mode: 0o444 });
+      manifestArtifacts.push({ name: artifact.name, artifact_id: artifact.artifactId, sha256: artifact.sha256, file });
+    }
+    const sha256 = snapshotDigest(manifestArtifacts);
+    const manifest: ArtifactSnapshotManifest = { schema_version: 1, artifacts: manifestArtifacts, snapshot_sha256: sha256 };
+    await writeFile(`${temporary}/${ARTIFACT_MANIFEST}`, `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx", mode: 0o444 });
+    await chmod(temporary, 0o555);
+    try {
+      await rename(temporary, target);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST" && (error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+      await chmod(temporary, 0o700);
+      await rm(temporary, { recursive: true, force: true });
+    }
+    return verifyArtifactSnapshot(target, artifacts);
+  } catch (error) {
+    await chmod(temporary, 0o700).catch(() => undefined);
+    await rm(temporary, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 export async function runPrometheusCheck(
-  runtime: { image: string; workspace: string },
+  runtime: { image: string; snapshot: string; snapshotSha256: string },
   check: string,
-  environment: Record<"SHAREDNET_PROMETHEUS_RUN_ID" | "SHAREDNET_PROMETHEUS_WORK_ID" | "SHAREDNET_PROMETHEUS_RESULT_REF" | "SHAREDNET_PROMETHEUS_REVISION_SHA256", string>,
+  environment: Record<"SHAREDNET_PROMETHEUS_RUN_ID" | "SHAREDNET_PROMETHEUS_WORK_ID" | "SHAREDNET_PROMETHEUS_RESULT_REF" | "SHAREDNET_PROMETHEUS_REVISION_SHA256" | "SHAREDNET_PROMETHEUS_ARTIFACT_SNAPSHOT_SHA256", string>,
   dependencies: Pick<PrometheusRuntimeDependencies, "docker" | "now"> & { timeoutMs?: number; signal?: AbortSignal },
 ): Promise<SemanticCheckResult> {
   const timeoutMs = dependencies.timeoutMs ?? 120_000;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw localError("prometheus_deadline_reached", "The Prometheus deadline passed before the semantic check could start.");
   }
+  if (runtime.snapshotSha256 !== environment.SHAREDNET_PROMETHEUS_ARTIFACT_SNAPSHOT_SHA256) {
+    throw localError("prometheus_artifact_snapshot_invalid", "The semantic check metadata does not match the mounted artifact snapshot.");
+  }
   const now = dependencies.now ?? (() => new Date());
   const startedAt = now().toISOString();
   const result = await dependencies.docker([
-    "run", "--rm", "--volume", `${runtime.workspace}:${CONTAINER_WORKSPACE}`,
+    "run", "--rm", "--read-only", "--network", "none", "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges", "--volume", `${runtime.snapshot}:/prometheus-input:ro`,
+    "--tmpfs", `${CONTAINER_WORKSPACE}:rw,nosuid,nodev,size=1g`,
+    "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m",
     "--workdir", CONTAINER_WORKSPACE,
     ...Object.keys(environment).flatMap((name) => ["-e", name]),
     runtime.image,
     "timeout", "--signal=TERM", "--kill-after=5s", `${(timeoutMs / 1_000).toFixed(3)}s`,
-    "sh", "-c", check,
+    "sh", "-c",
+    "set -eu; tar -xf /prometheus-input/submission.tar -C /workspace --no-same-owner --no-same-permissions; exec sh -c \"$1\"",
+    "prometheus-check", check,
   ], { env: environment, signal: dependencies.signal });
   const output = bounded(`${result.stdout}${result.stderr}`);
   return {

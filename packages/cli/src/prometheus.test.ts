@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { DEFAULT_IMAGE, type DockerRunner, type RunPlan } from "./goal-run.ts";
-import { cancelPrometheusRun, evaluatePrometheusBarrier, prometheusKickoff, prometheusStatus, readPrometheusMessages, resumePrometheusRun } from "./prometheus.ts";
+import { cancelPrometheusRun, evaluatePrometheusBarrier, prometheusCandidateHandoff, prometheusKickoff, prometheusStatus, readPrometheusMessages, resumePrometheusRun } from "./prometheus.ts";
 import { claimMonitor, prometheusPaths, readActiveRun, requestCancel, reserveActiveRun, writeRun, writeTeam, type PrometheusRunState, type PrometheusTeamState } from "./prometheus-state.ts";
 import type { ProcessProbe } from "./process-identity.ts";
 
@@ -190,8 +190,18 @@ describe("Prometheus completion barrier", () => {
     expect(kickoff).toContain("i_build");
     expect(kickoff).toContain("i_review");
     expect(kickoff).toContain("verification.pass");
+    expect(kickoff).toContain("runner will announce the exact candidate revision");
     expect(kickoff).not.toContain("@all");
     expect(kickoff).not.toContain("@builder");
+  });
+
+  it("builds an exact-member handoff containing the runner-derived revision and pinned snapshot", () => {
+    const roster = { coordinator: { member_id: "i_coord", thread_id: "t1", container_name: "c1" }, builder: { member_id: "i_build", thread_id: "t2", container_name: "c2" }, reviewer: { member_id: "i_review", thread_id: "t3", container_name: "c3" } };
+    const handoff = prometheusCandidateHandoff("run-1", roster, candidate, "c".repeat(64));
+    expect(handoff).toContain("@i_coord @i_build @i_review");
+    expect(handoff).toContain(candidate.revisionSha256);
+    expect(handoff).toContain(`artifact_snapshot_sha256=${"c".repeat(64)}`);
+    expect(handoff).toContain('"run_id":"run-1"');
   });
 });
 

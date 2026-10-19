@@ -128,6 +128,7 @@ export interface PrometheusCandidateSummary {
 
 export interface PrometheusCheckSummary {
   revision_sha256: string;
+  artifact_snapshot_sha256: string;
   started_at: string;
   finished_at: string;
   exit_code: number;
@@ -398,7 +399,7 @@ function parseCandidate(value: unknown, source: string): PrometheusCandidateSumm
 function parseCheck(value: unknown, source: string): PrometheusCheckSummary {
   const object = record(
     value,
-    ["revision_sha256", "started_at", "finished_at", "exit_code", "output", "output_sha256"],
+    ["revision_sha256", "artifact_snapshot_sha256", "started_at", "finished_at", "exit_code", "output", "output_sha256"],
     source,
   );
   const startedAt = timestamp(object.started_at, source);
@@ -406,6 +407,7 @@ function parseCheck(value: unknown, source: string): PrometheusCheckSummary {
   if (Date.parse(finishedAt) < Date.parse(startedAt)) invalidState(source);
   return {
     revision_sha256: pattern(object.revision_sha256, HEX_SHA256, source),
+    artifact_snapshot_sha256: pattern(object.artifact_snapshot_sha256, HEX_SHA256, source),
     started_at: startedAt,
     finished_at: finishedAt,
     exit_code: safeInteger(object.exit_code, source),

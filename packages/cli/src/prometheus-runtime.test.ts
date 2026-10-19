@@ -1,9 +1,14 @@
 // @vitest-environment node
 
+import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { DEFAULT_IMAGE, type DockerRunner, type RunPlan } from "./goal-run.ts";
-import { ensurePrometheusListeners, ensurePrometheusTeam, inspectPrometheusRuntime, runPrometheusCheck } from "./prometheus-runtime.ts";
+import { ensurePrometheusListeners, ensurePrometheusTeam, inspectPrometheusRuntime, materializePrometheusArtifactSnapshot, runPrometheusCheck } from "./prometheus-runtime.ts";
 import type { PrometheusTeamState } from "./prometheus-state.ts";
 
 const plan: RunPlan = {
@@ -186,13 +191,14 @@ describe("persistent Prometheus runtime", () => {
       return { code: 7, stdout: "x".repeat(70_000), stderr: "tail" };
     };
     const result = await runPrometheusCheck(
-      { image: DEFAULT_IMAGE, workspace: plan.workspace },
+      { image: DEFAULT_IMAGE, snapshot: "/state/pinned-artifacts", snapshotSha256: "c".repeat(64) },
       "pnpm test",
       {
         SHAREDNET_PROMETHEUS_RUN_ID: "run-1",
         SHAREDNET_PROMETHEUS_WORK_ID: "work-1",
         SHAREDNET_PROMETHEUS_RESULT_REF: "evt-1",
         SHAREDNET_PROMETHEUS_REVISION_SHA256: "b".repeat(64),
+        SHAREDNET_PROMETHEUS_ARTIFACT_SNAPSHOT_SHA256: "c".repeat(64),
       },
       { docker, now: () => new Date("2026-10-18T00:00:00.000Z") },
     );
@@ -201,7 +207,14 @@ describe("persistent Prometheus runtime", () => {
       SHAREDNET_PROMETHEUS_WORK_ID: "work-1",
       SHAREDNET_PROMETHEUS_RESULT_REF: "evt-1",
       SHAREDNET_PROMETHEUS_REVISION_SHA256: "b".repeat(64),
+      SHAREDNET_PROMETHEUS_ARTIFACT_SNAPSHOT_SHA256: "c".repeat(64),
     });
+    expect(seen[0]!.args).toContain("/state/pinned-artifacts:/prometheus-input:ro");
+    expect(seen[0]!.args).toEqual(expect.arrayContaining(["--read-only", "--network", "none", "--cap-drop", "ALL", "--tmpfs"]));
+    expect(seen[0]!.args).toContain("/workspace:rw,nosuid,nodev,size=1g");
+    expect(seen[0]!.args).toContain("/tmp:rw,nosuid,nodev,size=256m");
+    expect(seen[0]!.args.join(" ")).toContain("tar -xf /prometheus-input/submission.tar");
+    expect(seen[0]!.args.join(" ")).not.toContain(`${plan.workspace}:`);
     expect(seen[0]!.args.join(" ")).not.toContain("run-1");
     expect(seen[0]!.args).toContain("timeout");
     expect(seen[0]!.args).toContain("120.000s");
@@ -218,13 +231,14 @@ describe("persistent Prometheus runtime", () => {
       options?.signal?.addEventListener("abort", () => resolve({ code: 143, stdout: "", stderr: "terminated" }), { once: true });
     });
     const pending = runPrometheusCheck(
-      { image: DEFAULT_IMAGE, workspace: plan.workspace },
+      { image: DEFAULT_IMAGE, snapshot: "/state/pinned-artifacts", snapshotSha256: "c".repeat(64) },
       "pnpm test",
       {
         SHAREDNET_PROMETHEUS_RUN_ID: "run-1",
         SHAREDNET_PROMETHEUS_WORK_ID: "work-1",
         SHAREDNET_PROMETHEUS_RESULT_REF: "evt-1",
         SHAREDNET_PROMETHEUS_REVISION_SHA256: "b".repeat(64),
+        SHAREDNET_PROMETHEUS_ARTIFACT_SNAPSHOT_SHA256: "c".repeat(64),
       },
       { docker, timeoutMs: 30_000, signal: controller.signal },
     );
@@ -233,6 +247,78 @@ describe("persistent Prometheus runtime", () => {
 
     await expect(pending).resolves.toMatchObject({ exitCode: 143 });
     expect(sawSignal).toBe(true);
+  });
+
+  it("refuses to launch a check when its announced snapshot digest differs from the mounted snapshot", async () => {
+    let launches = 0;
+    await expect(runPrometheusCheck(
+      { image: DEFAULT_IMAGE, snapshot: "/state/pinned-artifacts", snapshotSha256: "c".repeat(64) },
+      "pnpm test",
+      {
+        SHAREDNET_PROMETHEUS_RUN_ID: "run-1",
+        SHAREDNET_PROMETHEUS_WORK_ID: "work-1",
+        SHAREDNET_PROMETHEUS_RESULT_REF: "evt-1",
+        SHAREDNET_PROMETHEUS_REVISION_SHA256: "b".repeat(64),
+        SHAREDNET_PROMETHEUS_ARTIFACT_SNAPSHOT_SHA256: "d".repeat(64),
+      },
+      { docker: async () => { launches += 1; return { code: 0, stdout: "", stderr: "" }; } },
+    )).rejects.toMatchObject({ code: "prometheus_artifact_snapshot_invalid" });
+    expect(launches).toBe(0);
+  });
+
+  it("materializes and re-verifies an immutable snapshot of the exact reviewed artifact bytes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sharednet-prometheus-artifacts-"));
+    const snapshot = join(root, "snapshot");
+    const bytes = new TextEncoder().encode("reviewed artifact\n");
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    let downloads = 0;
+    const client = {
+      requestBytes: async (path: string) => {
+        downloads += 1;
+        expect(path).toBe("/artifacts/art_Submit0001/content");
+        return { bytes, filename: "submission.tar", sha256 };
+      },
+    };
+    try {
+      const first = await materializePrometheusArtifactSnapshot(
+        [{ name: "submission", artifactId: "art_Submit0001", sha256 }],
+        client as never,
+        "member",
+        snapshot,
+      );
+      const second = await materializePrometheusArtifactSnapshot(
+        [{ name: "submission", artifactId: "art_Submit0001", sha256 }],
+        client as never,
+        "member",
+        snapshot,
+      );
+
+      expect(downloads).toBe(1);
+      expect(second).toEqual(first);
+      expect(await readFile(join(snapshot, "submission.tar"), "utf8")).toBe("reviewed artifact\n");
+      expect((await stat(snapshot)).mode & 0o777).toBe(0o555);
+      expect((await stat(join(snapshot, "submission.tar"))).mode & 0o777).toBe(0o444);
+      expect(first.sha256).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      await import("node:fs/promises").then(({ chmod }) => chmod(snapshot, 0o700)).catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects artifact content that does not match the compiled receipt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sharednet-prometheus-artifacts-bad-"));
+    const snapshot = join(root, "snapshot");
+    try {
+      await expect(materializePrometheusArtifactSnapshot(
+        [{ name: "submission", artifactId: "art_Submit0001", sha256: "a".repeat(64) }],
+        { requestBytes: async () => ({ bytes: new TextEncoder().encode("changed"), filename: null, sha256: null }) } as never,
+        "member",
+        snapshot,
+      )).rejects.toMatchObject({ code: "prometheus_artifact_changed" });
+    } finally {
+      await import("node:fs/promises").then(({ chmod }) => chmod(snapshot, 0o700)).catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("restarts unfiltered listeners for saved seats without joining again", async () => {

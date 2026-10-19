@@ -13,6 +13,7 @@ import {
   parsePrometheusPolicy,
   parseTerminalReceipts,
   type CandidateResult,
+  type PrometheusCandidate,
   type PrometheusMessage,
   type PrometheusPolicy,
   type TerminalReceiptResult,
@@ -22,6 +23,7 @@ import {
   ensurePrometheusListeners,
   ensurePrometheusTeam,
   inspectPrometheusRuntime,
+  materializePrometheusArtifactSnapshot,
   runPrometheusCheck,
   verifyPrometheusTeamIdentity,
   type PrometheusRuntimeStatus,
@@ -88,10 +90,20 @@ export function prometheusKickoff(input: {
     `PROMETHEUS.md sha256=${input.policy.sha256}; GOAL.md sha256=${input.goalSha256}; deadline=${input.deadlineAt}.`,
     "The complete current policy supersedes earlier policy:",
     input.policy.raw,
-    `Create compiled work for ${input.roster.builder.member_id} requiring deliverable submission and verified_by ${input.roster.reviewer.member_id}. The builder publishes work.result. The reviewer downloads the exact artifact, checks its SHA-256, uploads review evidence, then publishes verification.pass bound to the current result_ref. Resolve only the verified head; defects require a successor using supersedes.`,
+    `Create compiled work for ${input.roster.builder.member_id} requiring exactly one deliverable named submission and verified_by ${input.roster.reviewer.member_id}. The submission must be a workspace-rooted tar archive for the semantic checker. The builder publishes work.result. The reviewer downloads the exact artifact, checks its SHA-256, uploads review evidence, then publishes verification.pass bound to the current result_ref. Resolve only the verified head; defects require a successor using supersedes.`,
     `Semantic check after the evidence barrier: ${input.check}`,
-    `After the final head is resolved, request one receipt from builder and reviewer, then post yours. Exact line: [sharednet-prometheus:v1] {"type":"terminal.receipt","run_id":"${input.runId}","role":"<role>","revision_sha256":"<current 64-hex revision>"}`,
+    `After the final head is resolved and reviewed, wait: the runner will announce the exact candidate revision and pinned artifact snapshot digest. Then request one receipt from builder and reviewer and post yours. Exact line: [sharednet-prometheus:v1] {"type":"terminal.receipt","run_id":"${input.runId}","role":"<role>","revision_sha256":"<runner-announced 64-hex revision>"}`,
   ].join("\n\n");
+}
+
+export function prometheusCandidateHandoff(
+  runId: string,
+  roster: PrometheusRoster,
+  candidate: PrometheusCandidate,
+  artifactSnapshotSha256: string,
+): string {
+  const recipients = PROMETHEUS_ROLES.map((role) => `@${roster[role].member_id}`).join(" ");
+  return `${recipients} Runner pinned candidate revision ${candidate.revisionSha256}; artifact_snapshot_sha256=${artifactSnapshotSha256}. Send exactly one authenticated receipt using [sharednet-prometheus:v1] {"type":"terminal.receipt","run_id":"${runId}","role":"<your role>","revision_sha256":"${candidate.revisionSha256}"}`;
 }
 
 export interface PrometheusConnection {
@@ -546,6 +558,7 @@ export async function monitorPrometheusRun(run: PrometheusRunState, dependencies
   const lease = await claimMonitor(dependencies.paths, run.run_id, dependencies.processProbe ?? systemProcessProbe);
   const sleep = dependencies.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   const feedbackAttempted = new Set<string>();
+  const candidateAnnounced = new Set<string>();
   try {
     for (;;) {
       const current = await reloadActive(run.run_id, dependencies);
@@ -567,23 +580,55 @@ export async function monitorPrometheusRun(run: PrometheusRunState, dependencies
       const afterSnapshot = await reloadActive(current.run_id, dependencies);
       const stoppedAfterSnapshot = await stopOrRecover(afterSnapshot, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
       if (stoppedAfterSnapshot) return stoppedAfterSnapshot;
+      const pinned = observed.candidate.ok
+        ? await materializePrometheusArtifactSnapshot(
+          observed.candidate.candidate.artifacts,
+          dependencies.connection.client,
+          dependencies.connection.memberToken,
+          join(dependencies.paths.runDir(afterSnapshot.run_id), "artifact-snapshots", observed.candidate.candidate.revisionSha256),
+        )
+        : null;
+      let active = await reloadActive(current.run_id, dependencies);
+      const stoppedAfterPin = await stopOrRecover(active, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
+      if (stoppedAfterPin) return stoppedAfterPin;
+      run = active;
+      if (observed.candidate.ok && !observed.receipts.ok && !candidateAnnounced.has(observed.candidate.candidate.revisionSha256)) {
+        const revision = observed.candidate.candidate.revisionSha256;
+        const content = prometheusCandidateHandoff(active.run_id, active.roster!, observed.candidate.candidate, pinned!.sha256);
+        await dependencies.connection.client.request(
+          "POST",
+          `/rooms/${encodeURIComponent(active.room!.room_id)}/owner-messages`,
+          dependencies.connection.apiKey,
+          { content, as: "runner" },
+          { "idempotency-key": `${active.run_id}-candidate-${revision}` },
+        );
+        candidateAnnounced.add(revision);
+        active = await reloadActive(current.run_id, dependencies);
+        const stoppedAfterAnnouncement = await stopOrRecover(active, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
+        if (stoppedAfterAnnouncement) return stoppedAfterAnnouncement;
+      }
       if (observed.barrier.ready) {
         const revision = observed.barrier.candidate.revisionSha256;
-        const prior = afterSnapshot.checks.find((entry) => entry.revision_sha256 === revision);
+        const prior = active.checks.find((entry) => entry.revision_sha256 === revision);
+        if (pinned === null) throw localError("prometheus_artifact_snapshot_invalid", "The ready candidate has no artifact snapshot.");
+        if (prior && prior.artifact_snapshot_sha256 !== pinned.sha256) {
+          throw localError("prometheus_artifact_snapshot_invalid", "The saved semantic check names a different artifact snapshot.");
+        }
         let passingCheck = prior?.exit_code === 0;
         if (!prior) {
-          const checkStop = watchRunStop(afterSnapshot, dependencies.paths, dependencies.now);
+          const checkStop = watchRunStop(active, dependencies.paths, dependencies.now);
           let checked: Awaited<ReturnType<typeof runPrometheusCheck>>;
           try {
-            checked = await runPrometheusCheck({ image: dependencies.plan.image, workspace: current.workspace_path }, current.configuration.check_command, {
-              SHAREDNET_PROMETHEUS_RUN_ID: current.run_id,
+            checked = await runPrometheusCheck({ image: dependencies.plan.image, snapshot: pinned.path, snapshotSha256: pinned.sha256 }, active.configuration.check_command, {
+              SHAREDNET_PROMETHEUS_RUN_ID: active.run_id,
               SHAREDNET_PROMETHEUS_WORK_ID: observed.barrier.candidate.workId,
               SHAREDNET_PROMETHEUS_RESULT_REF: observed.barrier.candidate.resultRef,
               SHAREDNET_PROMETHEUS_REVISION_SHA256: revision,
+              SHAREDNET_PROMETHEUS_ARTIFACT_SNAPSHOT_SHA256: pinned.sha256,
             }, {
               docker: dependencies.docker,
               now: dependencies.now,
-              timeoutMs: Date.parse(afterSnapshot.deadline_at) - dependencies.now().getTime(),
+              timeoutMs: Math.min(120_000, Date.parse(active.deadline_at) - dependencies.now().getTime()),
               signal: checkStop.signal,
             });
           } finally {
@@ -593,8 +638,10 @@ export async function monitorPrometheusRun(run: PrometheusRunState, dependencies
           const stoppedAfterCheck = await stopOrRecover(afterCheck, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
           if (stoppedAfterCheck) return stoppedAfterCheck;
           if (checked.exitCode === 125) throw localError("prometheus_check_launch_failed", "The Prometheus semantic-check container could not be launched.");
-          const summary = { revision_sha256: revision, started_at: checked.startedAt, finished_at: checked.finishedAt, exit_code: Math.max(0, checked.exitCode), output: checked.output, output_sha256: checked.outputSha256 };
+          const summary = { revision_sha256: revision, artifact_snapshot_sha256: pinned.sha256, started_at: checked.startedAt, finished_at: checked.finishedAt, exit_code: Math.max(0, checked.exitCode), output: checked.output, output_sha256: checked.outputSha256 };
           run = await saveCheckpoint(dependencies.paths, afterCheck, { monitor: lease, checks: [...afterCheck.checks, summary] }, dependencies.now());
+          const stoppedAfterCheckCheckpoint = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
+          if (stoppedAfterCheckCheckpoint) return stoppedAfterCheckCheckpoint;
           if (checked.exitCode !== 0) {
             const feedback = `@${current.roster!.coordinator.member_id} Semantic check failed for revision ${revision}:\n${checked.output.slice(-2_000)}`;
             await dependencies.connection.client.request("POST", `/rooms/${encodeURIComponent(current.room!.room_id)}/owner-messages`, dependencies.connection.apiKey, { content: feedback, as: "runner" }, { "idempotency-key": `${current.run_id}-check-${revision}` });

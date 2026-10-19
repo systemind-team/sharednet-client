@@ -370,6 +370,7 @@ describe("Prometheus owner-only state", () => {
         checks: [
           {
             revision_sha256: SHA_A,
+            artifact_snapshot_sha256: SHA_B,
             started_at: CREATED_AT,
             finished_at: UPDATED_AT,
             exit_code: 1,
@@ -393,6 +394,7 @@ describe("Prometheus owner-only state", () => {
         checks: [
           {
             revision_sha256: SHA_A,
+            artifact_snapshot_sha256: SHA_B,
             started_at: CREATED_AT,
             finished_at: UPDATED_AT,
             exit_code: 1,

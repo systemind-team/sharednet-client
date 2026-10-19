@@ -103,17 +103,37 @@ Timeout and cancellation do not delete the stable team containers or volumes.
 
 ## Evidence and completion
 
-The coordinator assigns typed compiled work to the builder. The builder
-publishes a result artifact. The reviewer must independently download and
+The coordinator assigns typed compiled work to the builder. Local v1 requires
+exactly one deliverable named `submission`; it must be a tar archive whose root
+is the workspace the semantic check should inspect. The builder publishes that
+artifact. The reviewer must independently download and
 inspect that exact artifact, publish separate review evidence, and issue a
 `verification.pass` bound to the current result reference. A valid candidate
 has no open work or unmet verification requirement.
+
+Once that candidate exists, the runner downloads every declared deliverable,
+verifies its bytes against the compiled artifact receipt, and announces the
+exact candidate revision and artifact-snapshot digest to all three roles. The
+roles copy that runner-announced revision into their terminal receipts; they do
+not have to reproduce the runner's canonical hash calculation.
 
 Plain chat remains nonbinding. In particular, `DONE` has no effect. Completion
 also requires one revision-bound terminal receipt from every role, all three
 listeners idle and healthy, no unsettled handoff, a passing semantic `--check`,
 and an unchanged second read of the compiled candidate after the check. Any
 new compiled revision makes older receipts stale.
+
+The semantic check does not mount the mutable shared workspace. It mounts the
+downloaded snapshot directory read-only at `/prometheus-input`, extracts its
+`submission.tar` into a disposable `/workspace` tmpfs, and supplies a separate
+writable `/tmp` tmpfs for ordinary test and build tools. The checker otherwise
+runs with a read-only container root, no network, no added capabilities, and
+`no-new-privileges`. The pinned manifest stays under `/prometheus-input`; it
+maps the deliverable and artifact id to its SHA-256 and records
+`SHAREDNET_PROMETHEUS_ARTIFACT_SNAPSHOT_SHA256`. Source, fixtures, and a
+relative checker such as `python3 check.py` therefore come from the reviewed
+tar. Local v1 verifies the saved bytes again on resume before reusing a cached
+check result.
 
 ## Local state and credentials
 

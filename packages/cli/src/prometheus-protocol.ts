@@ -354,6 +354,7 @@ const CANDIDATE_REASON_ORDER = [
   "ambiguous-head",
   "rejected-head",
   "missing-result-event",
+  "invalid-submission-artifact",
   "missing-artifact-receipt",
   "bad-artifact-sha256",
   "stale-result-ref",
@@ -464,6 +465,11 @@ export function parsePrometheusCandidate(state: CompiledState, roster: Prometheu
   const resultReceipts = resultEvent.refs.artifact_receipts;
   const artifacts: CandidateArtifact[] = [];
   const resultArtifactIds = new Set<string>();
+  if (head.deliverables.length !== 1 || head.deliverables[0] !== "submission" ||
+      !validNamedArtifacts(resultArtifacts) || Object.keys(resultArtifacts).length !== 1 ||
+      !Object.hasOwn(resultArtifacts, "submission")) {
+    reasons.add("invalid-submission-artifact");
+  }
   if (!validNamedArtifacts(resultArtifacts) || !validReceipts(resultReceipts) ||
       head.deliverables.length === 0 || !head.deliverables.every((name) => Object.hasOwn(resultArtifacts, name)) ||
       !sameRecord(head.artifacts, resultArtifacts)) {
