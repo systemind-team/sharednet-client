@@ -14,8 +14,8 @@ import type { ProcessProbe } from "./process-identity.ts";
 
 const candidate = {
   stateDigest: `sha256:${"a".repeat(24)}`,
-  workId: "work-1",
-  resultRef: "evt-1",
+  workId: "work:1",
+  resultRef: `sha256:${"5".repeat(24)}`,
   artifacts: [],
   verifications: [],
   revisionSha256: "b".repeat(64),
@@ -311,7 +311,7 @@ describe("Prometheus lifecycle recovery", () => {
     const revision = "b".repeat(64);
     await writeRun(fixture.paths, {
       ...fixture.run,
-      candidate: { compiled_digest: `sha256:${"a".repeat(24)}`, work_id: "work-1", result_ref: "evt-1", revision_sha256: revision, observed_at: "2026-10-18T00:01:00.000Z" },
+      candidate: { compiled_digest: `sha256:${"a".repeat(24)}`, work_id: "work:1", result_ref: `sha256:${"5".repeat(24)}`, revision_sha256: revision, observed_at: "2026-10-18T00:01:00.000Z" },
       updated_at: "2026-10-18T00:01:00.000Z",
     });
     await requestCancel(fixture.paths, fixture.run.run_id);
