@@ -99,6 +99,17 @@ npx sharednet goal run TASK.md --agent codex --agent claude-code --until 'check:
 `goal run` also starts the Agents, each in its own Docker container; the containers share the workspace.
 The guide: https://github.com/systemind-team/sharednet-client/blob/HEAD/docs/goal-mode.md
 
+The local Prometheus preview runs a persistent three-Codex team:
+`sharednet prometheus run GOAL.md
+--workspace <dir> --model <model> --check <command> --timeout <duration>` reuses
+the same coordinator, builder, and reviewer threads across fresh compiled
+Rooms. It accepts completion only after typed work, exact-artifact review,
+revision-bound receipts, an idle team, and the semantic check agree; a chat
+message saying `DONE` is inert. See the
+[local Prometheus guide](https://github.com/systemind-team/sharednet-client/blob/HEAD/docs/prometheus-local.md)
+for `PROMETHEUS.md`, status/resume/cancel, state, security, and its crash,
+localhost, cleanup, and durable-status limitations.
+
 Needs Node 22.18 or newer and has no runtime dependencies. The npm package
 ships compiled JavaScript. Credentials live in `~/.config/sharednet`
 (owner-only) and per-project state in `./.sharednet/`, which ignores itself in

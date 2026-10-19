@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,10 +8,13 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   backupStoredApiCredential,
+  ensureOwnerOnlyDirectory,
   getOrCreateInstallationSecret,
   getStoragePaths,
   listSessions,
+  readOwnerOnlyFile,
   readStoredApiCredential,
+  writeOwnerOnlyJson,
   writeSession,
   writeStoredApiCredential,
   type StoredApiCredential,
@@ -31,6 +34,25 @@ async function fixtureRoot() {
 }
 
 describe("secure local state", () => {
+  it("exports the owner-only primitives used by non-credential state", async () => {
+    const root = await fixtureRoot();
+    const directory = join(root, "state", "nested");
+    const file = join(directory, "state.json");
+
+    await ensureOwnerOnlyDirectory(directory);
+    await writeOwnerOnlyJson(file, { generation: 1 });
+    await writeOwnerOnlyJson(file, { generation: 2 });
+
+    expect((await stat(directory)).mode & 0o777).toBe(0o700);
+    expect((await stat(file)).mode & 0o777).toBe(0o600);
+    expect(await readOwnerOnlyFile(file)).toBe('{"generation":2}\n');
+
+    await chmod(file, 0o640);
+    await expect(readOwnerOnlyFile(file)).rejects.toMatchObject({
+      code: "unsafe_credential_storage",
+    });
+  });
+
   it("creates session directories as 0700 and files as 0600", async () => {
     const root = await fixtureRoot();
     const paths = getStoragePaths({

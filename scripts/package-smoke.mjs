@@ -32,7 +32,14 @@ try {
   const [pack] = JSON.parse(packed.stdout);
   assert.equal(pack.name, "sharednet");
   const files = pack.files.map(({ path }) => path);
-  for (const path of ["bin/sharednet.js", "dist/main.js", "dist/cli.js", "dist/cli.d.ts", "LICENSE", "package.json"]) {
+  for (const path of [
+    "bin/sharednet.js", "dist/main.js", "dist/cli.js", "dist/cli.d.ts",
+    "dist/prometheus.js", "dist/prometheus.d.ts",
+    "dist/prometheus-protocol.js", "dist/prometheus-protocol.d.ts",
+    "dist/prometheus-runtime.js", "dist/prometheus-runtime.d.ts",
+    "dist/prometheus-state.js", "dist/prometheus-state.d.ts",
+    "LICENSE", "package.json",
+  ]) {
     assert(files.includes(path), `Missing packaged entry: ${path}`);
   }
   assert(files.every((path) => /^(?:bin\/sharednet\.js|dist\/[\w-]+\.(?:js|d\.ts)|package\.json|README\.md|LICENSE)$/.test(path)), "Unexpected tarball contents");
@@ -68,6 +75,17 @@ try {
   assert.equal(failure?.code, 2, "Installed executable must return its usage exit code");
   assert.equal(failure.stdout, "");
   assert.equal(JSON.parse(failure.stderr).error.code, "unknown_command");
+  const prometheus = await exec(join(consumer, "node_modules/.bin/sharednet"), [
+    "prometheus", "status", "--workspace", consumer, "--json",
+  ], {
+    cwd: consumer,
+    env: { ...env, NODE_OPTIONS: "--no-experimental-strip-types" },
+    timeout: 10_000,
+  });
+  assert.deepEqual(JSON.parse(prometheus.stdout), { workspace: consumer, team: null, run: null });
+  assert.equal(prometheus.stderr, "");
+  const installedFiles = files.join("\n");
+  assert.doesNotMatch(installedFiles, /(?:credential|auth\.json|\.sharednet|prometheus\/local-v1)/i);
   const sha256 = createHash("sha256").update(await readFile(tarball)).digest("hex");
   await writeFile(join(artifacts, "cli-smoke.json"), JSON.stringify({ name: pack.name, version: pack.version, tarball: pack.filename, sha256, files }, null, 2) + "\n");
   console.log(`Installed-package smoke passed: ${pack.filename}; sha256=${sha256}`);

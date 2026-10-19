@@ -1,12 +1,15 @@
 // @vitest-environment node
 
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runCli } from "./cli.ts";
+import { prometheusPaths, reserveActiveRun, writeTeam, type PrometheusRunState, type PrometheusTeamState } from "./prometheus-state.ts";
+import type { ProcessProbe } from "./process-identity.ts";
 
 const cleanup: string[] = [];
 
@@ -730,4 +733,81 @@ it("goal start selects a compiled Room before posting the goal", async () => {
   expect(result.exitCode).toBe(0);
   expect(sentBody(result.requests[0]!)).toMatchObject({ name: file, type: "compiled" });
   expect(sentBody(result.requests[1]!)).toEqual({ content: "Deliver a checked patch.", until: ["after 1h"] });
+});
+
+it("routes top-level prometheus status without credentials, Docker, or HTTP", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sharednet-prometheus-status-"));
+  cleanup.push(root);
+  const stdout: string[] = [];
+  const requests: string[] = [];
+  const exitCode = await runCli(["prometheus", "status", "--workspace", root, "--json"], {
+    cwd: root,
+    env: { HOME: root, XDG_STATE_HOME: join(root, "state"), XDG_CONFIG_HOME: join(root, "config") },
+    fetch: async (input) => { requests.push(String(input)); throw new Error("unexpected HTTP"); },
+    stdout: (value) => stdout.push(value),
+    stderr: () => undefined,
+  });
+  expect(exitCode).toBe(0);
+  expect(JSON.parse(stdout.join(""))).toEqual({ workspace: root, team: null, run: null });
+  expect(requests).toEqual([]);
+});
+
+it("returns durable Prometheus status when live runtime preflight fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sharednet-prometheus-status-active-"));
+  cleanup.push(root);
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const env = { HOME: root, XDG_STATE_HOME: join(root, "state"), XDG_CONFIG_HOME: join(root, "config") };
+  const paths = await prometheusPaths(env, workspace);
+  const roles = Object.fromEntries((["coordinator", "builder", "reviewer"] as const).map((role) => [role, {
+    container_name: `sharednet-prometheus-${paths.workspaceKey}-${role}`,
+    volume_name: `sharednet-prometheus-${paths.workspaceKey}-${role}-home`,
+    thread_id: `thr-${role}`,
+  }])) as PrometheusTeamState["roles"];
+  const team: PrometheusTeamState = {
+    schema_version: 1, workspace_key: paths.workspaceKey, workspace_path: paths.workspacePath, model: "gpt-6-sol", roles,
+    last_policy_sha256: "a".repeat(64), created_at: "2026-10-18T00:00:00.000Z", updated_at: "2026-10-18T00:00:00.000Z",
+  };
+  const run: PrometheusRunState = {
+    schema_version: 1, run_id: "run_status", workspace_key: paths.workspaceKey, workspace_path: paths.workspacePath,
+    configuration: { model: "gpt-6-sol", goal_path: join(workspace, "GOAL.md"), goal_sha256: createHash("sha256").update("goal").digest("hex"), policy_sha256: team.last_policy_sha256, check_command: "true" },
+    startup_checkpoint: "reserved", room: null, roster: null,
+    idempotency_keys: { room: "status-room", goal: "status-goal", roles: { coordinator: "status-coordinator", builder: "status-builder", reviewer: "status-reviewer" }, kickoff: "status-kickoff" },
+    deadline_at: "2026-10-18T04:00:00.000Z", monitor: null, cancel_requested: false, outcome: "starting", candidate: null, checks: [],
+    created_at: "2026-10-18T00:00:00.000Z", updated_at: "2026-10-18T00:00:00.000Z", finished_at: null, reason: null,
+  };
+  const probe: ProcessProbe = { supported: true, alive: () => true, identity: () => "test", argv: () => null };
+  await writeTeam(paths, team);
+  await reserveActiveRun(paths, run, probe);
+  const stdout: string[] = [];
+  const requests: string[] = [];
+  const exitCode = await runCli(["prometheus", "status", "--workspace", workspace, "--json"], {
+    cwd: workspace, env,
+    docker: async () => { throw new Error("Docker unavailable"); },
+    fetch: async (input) => { requests.push(String(input)); throw new Error("unexpected HTTP"); },
+    stdout: (value) => stdout.push(value), stderr: () => undefined,
+  });
+
+  expect(exitCode).toBe(0);
+  expect(JSON.parse(stdout.join(""))).toMatchObject({
+    workspace,
+    run: { run_id: "run_status", startup_checkpoint: "reserved" },
+    live: { available: false, error: { code: "service_unavailable", message: "SharedNet could not complete the request." } },
+  });
+  expect(requests).toEqual([]);
+});
+
+it("routes top-level prometheus resume and reports an absent run before external work", async () => {
+  const root = await mkdtemp(join(tmpdir(), "sharednet-prometheus-resume-"));
+  cleanup.push(root);
+  const stderr: string[] = [];
+  const exitCode = await runCli(["prometheus", "resume", "--workspace", root, "--json"], {
+    cwd: root,
+    env: { HOME: root, XDG_STATE_HOME: join(root, "state"), XDG_CONFIG_HOME: join(root, "config") },
+    fetch: async () => { throw new Error("unexpected HTTP"); },
+    stdout: () => undefined,
+    stderr: (value) => stderr.push(value),
+  });
+  expect(exitCode).toBe(2);
+  expect(JSON.parse(stderr.join("")).error.code).toBe("prometheus_run_not_active");
 });

@@ -45,6 +45,15 @@ import {
 
 type Environment = Record<string, string | undefined>;
 
+function joinIdempotencyKey(env: Environment): string {
+  const configured = env.SHAREDNET_JOIN_IDEMPOTENCY_KEY?.trim();
+  if (configured === undefined || configured.length === 0) return randomUUID();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(configured)) {
+    throw localError("invalid_arguments", "SHAREDNET_JOIN_IDEMPOTENCY_KEY is not a safe idempotency key.");
+  }
+  return configured;
+}
+
 /** A path the human typed, resolved against the directory the CLI was run in. */
 function resolvePath(cwd: string, path: string): string {
   return isAbsolute(path) ? path : resolvePathFrom(cwd, path);
@@ -505,6 +514,7 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     `/rooms/${encodeURIComponent(roomId)}/join`,
     token,
     { name, ...(report ? { runtime: report } : {}), ...(reach === undefined ? {} : { reach }) },
+    { "idempotency-key": joinIdempotencyKey(dependencies.env) },
   );
   const memberId = payload.membership?.member_id;
   const memberToken = payload.member_token;
@@ -697,7 +707,7 @@ async function joinAsAccount(
   // Instance, and the first one's token revoked under it. Re-entering a
   // Room this directory already holds a seat in goes through `join rom_…`.
   const { session } = await registerInstance(dependencies.env, dependencies.fetch, paths, baseUrl, {
-    forceNew: true,
+    forceNew: dependencies.env.SHAREDNET_REUSE_RUNTIME_SESSION !== "1",
     freshWhenUndetected: true,
     ...(reach === undefined ? {} : { reach }),
     ...(agent === undefined ? {} : { agent }),
@@ -709,7 +719,7 @@ async function joinAsAccount(
     `/rooms/${encodeURIComponent(roomId)}/join`,
     session.instance_token,
     { invite, ...(chosenName === undefined ? {} : { name: chosenName }) },
-    { "idempotency-key": randomUUID() },
+    { "idempotency-key": joinIdempotencyKey(dependencies.env) },
   );
   if (!payload.room?.id || !payload.membership?.member_id) throw invalidServerResponse();
   // The seat file mirrors the session so say/wait need no second lookup; the

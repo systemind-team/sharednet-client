@@ -33,6 +33,29 @@ export interface ProcessProbe {
   argv(pid: number): string | null;
 }
 
+export interface RecordedProcessIdentity {
+  pid: number;
+  start_identity: string;
+}
+
+export type ProcessIdentityStatus = "alive" | "dead" | "reused" | "unknown";
+
+/**
+ * Classify the exact process recorded in a lock. A live PID with another
+ * start identity is a reused PID: the recorded process is gone, and the new
+ * process must never inherit its authority.
+ */
+export function inspectProcessIdentity(
+  probe: ProcessProbe,
+  recorded: RecordedProcessIdentity,
+): ProcessIdentityStatus {
+  if (!probe.supported) return "unknown";
+  if (!probe.alive(recorded.pid)) return "dead";
+  const current = probe.identity(recorded.pid);
+  if (current === null) return "unknown";
+  return current === recorded.start_identity ? "alive" : "reused";
+}
+
 /** Signal 0 probes without signalling; EPERM means the process exists but belongs to someone else. */
 export function processAlive(pid: number, kill: (pid: number, signal: 0) => unknown = (target, signal) => process.kill(target, signal)): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;

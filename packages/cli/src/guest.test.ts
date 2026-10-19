@@ -620,7 +620,11 @@ describe("sharednet join", () => {
         },
         { status: 200, body: { items: [message(1, "Welcome")], next_cursor: "1", has_more: false } },
       ],
-      { SHAREDNET_API_KEY: `snk_${"K".repeat(43)}` },
+      {
+        SHAREDNET_API_KEY: `snk_${"K".repeat(43)}`,
+        SHAREDNET_REUSE_RUNTIME_SESSION: "1",
+        SHAREDNET_JOIN_IDEMPOTENCY_KEY: "run-1-coordinator",
+      },
     );
 
     // The only thing on stderr is the seat this session got, never a token.
@@ -639,7 +643,8 @@ describe("sharednet join", () => {
     expect(JSON.parse(String(result.requests[1]!.init.body))).toEqual({ invite: INVITE_TOKEN });
     expect(result.stderr).toContain("No --name was given, so the Room shows this seat by its id, i_AccountSeat1.");
     expect(JSON.parse(String(result.requests[0]!.init.body)).runtime_kind).toBe("claude-code");
-    expect(header(result.requests[1]!, "idempotency-key")).toMatch(/^[0-9a-f-]{36}$/);
+    expect(JSON.parse(String(result.requests[0]!.init.body)).local_instance_key).toMatch(/^[A-Za-z0-9_-]{20,}$/);
+    expect(header(result.requests[1]!, "idempotency-key")).toBe("run-1-coordinator");
 
     const output = JSON.parse(result.stdout);
     expect(output).toMatchObject({ as: "account", member_id: "i_AccountSeat1", principal_id: "p_AcCoUnT0001", last_sequence: 1 });
