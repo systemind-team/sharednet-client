@@ -10,7 +10,7 @@ import { dirname, join, relative } from "node:path";
 import type { ApiClient } from "./api-client.ts";
 import { localError } from "./errors.ts";
 import { goalWatch, type GoalWatchResult } from "./goal.ts";
-import type { GoalRunHarnessResolution } from "./harness-modes.ts";
+import { assertGoalRunHarnessAgentCount, type GoalRunHarnessResolution } from "./harness-modes.ts";
 import { mentions } from "./triggers.ts";
 
 /**
@@ -356,9 +356,12 @@ export function withoutTaskActs(wake: WakeShape): WakeShape {
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
 export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting }): string {
   const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
+  const single = input.seats.length === 1;
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
   return [
-    `You are ${input.seat.name}, one of ${input.seats.length} agents working on one goal in SharedNet Room ${input.roomId}.${others.length > 0 ? ` The others: ${others.join(", ")}.` : ""}`,
+    single
+      ? `You are ${input.seat.name}, the only agent working on one goal in SharedNet Room ${input.roomId}.`
+      : `You are ${input.seat.name}, one of ${input.seats.length} agents working on one goal in SharedNet Room ${input.roomId}. The others: ${others.join(", ")}.`,
     "",
     `The goal (message #${input.goalSequence}):`,
     "<goal>",
@@ -368,7 +371,9 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
     `The Room ends when the first of these happens: ${input.until.join("; ")}.`,
     ...(claims.length > 0 ? [`Say ${claims.join(" or ")} in the Room only when you believe the goal is met: saying it runs the check.`] : []),
     "",
-    `You share this directory (${CONTAINER_WORKSPACE}) with the others, and only this one: each of you works in its own container, so what you install elsewhere is yours alone. Talk to them only through the Room, with the sharednet command:`,
+    single
+      ? `You work in this directory (${CONTAINER_WORKSPACE}) in your own container. Use the SharedNet Room to record concise progress and the final completion claim:`
+      : `You share this directory (${CONTAINER_WORKSPACE}) with the others, and only this one: each of you works in its own container, so what you install elsewhere is yours alone. Talk to them only through the Room, with the sharednet command:`,
     "  sharednet read --last 30 --json    what has been said",
     '  sharednet say "…" --json          say something; keep it short',
     ...(input.roomType === "compiled" ? [COMPILED_HELP] : []),
@@ -377,7 +382,9 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
       "Do not run `sharednet wait` or `sharednet watch`: end your turn when waiting; the runner supplies messages routed to you.",
     ] : ["Do not run `sharednet wait` or `sharednet watch`: when your turn ends, you are woken with whatever is said next."]),
     "Lines from `runner` are the goal's machinery, such as a check's result, not a person.",
-    "Agree in the Room who does what, do your part, and end your turn when there is nothing more to do now.",
+    single
+      ? "Work through the goal and end your turn when there is nothing more to do now."
+      : "Agree in the Room who does what, do your part, and end your turn when there is nothing more to do now.",
     ...(input.mentionGate ? [MENTION_HELP] : []),
     ...(input.taskGate ? [TASK_HELP] : []),
   ].join("\n");
@@ -589,6 +596,7 @@ export async function runGoal(
   if (input.harnessMode && plan.agents.some((agent) => agent.model === null)) {
     throw localError("harness_model_required", "A frozen --harness-mode requires every Agent to pin its model.");
   }
+  if (input.harnessMode) assertGoalRunHarnessAgentCount(input.harnessMode, plan.agents.length);
   if (input.roomType === "compiled" && (input.mentionGate || input.taskGate || messageRouting === "mentions")) throw localError("invalid_arguments", "The mention/task controls are for plain board Rooms.");
   const codeProvenance = input.codeProvenance ?? await discoverCodeProvenance(plan.cli);
   if (input.harnessMode && codeProvenance.sourceWorktreeDirty) {

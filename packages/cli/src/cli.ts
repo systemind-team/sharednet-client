@@ -12,7 +12,7 @@ import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
 import { cliPackage, discoverCodeProvenance, dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner } from "./goal-run.ts";
 import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, type ServeKickoff } from "./goal-serve-demo.ts";
-import { getHarnessModeSpec, resolveGoalRunHarnessMode, resolveRuntimeHarnessMode, type RuntimeHarnessResolution } from "./harness-modes.ts";
+import { assertGoalRunHarnessAgentCount, getHarnessModeSpec, resolveGoalRunHarnessMode, resolveRuntimeHarnessMode, type RuntimeHarnessResolution } from "./harness-modes.ts";
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
@@ -630,6 +630,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (harnessMode && agents.some((agent) => agent.model === null)) {
     throw localError("harness_model_required", "A frozen --harness-mode requires every --agent to pin its model, for example --agent codex:<model>.");
   }
+  if (harnessMode) assertGoalRunHarnessAgentCount(harnessMode, agents.length);
   const cliEntry = dependencies.cliEntry ?? realpathSync(process.argv[1]!);
   let codeProvenance: CodeProvenance | undefined;
   if (harnessMode) {

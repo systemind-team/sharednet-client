@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import {
   HARNESS_MODE_NAMES,
   HARNESS_MODE_REGISTRY,
+  assertGoalRunHarnessAgentCount,
   getHarnessModeSpec,
   harnessModeSpecHash,
   resolveGoalRunHarnessMode,
@@ -23,6 +24,14 @@ const researchProfiles = [
 ] as const;
 
 describe("frozen harness mode registry", () => {
+  it("enforces an optional frozen agent-count constraint", () => {
+    const baseline = resolveGoalRunHarnessMode("research/baseline@1");
+    const constrained = { ...baseline, profile: { ...baseline.profile, agents: 1 as const } };
+    expect(() => assertGoalRunHarnessAgentCount(constrained, 1)).not.toThrow();
+    expect(() => assertGoalRunHarnessAgentCount(constrained, 2)).toThrowError(expect.objectContaining({ code: "harness_agent_count_mismatch" }));
+    expect(() => assertGoalRunHarnessAgentCount(baseline, 2)).not.toThrow();
+  });
+
   it("registers the eight canonical immutable names and the exact six goal-run profiles", () => {
     expect(HARNESS_MODE_NAMES).toEqual([
       "research/baseline@1",

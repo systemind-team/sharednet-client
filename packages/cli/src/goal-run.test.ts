@@ -187,6 +187,16 @@ describe("a turn", () => {
     expect(wake).toContain("#5 runner: check failed");
   });
 
+  it("gives a single seat a single-agent role without teammate instructions", () => {
+    const seats = parseAgents(["codex:gpt-test"]);
+    const opening = openingPrompt({ seat: seats[0]!, seats, roomId: ROOM, goal: "Make the tests pass.", goalSequence: 1, until: ["said DONE", "after 1h"] });
+    expect(opening).toContain("You are codex-1, the only agent working on one goal");
+    expect(opening).toContain("You work in this directory (/workspace)");
+    expect(opening).not.toContain("The others:");
+    expect(opening).not.toContain("with the others");
+    expect(opening).not.toContain("Agree in the Room who does what");
+  });
+
   it("forwards only a development service on this machine's loopback into the container", () => {
     expect(loopbackPort("http://127.0.0.1:3117")).toBe(3117);
     expect(loopbackPort("https://www.sharednet.ai")).toBeNull();
@@ -312,6 +322,51 @@ describe("runGoal", () => {
       },
       { docker: async () => { dockerCalls += 1; return { code: 0, stdout: "", stderr: "" }; }, now: () => new Date() },
     )).rejects.toMatchObject({ code: "harness_mode_mismatch" });
+    expect(dockerCalls).toBe(0);
+  });
+
+  it("enforces a frozen one-seat constraint before Docker work", async () => {
+    const out = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents(["codex:gpt-test", "codex:gpt-test"]),
+      workspace: out,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "api-key" },
+      claudeAuth: null,
+    };
+    const baseline = resolveGoalRunHarnessMode("research/baseline@1");
+    const constrained = { ...baseline, profile: { ...baseline.profile, agents: 1 as const } };
+    let dockerCalls = 0;
+    await expect(runGoal(
+      {} as ApiClient,
+      "sni_owner-seat",
+      OWNER_KEY,
+      {
+        plan,
+        roomType: "board",
+        roomId: ROOM,
+        inviteToken: INVITE,
+        goal: "g",
+        goalSequence: 1,
+        until: ["after 1h"],
+        baseUrl: "https://www.sharednet.ai",
+        out,
+        checkEveryMs: 60_000,
+        quietChecks: false,
+        harnessMode: constrained,
+        codeProvenance: {
+          clientCommit: "1".repeat(40),
+          runnerCommit: "1".repeat(40),
+          sourceWorktreeDirty: false,
+          packageVersion: "0.1.16",
+          packageManifestSha256: "2".repeat(64),
+          entrySha256: "3".repeat(64),
+          codeTreeSha256: "4".repeat(64),
+        },
+      },
+      { docker: async () => { dockerCalls += 1; return { code: 0, stdout: "", stderr: "" }; }, now: () => new Date() },
+    )).rejects.toMatchObject({ code: "harness_agent_count_mismatch" });
     expect(dockerCalls).toBe(0);
   });
 

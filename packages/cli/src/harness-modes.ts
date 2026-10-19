@@ -17,6 +17,8 @@ export interface ResearchHarnessProfile {
   readonly room_type: "board";
   readonly delivery: "runner-owned-turn-loop";
   readonly initial_wake: "all-seats";
+  /** Omitted when the mode leaves team size as an explicit run input. */
+  readonly agents?: 1;
   readonly mention_gate: boolean;
   readonly task_gate: boolean;
   readonly message_routing: "broadcast" | "mentions";
@@ -211,6 +213,13 @@ export function resolveGoalRunHarnessMode(name: string): GoalRunHarnessResolutio
     );
   }
   return { name: spec.name, spec, specSha256: harnessModeSpecHash(spec), profile: spec.profile };
+}
+
+/** Defense shared by CLI preflight and the runner boundary for topology-frozen modes. */
+export function assertGoalRunHarnessAgentCount(mode: GoalRunHarnessResolution, actual: number): void {
+  if (mode.profile.agents !== undefined && actual !== mode.profile.agents) {
+    throw localError("harness_agent_count_mismatch", `${mode.name} requires exactly ${mode.profile.agents} Agent.`);
+  }
 }
 
 export function resolveRuntimeHarnessMode(name: string): RuntimeHarnessResolution {
