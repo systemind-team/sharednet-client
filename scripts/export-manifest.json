@@ -365,6 +365,7 @@
     "packages/cli/src/prometheus-protocol.ts",
     "packages/cli/src/prometheus-protocol.test.ts",
     "packages/cli/src/prometheus-state.ts",
+    "packages/cli/src/prometheus-state-race.test.ts",
     "packages/cli/src/prometheus-state.test.ts",
     "packages/cli/src/prometheus-runtime.ts",
     "packages/cli/src/prometheus-runtime.test.ts",
