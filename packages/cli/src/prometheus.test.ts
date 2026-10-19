@@ -355,6 +355,37 @@ describe("Prometheus lifecycle recovery", () => {
     expect(await readActiveRun(fixture.paths)).toBeNull();
   });
 
+  it("closes an already-created Room when cancellation lands during reusable-team bootstrap", async () => {
+    const fixture = await lifecycleFixture("room_created", "2026-10-18T04:00:00.000Z");
+    const baseDocker = lifecycleDocker(fixture.team, []);
+    let cancelled = false;
+    const docker: DockerRunner = async (args, options) => {
+      if (!cancelled && args[0] === "start") {
+        cancelled = true;
+        await requestCancel(fixture.paths, fixture.run.run_id);
+        await new Promise<void>((resolve) => {
+          if (options?.signal?.aborted) resolve();
+          else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+      }
+      return baseDocker(args, options);
+    };
+    const requests: string[] = [];
+
+    const result = await resumePrometheusRun(fixture.workspace, {
+      env: fixture.env, cwd: fixture.workspace, now: () => new Date("2026-10-18T01:00:00.000Z"),
+      docker, plan: { ...plan, workspace: fixture.workspace }, processProbe: fixture.probe,
+      connect: async () => ({
+        client: { request: async (_method: string, path: string) => { requests.push(path); return {}; } } as never,
+        memberToken: "member", apiKey: "api", baseUrl: "https://www.sharednet.ai",
+      }),
+    });
+
+    expect(result).toMatchObject({ outcome: "cancelled", startup_checkpoint: "room_created" });
+    expect(requests).toEqual(["/rooms/rom_Lifecycle/close"]);
+    expect(await readActiveRun(fixture.paths)).toBeNull();
+  });
+
   it("records an irrecoverable monitor protocol error as failed and closes the Room", async () => {
     const fixture = await lifecycleFixture("kickoff_posted");
     const requests: string[] = [];

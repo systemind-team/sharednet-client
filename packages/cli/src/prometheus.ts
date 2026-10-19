@@ -393,7 +393,12 @@ async function continuePrometheusRun(
     });
   } catch (error) {
     const current = await reloadActive(run.run_id, dependencies);
-    const stopped = await stopOrRecover(current, lease, { paths: dependencies.paths, now: dependencies.now });
+    const stopConnection = current.room ? await dependencies.connect() : undefined;
+    const stopped = await stopOrRecover(current, lease, {
+      paths: dependencies.paths,
+      now: dependencies.now,
+      ...(stopConnection ? { connection: stopConnection } : {}),
+    });
     if (stopped) return stopped;
     const failure = asCliError(error);
     if (!["prometheus_team_invalid", "prometheus_team_missing", "prometheus_team_mismatch"].includes(failure.code)) throw error;
@@ -404,9 +409,14 @@ async function continuePrometheusRun(
   }
   await writeTeam(dependencies.paths, team);
   run = await reloadActive(run.run_id, dependencies);
-  const stoppedAfterBootstrap = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now });
+  const bootstrapConnection = run.room ? await dependencies.connect() : undefined;
+  const stoppedAfterBootstrap = await stopOrRecover(run, lease, {
+    paths: dependencies.paths,
+    now: dependencies.now,
+    ...(bootstrapConnection ? { connection: bootstrapConnection } : {}),
+  });
   if (stoppedAfterBootstrap) return stoppedAfterBootstrap;
-  const connection = await dependencies.connect();
+  const connection = bootstrapConnection ?? await dependencies.connect();
   run = await reloadActive(run.run_id, dependencies);
   const stoppedAfterConnect = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection });
   if (stoppedAfterConnect) return stoppedAfterConnect;
