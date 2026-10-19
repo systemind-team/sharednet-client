@@ -349,13 +349,12 @@ describe("reach: forming a group from the account CLI", () => {
     expect(malformed.stderr.join(" ")).toContain("research/baseline@1");
     expect(malformed.requests).toEqual([]);
 
-    const unavailable = await harness([
-      "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "runtime/serve-first@1",
+    const runtimeBoardOnly = await harness([
+      "goal", "run", "missing.md", "--type", "compiled", "--agent", "codex:gpt-test", "--agent", "codex:gpt-test", "--agent", "codex:gpt-test", "--until", "after: 1h", "--harness-mode", "runtime/serve-first@1",
     ]);
-    expect(unavailable.exitCode).toBe(2);
-    expect(unavailable.stderr.join(" ")).toContain("harness_mode_unavailable");
-    expect(unavailable.stderr.join(" ")).toContain("PR #48");
-    expect(unavailable.requests).toEqual([]);
+    expect(runtimeBoardOnly.exitCode).toBe(2);
+    expect(runtimeBoardOnly.stderr.join(" ")).toContain("requires a board Room");
+    expect(runtimeBoardOnly.requests).toEqual([]);
 
     const unpinnedModel = await harness([
       "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "research/baseline@1",
@@ -396,6 +395,37 @@ describe("reach: forming a group from the account CLI", () => {
       const refused = await harness(args, []);
       expect(refused.exitCode).not.toBe(0);
       expect(refused.stderr.join(" ")).toContain("--kickoff is first or all");
+      expect(refused.requests).toEqual([]);
+    }
+  });
+
+  it("does not let the legacy serve-demo command smuggle a named mode or Room type", async () => {
+    for (const extra of [
+      ["--harness-mode", "runtime/serve-first@1"],
+      ["--type", "board"],
+      ["--web-search", "off"],
+    ]) {
+      const refused = await harness(["goal", "serve-demo", "TASK.md", "--kickoff", "first", "--until", "after: 1h", ...extra], []);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr.join(" ")).toContain("not valid for this command");
+      expect(refused.requests).toEqual([]);
+    }
+  });
+
+  it("requires pinned models and rejects low-level controls for runtime harness modes", async () => {
+    const unpinned = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--agent", "codex", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "runtime/serve-all@1",
+    ]);
+    expect(unpinned.exitCode).toBe(2);
+    expect(unpinned.stderr.join(" ")).toContain("harness_model_required");
+    expect(unpinned.requests).toEqual([]);
+
+    for (const extra of [["--mention-gate"], ["--task-gate"], ["--message-routing", "broadcast"]]) {
+      const refused = await harness([
+        "goal", "run", "missing.md", "--agent", "codex:gpt-test", "--agent", "codex:gpt-test", "--agent", "codex:gpt-test", "--until", "after: 1h", "--harness-mode", "runtime/serve-first@1", ...extra,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr.join(" ")).toContain("fixes the gate and routing controls");
       expect(refused.requests).toEqual([]);
     }
   });

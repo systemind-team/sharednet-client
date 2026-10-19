@@ -10,6 +10,7 @@ import {
   getHarnessModeSpec,
   harnessModeSpecHash,
   resolveGoalRunHarnessMode,
+  resolveRuntimeHarnessMode,
 } from "./harness-modes.ts";
 
 const researchProfiles = [
@@ -58,6 +59,17 @@ describe("frozen harness mode registry", () => {
     expect(harnessModeSpecHash(getHarnessModeSpec("research/both@1"))).toBe(hashes[3]);
   });
 
+  it("does not change any published research-mode hash", () => {
+    expect(Object.fromEntries(researchProfiles.map(([name]) => [name, harnessModeSpecHash(getHarnessModeSpec(name))]))).toEqual({
+      "research/baseline@1": "3bced23adad81117a2eb039fe5a284eeab49ad7711e1a2efc4506db553a95514",
+      "research/mentions@1": "3885aaf5b0615bd9facfa86a3043313ba8598a98f3440626890b05897e2bf793",
+      "research/tasks@1": "0b44d68ad0e8131da4b557a3cce5b633c93b2fdb5ecfcf275ad1751d80e7b156",
+      "research/both@1": "c4be25291d7aca3a1193119f12bfd70ca0d2723b5cd3bf08d281a1afb6bf6f28",
+      "research/routing-only@1": "bd1f751ca8ec726a8632bb99b0148b5e81693af50a623c89230320e92f836f88",
+      "research/receipt-only@1": "902d907b2f390a03b17593184836bf644fcdf5dae8f8e412d973f8010717d052",
+    });
+  });
+
   it("keeps mutable availability and re-verification metadata outside the immutable spec hash", () => {
     const spec = getHarnessModeSpec("runtime/serve-first@1");
     const changed = {
@@ -76,14 +88,13 @@ describe("frozen harness mode registry", () => {
   );
 
   it.each(["runtime/serve-first@1", "runtime/serve-all@1"] as const)(
-    "keeps %s discoverable but unavailable until serve-demo is merged",
+    "makes %s selectable through goal run with the frozen kickoff",
     (name) => {
-      const spec = getHarnessModeSpec(name);
-      expect(spec.profile).toMatchObject({ command: "goal serve-demo", kickoff: name.includes("first") ? "first" : "all" });
-      expect(spec.availability).toMatchObject({ state: "dependency", pull_request: 48 });
-      expect(() => resolveGoalRunHarnessMode(name)).toThrowError(
-        expect.objectContaining({ code: "harness_mode_unavailable", message: expect.stringContaining("PR #48") }),
-      );
+      const resolved = resolveRuntimeHarnessMode(name);
+      expect(resolved.profile).toMatchObject({ command: "goal serve-demo", kickoff: name.includes("first") ? "first" : "all" });
+      expect(resolved.spec.availability).toEqual({ state: "available", command: "goal run" });
+      expect(resolved.specSha256).toBe(harnessModeSpecHash(resolved.spec));
+      expect(() => resolveGoalRunHarnessMode(name)).toThrowError(expect.objectContaining({ code: "harness_mode_family_mismatch" }));
     },
   );
 
@@ -93,7 +104,6 @@ describe("frozen harness mode registry", () => {
       expect(catalog).toContain(`\`${spec.name}\``);
       expect(catalog).toContain(`\`${harnessModeSpecHash(spec)}\``);
     }
-    expect(catalog).toContain("PR #48");
-    expect(catalog).toContain("unavailable");
+    expect(catalog).toContain("goal run");
   });
 });

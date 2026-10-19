@@ -12,7 +12,7 @@ import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
 import { cliPackage, discoverCodeProvenance, dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner } from "./goal-run.ts";
 import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, type ServeKickoff } from "./goal-serve-demo.ts";
-import { resolveGoalRunHarnessMode } from "./harness-modes.ts";
+import { getHarnessModeSpec, resolveGoalRunHarnessMode, resolveRuntimeHarnessMode, type RuntimeHarnessResolution } from "./harness-modes.ts";
 import { parseDuration } from "./triggers.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
@@ -583,10 +583,14 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (namedMode !== undefined && ["mention-gate", "task-gate", "message-routing"].some((name) => parsed.options.has(name))) {
     throw localError("invalid_arguments", "--harness-mode fixes the gate and routing controls; do not combine it with --mention-gate, --task-gate, or --message-routing.");
   }
-  const harnessMode = namedMode === undefined ? undefined : resolveGoalRunHarnessMode(namedMode);
-  if (harnessMode && requestedType === "compiled") {
-    throw localError("invalid_arguments", `${harnessMode.name} requires a board Room.`);
+  const namedSpec = namedMode === undefined ? undefined : getHarnessModeSpec(namedMode);
+  if (namedSpec && requestedType === "compiled") {
+    throw localError("invalid_arguments", `${namedSpec.name} requires a board Room.`);
   }
+  if (namedSpec?.family === "runtime") {
+    return goalServeDemoCommand(parsed, globals, dependencies, resolveRuntimeHarnessMode(namedSpec.name));
+  }
+  const harnessMode = namedMode === undefined ? undefined : resolveGoalRunHarnessMode(namedMode);
   const type = harnessMode ? "board" : requestedType;
   const manualMessageRouting = option(parsed, "message-routing");
   if (manualMessageRouting !== undefined && manualMessageRouting !== "broadcast" && manualMessageRouting !== "mentions") throw localError("invalid_arguments", "--message-routing must be broadcast or mentions.");
@@ -599,7 +603,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--harness-mode research/<mode>@1 | --mention-gate/--task-gate/--message-routing]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
@@ -704,15 +708,23 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
 }
 
 /** Three Docker Codex threads driven by three production `serve` listeners, not by Goal's seat loop. */
-async function goalServeDemoCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "turn-limit", "kickoff"]);
+async function goalServeDemoCommand(
+  parsed: ParsedArguments,
+  globals: GlobalArguments,
+  dependencies: ResolvedDependencies,
+  harnessMode?: RuntimeHarnessResolution,
+): Promise<unknown> {
+  assertOnlyOptions(parsed, [
+    "agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "turn-limit", "kickoff",
+    ...(harnessMode ? ["harness-mode", "type", "web-search"] : []),
+  ]);
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
       "Usage: sharednet goal serve-demo <goal file> --kickoff first|all [--agent codex[:model] --agent codex[:model] --agent codex[:model]] --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--turn-limit 20m]",
     );
   }
-  const kickoff = option(parsed, "kickoff");
+  const kickoff = harnessMode?.profile.kickoff ?? option(parsed, "kickoff");
   if (kickoff !== "first" && kickoff !== "all") throw localError("invalid_arguments", "--kickoff is first or all.");
   const turnLimitMs = parsed.options.has("turn-limit") ? parseDuration(option(parsed, "turn-limit"), "--turn-limit") : undefined;
   if (turnLimitMs !== undefined && !validTurnLimit(turnLimitMs)) throw localError("invalid_arguments", "--turn-limit must be between 1m and 24h.");
@@ -722,6 +734,21 @@ async function goalServeDemoCommand(parsed: ParsedArguments, globals: GlobalArgu
     throw localError("invalid_arguments", "goal serve-demo does not accept count: the one runner kickoff is a real Room message. Use said, check, idle, after, at, message, or mention.");
   }
   const agents = parseServeDemoAgents(parsed.repeated.get("agent") ?? []);
+  if (harnessMode && agents.some((agent) => agent.model === null)) {
+    throw localError("harness_model_required", "A frozen --harness-mode requires every --agent to pin its model, for example --agent codex:<model>.");
+  }
+  const webSearch = option(parsed, "web-search") ?? "live";
+  if (webSearch !== "live" && webSearch !== "off") {
+    throw localError("invalid_arguments", "--web-search is live or off.");
+  }
+  const cliEntry = dependencies.cliEntry ?? realpathSync(process.argv[1]!);
+  let codeProvenance: CodeProvenance | undefined;
+  if (harnessMode) {
+    codeProvenance = await discoverCodeProvenance(cliPackage(cliEntry));
+    if (codeProvenance.sourceWorktreeDirty) {
+      throw localError("dirty_harness_source", "A frozen --harness-mode cannot run from a dirty sharednet-client checkout; commit or stash the CLI changes first.");
+    }
+  }
   const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
   assertServeDemoGoalUnaddressed(content);
   const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
@@ -739,7 +766,7 @@ async function goalServeDemoCommand(parsed: ParsedArguments, globals: GlobalArgu
       workspace,
       env: dependencies.env,
       home: dependencies.env.HOME ?? homedir(),
-      entry: dependencies.cliEntry ?? realpathSync(process.argv[1]!),
+      entry: cliEntry,
     },
     docker,
     dependencies.stderr,
@@ -774,6 +801,9 @@ async function goalServeDemoCommand(parsed: ParsedArguments, globals: GlobalArgu
         checkEveryMs,
         quietChecks: parsed.options.get("quiet-checks") === true,
         kickoff: kickoff as ServeKickoff,
+        webSearch: webSearch as "live" | "off",
+        ...(harnessMode ? { harnessMode } : {}),
+        ...(codeProvenance ? { codeProvenance } : {}),
         ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
       },
       {

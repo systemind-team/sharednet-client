@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { ApiClient } from "./api-client.ts";
 import { DEFAULT_IMAGE, containerName, runContainers, type DockerRunner, type RunPlan } from "./goal-run.ts";
+import { resolveRuntimeHarnessMode } from "./harness-modes.ts";
 import {
   assertServeDemoGoalUnaddressed,
   parseServeDemoAgents,
@@ -154,6 +155,43 @@ async function lifecycleScenario(options: {
 }
 
 describe("serve-first Goal demo", () => {
+  it("rejects a dirty named runtime or a kickoff that differs from its frozen profile before Docker", async () => {
+    const workspace = await temporary();
+    const out = await temporary();
+    const calls: string[][] = [];
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseServeDemoAgents(["codex:gpt-test", "codex:gpt-test", "codex:gpt-test"]),
+      workspace,
+      cli: { root: "/opt/sharednet-cli", entry: "src/main.ts" },
+      codexAuth: { kind: "api-key" },
+      claudeAuth: null,
+    };
+    const provenance = {
+      clientCommit: "a".repeat(40), runnerCommit: "a".repeat(40), sourceWorktreeDirty: true,
+      packageVersion: "0.1.16-test", packageManifestSha256: null, entrySha256: null, codeTreeSha256: null,
+    };
+    const input = {
+      plan, roomId: ROOM, inviteToken: "rit_synthetic", goal: "Build it.", until: ["after 20m"],
+      baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true,
+      kickoff: "first" as const, harnessMode: resolveRuntimeHarnessMode("runtime/serve-first@1"), codeProvenance: provenance,
+    };
+    const dependencies = {
+      docker: async (args: readonly string[]) => { calls.push([...args]); return { code: 0, stdout: "", stderr: "" }; },
+      now: () => new Date("2026-10-14T20:00:00.000Z"),
+    };
+
+    await expect(runServeGoalDemo({} as ApiClient, "sni_synthetic", "snk_synthetic", input, dependencies)).rejects.toMatchObject({ code: "dirty_harness_source" });
+    await expect(runServeGoalDemo(
+      {} as ApiClient,
+      "sni_synthetic",
+      "snk_synthetic",
+      { ...input, kickoff: "all", codeProvenance: { ...provenance, sourceWorktreeDirty: false } },
+      dependencies,
+    )).rejects.toMatchObject({ code: "harness_mode_mismatch" });
+    expect(calls).toEqual([]);
+  });
+
   it("defaults to three Codex agents and refuses any topology other than three Codex seats", () => {
     expect(parseServeDemoAgents([])).toEqual([
       { name: "codex-1", driver: "codex", model: null },
@@ -300,6 +338,17 @@ describe("serve-first Goal demo", () => {
         checkEveryMs: 60_000,
         quietChecks: true,
         kickoff: "first",
+        webSearch: "off",
+        harnessMode: resolveRuntimeHarnessMode("runtime/serve-first@1"),
+        codeProvenance: {
+          clientCommit: "a".repeat(40),
+          runnerCommit: "a".repeat(40),
+          sourceWorktreeDirty: false,
+          packageVersion: "0.1.16-test",
+          packageManifestSha256: "b".repeat(64),
+          entrySha256: "c".repeat(64),
+          codeTreeSha256: "d".repeat(64),
+        },
       },
       {
         docker,
@@ -309,6 +358,7 @@ describe("serve-first Goal demo", () => {
         sleep: async () => undefined,
         watch: async (_client, _memberToken, _apiKey, options) => {
           watchOptions = options as unknown as Record<string, unknown>;
+          await writeFile(join(out, "episode.json"), `${JSON.stringify({ schema_version: 1, room_id: ROOM, totals: {} })}\n`);
           return { room_id: ROOM, ended_by: { trigger: "after 20m", at: "2026-10-14T20:20:00.000Z", detail: null }, messages: 2, checks: 0, snapshots: 0, out };
         },
       },
@@ -332,7 +382,7 @@ describe("serve-first Goal demo", () => {
     expect(agentExecs.every((args) => args[args.indexOf("--user") + 1] === "4242:4343")).toBe(true);
     expect(calls.filter((args) => args[0] === "exec" && args.includes("chown")).every((args) => args.join(" ").includes("chown -R 4242:4343"))).toBe(true);
     const configWrites = calls.flatMap((args, index) => args.some((argument) => argument.includes("/.codex/config.toml")) ? [callInputs[index]] : []);
-    expect(configWrites).toEqual(Array(3).fill('model = "gpt-6-luna"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n'));
+    expect(configWrites).toEqual(Array(3).fill('model = "gpt-6-luna"\nweb_search = "disabled"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n'));
     expect(calls.flat().join(" ")).not.toContain("snk_owner-secret");
     expect(calls.flat().join(" ")).not.toContain("rit_invite-secret");
     const copies = calls.filter((args) => args[0] === "cp");
@@ -353,6 +403,32 @@ describe("serve-first Goal demo", () => {
     }
     expect(result.agents.map((agent) => agent.session_id)).toEqual(["thread-one", "thread-two", "thread-three"]);
     expect(JSON.parse(await readFile(join(out, "serve-demo.json"), "utf8"))).toMatchObject({ mode: "real-serve", kickoff: "first" });
+    const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
+    expect(episode.harness).toMatchObject({
+      mode: "runtime/serve-first@1",
+      spec_sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      resolved_profile: {
+        command: "goal serve-demo",
+        delivery: "production-sharednet-serve",
+        kickoff: "first",
+        web_search: "off",
+        turn_limit_s: 1200,
+        until: ["after 20m"],
+      },
+      client_commit: "a".repeat(40),
+      source_worktree_dirty: false,
+      models: [
+        { seat: "codex-1", driver: "codex", model: "gpt-6-luna" },
+        { seat: "codex-2", driver: "codex", model: "gpt-6-luna" },
+        { seat: "codex-3", driver: "codex", model: "gpt-6-luna" },
+      ],
+      goal_sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      opening_prompt_sha256: {
+        "codex-1": expect.stringMatching(/^[0-9a-f]{64}$/),
+        "codex-2": expect.stringMatching(/^[0-9a-f]{64}$/),
+        "codex-3": expect.stringMatching(/^[0-9a-f]{64}$/),
+      },
+    });
     expect(calls.at(-1)).toEqual(["rm", "--force", containerName(ROOM, "codex-1"), containerName(ROOM, "codex-2"), containerName(ROOM, "codex-3"), containerName(ROOM)]);
   });
 

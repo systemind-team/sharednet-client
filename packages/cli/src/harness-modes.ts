@@ -37,14 +37,6 @@ interface AvailableHarnessMode {
   readonly command: "goal run";
 }
 
-interface DependencyHarnessMode {
-  readonly state: "dependency";
-  readonly command: "goal serve-demo";
-  readonly pull_request: 48;
-  readonly url: "https://github.com/systemind-team/sharednet-client/pull/48";
-  readonly reviewed_head: "e77597df9e2fae3d83c8c518c1c815eb7a3ede5d";
-}
-
 interface HarnessModeProvenance {
   readonly repository: "systemind-team/sharednet-client";
   readonly mechanism_commit: string;
@@ -72,7 +64,7 @@ export interface RuntimeHarnessModeSpec {
   readonly wake: string;
   readonly stop: string;
   readonly profile: RuntimeHarnessProfile;
-  readonly availability: DependencyHarnessMode;
+  readonly availability: AvailableHarnessMode;
   readonly provenance: HarnessModeProvenance;
 }
 
@@ -97,19 +89,12 @@ const researchProvenance = {
 const runtimeProvenance = {
   repository: "systemind-team/sharednet-client",
   mechanism_commit: "e77597df9e2fae3d83c8c518c1c815eb7a3ede5d",
-  verified_against: "e77597df9e2fae3d83c8c518c1c815eb7a3ede5d",
+  // Post-PR48 fixes retain models on resumes, isolate auth, and leave interrupted Rooms open.
+  verified_against: "8b8234e394ed44a4767ede4f1da1fac6da1cefee",
   source: ["packages/cli/src/goal-serve-demo.ts"],
 } as const;
 
 const available = { state: "available", command: "goal run" } as const;
-const dependency = {
-  state: "dependency",
-  command: "goal serve-demo",
-  pull_request: 48,
-  url: "https://github.com/systemind-team/sharednet-client/pull/48",
-  reviewed_head: "e77597df9e2fae3d83c8c518c1c815eb7a3ede5d",
-} as const;
-
 function research(
   name: ResearchHarnessModeName,
   controls: Pick<ResearchHarnessProfile, "mention_gate" | "task_gate" | "message_routing">,
@@ -157,7 +142,7 @@ function runtime(name: RuntimeHarnessModeName, kickoff: "first" | "all"): Runtim
       driver: "codex",
       later_wake: "direct-mentions",
     },
-    availability: dependency,
+    availability: available,
     provenance: runtimeProvenance,
   };
 }
@@ -210,12 +195,30 @@ export interface GoalRunHarnessResolution {
   readonly profile: ResearchHarnessProfile;
 }
 
+export interface RuntimeHarnessResolution {
+  readonly name: RuntimeHarnessModeName;
+  readonly spec: RuntimeHarnessModeSpec;
+  readonly specSha256: string;
+  readonly profile: RuntimeHarnessProfile;
+}
+
 export function resolveGoalRunHarnessMode(name: string): GoalRunHarnessResolution {
   const spec = getHarnessModeSpec(name);
   if (spec.family === "runtime") {
     throw localError(
-      "harness_mode_unavailable",
-      `${spec.name} is registered but unavailable in this build: it depends on unmerged PR #48 and the goal serve-demo command.`,
+      "harness_mode_family_mismatch",
+      `${spec.name} is a serve-backed runtime mode, not a runner-owned research mode.`,
+    );
+  }
+  return { name: spec.name, spec, specSha256: harnessModeSpecHash(spec), profile: spec.profile };
+}
+
+export function resolveRuntimeHarnessMode(name: string): RuntimeHarnessResolution {
+  const spec = getHarnessModeSpec(name);
+  if (spec.family !== "runtime") {
+    throw localError(
+      "harness_mode_family_mismatch",
+      `${spec.name} is a runner-owned research mode, not a serve-backed runtime mode.`,
     );
   }
   return { name: spec.name, spec, specSha256: harnessModeSpecHash(spec), profile: spec.profile };

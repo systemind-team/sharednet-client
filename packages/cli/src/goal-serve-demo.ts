@@ -1,4 +1,5 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { ApiClient } from "./api-client.ts";
@@ -11,9 +12,12 @@ import {
   parseAgents,
   runContainers,
   type AgentSpec,
+  type CodeProvenance,
   type DockerRunner,
   type RunPlan,
+  type WebSearch,
 } from "./goal-run.ts";
+import type { RuntimeHarnessResolution } from "./harness-modes.ts";
 import { mentions } from "./triggers.ts";
 import { validTurnLimit } from "./wake-driver.ts";
 
@@ -96,7 +100,10 @@ export interface ServeGoalDemoInput {
   checkEveryMs: number;
   quietChecks: boolean;
   kickoff: ServeKickoff;
+  webSearch?: WebSearch;
   turnLimitMs?: number;
+  harnessMode?: RuntimeHarnessResolution;
+  codeProvenance?: CodeProvenance;
 }
 
 type WatchGoal = (
@@ -175,6 +182,18 @@ export async function runServeGoalDemo(
   if (!validTurnLimit(input.turnLimitMs ?? DEFAULT_TURN_LIMIT_MS)) {
     throw localError("invalid_arguments", "The turn limit must be between 1m and 24h.");
   }
+  if (input.harnessMode && input.harnessMode.profile.kickoff !== input.kickoff) {
+    throw localError("harness_mode_mismatch", `${input.harnessMode.name} requires kickoff ${input.harnessMode.profile.kickoff}.`);
+  }
+  if (input.harnessMode && plan.agents.some((agent) => agent.model === null)) {
+    throw localError("harness_model_required", "A frozen --harness-mode requires every Agent to pin its model.");
+  }
+  if (input.harnessMode && !input.codeProvenance) {
+    throw localError("invalid_arguments", "A frozen runtime harness needs code provenance before it starts.");
+  }
+  if (input.harnessMode && input.codeProvenance?.sourceWorktreeDirty) {
+    throw localError("dirty_harness_source", "A frozen --harness-mode cannot run from a dirty sharednet-client checkout; commit or stash the CLI changes first.");
+  }
   const log = dependencies.stderr ?? (() => undefined);
   const sleep = dependencies.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const watch = dependencies.watch ?? goalWatch;
@@ -188,6 +207,7 @@ export async function runServeGoalDemo(
   const runningContainers = new Set<string>();
   const pendingStarts = new Set<Promise<unknown>>();
   const records: Array<AgentSpec & { member_id: string | null; session_id: string | null }> = plan.agents.map((agent) => ({ ...agent, member_id: null, session_id: null }));
+  const openingPromptHashes: Record<string, string> = {};
   await mkdir(input.out, { recursive: true });
 
   let interrupted: ServeDemoSignal | null = null;
@@ -372,7 +392,8 @@ export async function runServeGoalDemo(
         // `sharednet serve` resumes this thread in a new Codex process. Persist an
         // explicitly selected model in the seat's Codex home so those later turns
         // do not silently fall back to the machine or image default.
-        const config = `${seat.model ? `model = "${seat.model}"\n` : ""}approval_policy = "never"\nsandbox_mode = "danger-full-access"\n`;
+        const search = input.webSearch === "off" ? "disabled" : "live";
+        const config = `${seat.model ? `model = "${seat.model}"\n` : ""}web_search = "${search}"\napproval_policy = "never"\nsandbox_mode = "danger-full-access"\n`;
         const configured = await docker(["exec", "--user", agentUser, "--interactive", container, "sh", "-c", `cat > '${home}/.codex/config.toml'`], { input: config });
         if (configured.code !== 0) throw localError("container_failed", `${seat.name}'s Codex policy could not be written: ${configured.stderr.trim()}`);
       }
@@ -380,10 +401,12 @@ export async function runServeGoalDemo(
       // The bootstrap creates only persistent threads. It neither starts Goal work nor posts to the Room.
       for (const seat of records) {
         const reader = new TurnReader("codex");
+        const prompt = serveSessionPrompt(seat, records, input.until, input.kickoff);
+        openingPromptHashes[seat.name] = createHash("sha256").update(prompt).digest("hex");
         const command = [
           "timeout", "120", "codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox",
           ...(seat.model ? ["-m", seat.model] : []),
-          serveSessionPrompt(seat, records, input.until, input.kickoff),
+          prompt,
         ];
         const bootstrapped = await execSeat(seat, command);
         for (const line of bootstrapped.stdout.split("\n")) reader.line(line);
@@ -500,7 +523,33 @@ export async function runServeGoalDemo(
       if (serveLog.code !== 0) log(`goal: ${seat.name}'s serve log could not be copied out: ${serveLog.stderr.trim()}\n`);
     }
     const result: ServeGoalDemoResult = { ...watched, mode: "real-serve", kickoff: input.kickoff, agents: seats };
-    await writeFile(join(input.out, "serve-demo.json"), `${JSON.stringify({ mode: result.mode, kickoff: result.kickoff, image: plan.image, turn_limit_ms: turnLimitMs, goal_sequence: goalSequence, kickoff_message: kickoff, agents: seats }, null, 2)}\n`);
+    const harness = input.harnessMode && input.codeProvenance ? {
+      mode: input.harnessMode.name,
+      spec_sha256: input.harnessMode.specSha256,
+      resolved_profile: {
+        ...input.harnessMode.profile,
+        web_search: input.webSearch ?? "live",
+        turn_limit_s: Math.round(turnLimitMs / 1000),
+        until: input.until,
+      },
+      client_commit: input.codeProvenance.clientCommit,
+      runner_commit: input.codeProvenance.runnerCommit,
+      source_worktree_dirty: input.codeProvenance.sourceWorktreeDirty,
+      package_version: input.codeProvenance.packageVersion,
+      package_manifest_sha256: input.codeProvenance.packageManifestSha256,
+      entry_sha256: input.codeProvenance.entrySha256,
+      code_tree_sha256: input.codeProvenance.codeTreeSha256,
+      image: plan.image,
+      models: seats.map((seat) => ({ seat: seat.name, driver: seat.driver, model: seat.model })),
+      goal_sha256: createHash("sha256").update(input.goal).digest("hex"),
+      opening_prompt_sha256: openingPromptHashes,
+    } : null;
+    if (harness) {
+      const episodePath = join(input.out, "episode.json");
+      const episode = JSON.parse(await readFile(episodePath, "utf8")) as Record<string, unknown>;
+      await writeFile(episodePath, `${JSON.stringify({ ...episode, image: plan.image, web_search: input.webSearch ?? "live", turn_limit_s: Math.round(turnLimitMs / 1000), harness }, null, 2)}\n`);
+    }
+    await writeFile(join(input.out, "serve-demo.json"), `${JSON.stringify({ mode: result.mode, kickoff: result.kickoff, image: plan.image, turn_limit_ms: turnLimitMs, goal_sequence: goalSequence, kickoff_message: kickoff, ...(harness ? { harness } : {}), agents: seats }, null, 2)}\n`);
     return result;
   } catch (error) {
     runFailure = error;

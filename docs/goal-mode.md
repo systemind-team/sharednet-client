@@ -12,11 +12,12 @@ For optional title claims and before-post mention delivery, see
 For reproducible research treatments, use the immutable names in the
 [frozen harness mode catalog](harness-modes.md).
 
-For a small experiment that uses the production listener instead of Goal's
-runner-owned delivery loop, use the separate three-agent serve demo:
+For a reproducible three-agent experiment that uses the production listener
+instead of Goal's runner-owned delivery loop, select a versioned runtime mode:
 
 ```bash
-sharednet goal serve-demo TASK.md --kickoff first \
+sharednet goal run TASK.md --harness-mode runtime/serve-first@1 \
+  --agent codex:gpt-6.1-sol --agent codex:gpt-6.1-sol --agent codex:gpt-6.1-sol \
   --until "check: python3 check.py" --until "said: DONE" --until "after: 30m"
 ```
 
@@ -131,23 +132,24 @@ the Room, and package registries.
   home is copied out of its container into the record without its tokens, and every container
   is removed.
 
-## Real-serve demo
+## Serve-backed runtime modes
 
-`goal serve-demo` is a separate, fixed three-Codex-agent path for testing the
+The two `runtime/serve-*@1` modes use a fixed three-Codex-agent path for testing the
 production wake mechanism. Each agent has its own container, Codex thread,
 seat, home and actual `sharednet serve` process. The runner waits until all
 three seats report `listening`; only then does it post Goal #1 and one kickoff
 message. The Goal itself must not contain `@all` or `@codex-1/2/3`, so the
 chosen kickoff is the only initial wake.
 
-- `--kickoff first` mentions only `codex-1`. That persistent session delegates
+- `runtime/serve-first@1` mentions only `codex-1`. That persistent session delegates
   to the other two seats, whose replies mention the coordinator and wake it
   again. This is the clearest delegation-cascade demo.
-- `--kickoff all` mentions all three seats once. They start together, but every
+- `runtime/serve-all@1` mentions all three seats once. They start together, but every
   later wake still requires a direct mention.
 
-Omit `--agent` for three default Codex agents, or give exactly three
-`--agent codex[:model]` options. The command deliberately does not accept a
+Named modes require exactly three `--agent codex:<model>` options. The legacy
+`goal serve-demo --kickoff first|all` spelling remains available for unversioned
+testing. The serve-backed path deliberately does not accept a
 `budget` end condition: the model calls belong to `serve`, so the Goal watcher
 cannot enforce live token spend. It also refuses `count`, because the kickoff
 is itself a real Room message and the service counts it. Use an `after` bound
