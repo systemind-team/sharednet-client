@@ -203,7 +203,14 @@ export async function readOwnerOnlyFile(path: string): Promise<string | null> {
   let handle;
   try {
     const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
-    handle = await open(path, constants.O_RDONLY | noFollow);
+    try {
+      handle = await open(path, constants.O_RDONLY | noFollow);
+    } catch (error) {
+      // A concurrent owner may remove the file after lstat. That is the same
+      // observable state as a file which was absent at the initial lookup.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
     const openedInfo = await handle.stat();
     if (
       !openedInfo.isFile() ||

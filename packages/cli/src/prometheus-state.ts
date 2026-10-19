@@ -768,8 +768,15 @@ export async function readActiveRun(paths: PrometheusPaths): Promise<PrometheusR
 }
 
 async function removeOwnerOnlyFile(path: string): Promise<void> {
-  if ((await readOwnerOnlyFile(path)) === null) return;
-  await unlink(path);
+  try {
+    // Unlinking a symlink removes the link itself, so deletion does not need
+    // the read-side no-follow validation. Avoiding a read before unlink also
+    // removes the check/read/unlink window used by competing state cleaners.
+    await unlink(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
   const directory = await open(dirname(path), "r");
   try {
     await directory.sync();
