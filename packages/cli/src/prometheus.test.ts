@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { DEFAULT_IMAGE, type DockerRunner, type RunPlan } from "./goal-run.ts";
 import { cancelPrometheusRun, evaluatePrometheusBarrier, prometheusCandidateHandoff, prometheusKickoff, prometheusStatus, readPrometheusMessages, resumePrometheusRun } from "./prometheus.ts";
-import { claimMonitor, prometheusPaths, readActiveRun, requestCancel, reserveActiveRun, writeRun, writeTeam, type PrometheusRunState, type PrometheusTeamState } from "./prometheus-state.ts";
+import { claimMonitor, prometheusPaths, readActiveRun, readRun, requestCancel, reserveActiveRun, writeRun, writeTeam, type PrometheusRunState, type PrometheusTeamState } from "./prometheus-state.ts";
 import type { ProcessProbe } from "./process-identity.ts";
 
 const candidate = {
@@ -20,6 +20,14 @@ const candidate = {
   verifications: [],
   revisionSha256: "b".repeat(64),
 };
+const UUIDS = {
+  room: "11111111-1111-4111-8111-111111111111",
+  goal: "22222222-2222-4222-8222-222222222222",
+  coordinator: "33333333-3333-4333-8333-333333333333",
+  builder: "44444444-4444-4444-8444-444444444444",
+  reviewer: "55555555-5555-4555-8555-555555555555",
+  kickoff: "66666666-6666-4666-8666-666666666666",
+} as const;
 const receipts = {
   ok: true as const,
   receipts: {
@@ -67,18 +75,18 @@ async function lifecycleFixture(checkpoint: PrometheusRunState["startup_checkpoi
     member_id: `i_${role}`, thread_id: `thr-${role}`, container_name: container(role),
   }])) as NonNullable<PrometheusRunState["roster"]>;
   const run: PrometheusRunState = {
-    schema_version: 1, run_id: "run_lifecycle", workspace_key: paths.workspaceKey, workspace_path: paths.workspacePath,
+    schema_version: 2, run_id: "run_lifecycle", workspace_key: paths.workspaceKey, workspace_path: paths.workspacePath,
     configuration: {
       model: "gpt-6-sol", goal_path: join(workspace, "GOAL.md"),
       goal_sha256: createHash("sha256").update(goal).digest("hex"), policy_sha256: team.last_policy_sha256,
-      check_command: "pnpm test",
+      check_command: "pnpm test", goal_request_body: { content: goal, until: [`at ${deadlineAt}`] },
     },
     startup_checkpoint: checkpoint,
     room: checkpointIndex >= 1 ? { room_id: "rom_Lifecycle", goal_sequence: checkpointIndex >= 2 ? 1 : null, kickoff_sequence: checkpointIndex >= 5 ? 2 : null } : null,
     roster: checkpointIndex >= 3 ? roster : null,
-    idempotency_keys: { room: "run-room", goal: "run-goal", roles: { coordinator: "run-coordinator", builder: "run-builder", reviewer: "run-reviewer" }, kickoff: "run-kickoff" },
+    idempotency_keys: { room: UUIDS.room, goal: UUIDS.goal, roles: { coordinator: UUIDS.coordinator, builder: UUIDS.builder, reviewer: UUIDS.reviewer }, kickoff: UUIDS.kickoff },
     deadline_at: deadlineAt, monitor: null, cancel_requested: false,
-    outcome: checkpoint === "kickoff_posted" ? "running" : "starting", candidate: null, checks: [],
+    outcome: checkpoint === "kickoff_posted" ? "running" : "starting", candidate: null, checks: [], effects: [], pending_close: null,
     created_at: "2026-10-18T00:00:00.000Z", updated_at: "2026-10-18T00:00:01.000Z", finished_at: null, reason: null,
   };
   const processState = { alive: true, identity: "test-process-start" };
@@ -213,10 +221,10 @@ describe("Prometheus lifecycle recovery", () => {
   it("resumes a reserved run through every missing startup checkpoint with the original idempotency keys", async () => {
     const fixture = await lifecycleFixture("reserved");
     const dockerCalls: Array<{ args: readonly string[]; env?: Record<string, string> }> = [];
-    const requests: Array<{ method: string; path: string; headers?: Record<string, string> }> = [];
+    const requests: Array<{ method: string; path: string; body?: unknown; headers?: Record<string, string> }> = [];
     let startupFinished = false;
-    const client = { request: async (method: string, path: string, _credential: string, _body?: unknown, headers?: Record<string, string>) => {
-      requests.push({ method, path, headers });
+    const client = { request: async (method: string, path: string, _credential: string, body?: unknown, headers?: Record<string, string>) => {
+      requests.push({ method, path, body, headers });
       if (path === "/rooms") return { room: { id: "rom_Lifecycle" } };
       if (path.endsWith("/goal")) return { message: { sequence: 1 } };
       if (path.endsWith("/invites")) return { token: `rit_${"t".repeat(43)}` };
@@ -233,13 +241,23 @@ describe("Prometheus lifecycle recovery", () => {
 
     expect(result).toMatchObject({ startup_checkpoint: "kickoff_posted", outcome: "timed_out", room: { room_id: "rom_Lifecycle", goal_sequence: 1, kickoff_sequence: 2 } });
     expect(await readActiveRun(fixture.paths)).toBeNull();
+    await expect(readRun(fixture.paths, fixture.run.run_id)).resolves.toMatchObject({
+      effects: [
+        { effect_id: "room.create", status: "committed", body: { name: expect.any(String), type: "compiled" } },
+        { effect_id: "goal.start", status: "committed", body: { content: "Build the requested artifact.\n", until: ["at 2026-10-18T02:00:00.000Z"] } },
+        { effect_id: "kickoff.post", status: "committed", body: { content: expect.any(String), as: "runner" } },
+        { effect_id: "close.timed_out", status: "committed", body: { trigger: "prometheus_timed_out", detail: fixture.run.run_id } },
+      ],
+      pending_close: null,
+    });
     expect(requests.filter((request) => request.path === "/rooms")).toHaveLength(1);
-    expect(requests.find((request) => request.path === "/rooms")?.headers?.["idempotency-key"]).toBe("run-room");
-    expect(requests.find((request) => request.path.endsWith("/goal"))?.headers?.["idempotency-key"]).toBe("run-goal");
-    expect(requests.find((request) => request.path.endsWith("/owner-messages"))?.headers?.["idempotency-key"]).toBe("run-kickoff");
+    expect(requests.find((request) => request.path === "/rooms")?.headers?.["idempotency-key"]).toBe(UUIDS.room);
+    expect(requests.find((request) => request.path.endsWith("/goal"))?.headers?.["idempotency-key"]).toBe(UUIDS.goal);
+    expect(requests.find((request) => request.path.endsWith("/goal"))?.body).toEqual({ content: "Build the requested artifact.\n", until: ["at 2026-10-18T02:00:00.000Z"] });
+    expect(requests.find((request) => request.path.endsWith("/owner-messages"))?.headers?.["idempotency-key"]).toBe(UUIDS.kickoff);
     for (const role of ["coordinator", "builder", "reviewer"] as const) {
       const join = dockerCalls.find((call) => call.args.includes("join") && call.args.join(" ").includes(role));
-      expect(join?.env?.SHAREDNET_JOIN_IDEMPOTENCY_KEY).toBe(`run-${role}`);
+      expect(join?.env?.SHAREDNET_JOIN_IDEMPOTENCY_KEY).toBe(UUIDS[role]);
     }
   });
 

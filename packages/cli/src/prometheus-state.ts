@@ -44,6 +44,7 @@ const ROOM_ID = /^rom_[A-Za-z0-9]+$/;
 const MEMBER_ID = /^(?:i|mem)_[A-Za-z0-9]+$/;
 const DOCKER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const MODEL_NAME = /^[A-Za-z0-9._/-]{1,100}$/;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FORBIDDEN_STATE_TEXT = /(?:\b(?:snk|sni|rit|clp|afk)_[A-Za-z0-9_-]{16,}\b|\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{16,}|(?:\\?")(?:access_token|refresh_token|id_token|client_secret|api_key|member_token)(?:\\?")\s*:\s*(?:\\?")[^"\\\r\n]{16,})/i;
 const FORBIDDEN_JWT = /(?:\bBearer\s+[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})/i;
 
@@ -88,6 +89,10 @@ export interface PrometheusRunConfiguration {
   goal_sha256: string;
   policy_sha256: string;
   check_command: string;
+  goal_request_body: {
+    content: string;
+    until: [string];
+  };
 }
 
 export interface PrometheusRoomState {
@@ -109,6 +114,34 @@ export interface PrometheusIdempotencyKeys {
   goal: string;
   roles: Record<PrometheusRole, string>;
   kickoff: string;
+}
+
+export type PrometheusEffectStatus = "pending" | "committed";
+
+export interface PrometheusEffectJournalEntry {
+  effect_id: string;
+  method: "POST";
+  path: string;
+  idempotency_key: string;
+  body: unknown;
+  body_sha256: string;
+  status: PrometheusEffectStatus;
+  created_at: string;
+  committed_at: string | null;
+}
+
+export interface PrometheusCloseExpectation {
+  latest_sequence: number;
+  compiled_sequence: number;
+  compiled_digest: string;
+}
+
+export interface PrometheusPendingClose {
+  effect_id: string;
+  outcome: PrometheusTerminalOutcome;
+  revision_sha256: string | null;
+  expected: PrometheusCloseExpectation | null;
+  prepared_at: string;
 }
 
 export interface MonitorLease {
@@ -138,7 +171,7 @@ export interface PrometheusCheckSummary {
 }
 
 export interface PrometheusRunState {
-  schema_version: 1;
+  schema_version: 2;
   run_id: string;
   workspace_key: string;
   workspace_path: string;
@@ -153,6 +186,8 @@ export interface PrometheusRunState {
   outcome: PrometheusRunOutcome;
   candidate: PrometheusCandidateSummary | null;
   checks: PrometheusCheckSummary[];
+  effects: PrometheusEffectJournalEntry[];
+  pending_close: PrometheusPendingClose | null;
   created_at: string;
   updated_at: string;
   finished_at: string | null;
@@ -305,17 +340,25 @@ function parseTeam(value: unknown, paths: PrometheusPaths): PrometheusTeamState 
 function parseConfiguration(value: unknown, source: string): PrometheusRunConfiguration {
   const object = record(
     value,
-    ["model", "goal_path", "goal_sha256", "policy_sha256", "check_command"],
+    ["model", "goal_path", "goal_sha256", "policy_sha256", "check_command", "goal_request_body"],
     source,
   );
   const goalPath = string(object.goal_path, source);
   if (!isAbsolute(goalPath)) invalidState(source);
+  const goalBody = record(object.goal_request_body, ["content", "until"], source);
+  if (!Array.isArray(goalBody.until) || goalBody.until.length !== 1) invalidState(source);
+  const until = string(goalBody.until[0], source, 96);
+  if (!/^at \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(until)) invalidState(source);
   return {
     model: pattern(object.model, MODEL_NAME, source),
     goal_path: goalPath,
     goal_sha256: pattern(object.goal_sha256, HEX_SHA256, source),
     policy_sha256: pattern(object.policy_sha256, HEX_SHA256, source),
     check_command: string(object.check_command, source),
+    goal_request_body: {
+      content: string(goalBody.content, source, 1_000_000),
+      until: [until],
+    },
   };
 }
 
@@ -355,10 +398,86 @@ function parseRoster(value: unknown, source: string): PrometheusRoster | null {
 function parseIdempotencyKeys(value: unknown, source: string): PrometheusIdempotencyKeys {
   const object = record(value, ["room", "goal", "roles", "kickoff"], source);
   return {
-    room: pattern(object.room, SAFE_ID, source),
-    goal: pattern(object.goal, SAFE_ID, source),
-    roles: exactRoleRecord(object.roles, source, (entry) => pattern(entry, SAFE_ID, source)),
-    kickoff: pattern(object.kickoff, SAFE_ID, source),
+    room: pattern(object.room, UUID_V4, source),
+    goal: pattern(object.goal, UUID_V4, source),
+    roles: exactRoleRecord(object.roles, source, (entry) => pattern(entry, UUID_V4, source)),
+    kickoff: pattern(object.kickoff, UUID_V4, source),
+  };
+}
+
+function parseEffectBody(value: unknown, source: string): unknown {
+  if (value === undefined) invalidState(source);
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    invalidState(source);
+  }
+  if (serialized === undefined || serialized.length > 1_000_000) invalidState(source);
+  noCredentials(value);
+  return value;
+}
+
+function effectBodySha256(body: unknown): string {
+  return createHash("sha256").update(JSON.stringify(body), "utf8").digest("hex");
+}
+
+function parseEffect(value: unknown, source: string): PrometheusEffectJournalEntry {
+  const object = record(value, [
+    "effect_id", "method", "path", "idempotency_key", "body", "body_sha256",
+    "status", "created_at", "committed_at",
+  ], source);
+  if (object.method !== "POST") invalidState(source);
+  const path = string(object.path, source, 2_048);
+  if (!path.startsWith("/") || path.includes("\0")) invalidState(source);
+  const body = parseEffectBody(object.body, source);
+  const bodySha256 = pattern(object.body_sha256, HEX_SHA256, source);
+  if (bodySha256 !== effectBodySha256(body)) invalidState(source);
+  const status = string(object.status, source) as PrometheusEffectStatus;
+  if (status !== "pending" && status !== "committed") invalidState(source);
+  const createdAt = timestamp(object.created_at, source);
+  const committedAt = nullableTimestamp(object.committed_at, source);
+  if ((status === "committed") !== (committedAt !== null)) invalidState(source);
+  if (committedAt !== null && Date.parse(committedAt) < Date.parse(createdAt)) invalidState(source);
+  return {
+    effect_id: pattern(object.effect_id, SAFE_ID, source),
+    method: "POST",
+    path,
+    idempotency_key: pattern(object.idempotency_key, UUID_V4, source),
+    body,
+    body_sha256: bodySha256,
+    status,
+    created_at: createdAt,
+    committed_at: committedAt,
+  };
+}
+
+function parseCloseExpectation(value: unknown, source: string): PrometheusCloseExpectation | null {
+  if (value === null) return null;
+  const object = record(value, ["latest_sequence", "compiled_sequence", "compiled_digest"], source);
+  return {
+    latest_sequence: safeInteger(object.latest_sequence, source),
+    compiled_sequence: safeInteger(object.compiled_sequence, source),
+    compiled_digest: pattern(object.compiled_digest, COMPILED_STATE_DIGEST, source),
+  };
+}
+
+function parsePendingClose(value: unknown, source: string): PrometheusPendingClose | null {
+  if (value === null) return null;
+  const object = record(value, ["effect_id", "outcome", "revision_sha256", "expected", "prepared_at"], source);
+  const outcome = string(object.outcome, source) as PrometheusTerminalOutcome;
+  if (!TERMINAL_OUTCOMES.has(outcome)) invalidState(source);
+  const revisionSha256 = object.revision_sha256 === null ? null : pattern(object.revision_sha256, HEX_SHA256, source);
+  const expected = parseCloseExpectation(object.expected, source);
+  if (outcome === "succeeded" ? (revisionSha256 === null || expected === null) : (revisionSha256 !== null || expected !== null)) {
+    invalidState(source);
+  }
+  return {
+    effect_id: pattern(object.effect_id, SAFE_ID, source),
+    outcome,
+    revision_sha256: revisionSha256,
+    expected,
+    prepared_at: timestamp(object.prepared_at, source),
   };
 }
 
@@ -438,6 +557,8 @@ function parseRun(value: unknown, paths: PrometheusPaths, expectedRunId: string)
       "outcome",
       "candidate",
       "checks",
+      "effects",
+      "pending_close",
       "created_at",
       "updated_at",
       "finished_at",
@@ -445,7 +566,7 @@ function parseRun(value: unknown, paths: PrometheusPaths, expectedRunId: string)
     ],
     `${source} is not valid Prometheus state.`,
   );
-  if (object.schema_version !== 1) invalidState(`${source} has an unsupported version.`);
+  if (object.schema_version !== 2) invalidState(`${source} has an unsupported version.`);
   const runId = pattern(object.run_id, SAFE_ID, source);
   const workspaceKey = pattern(object.workspace_key, WORKSPACE_KEY, source);
   const workspacePath = string(object.workspace_path, source);
@@ -488,10 +609,19 @@ function parseRun(value: unknown, paths: PrometheusPaths, expectedRunId: string)
   const candidate = parseCandidate(object.candidate, source);
   if (outcome === "succeeded" && candidate === null) invalidState(source);
   if (!Array.isArray(object.checks)) invalidState(source);
+  if (!Array.isArray(object.effects)) invalidState(source);
   if (typeof object.cancel_requested !== "boolean") invalidState(source);
 
+  const effects = object.effects.map((entry, index) => parseEffect(entry, `${source} effect ${index}`));
+  if (new Set(effects.map((entry) => entry.effect_id)).size !== effects.length) invalidState(source);
+  const pendingClose = parsePendingClose(object.pending_close, source);
+  if (pendingClose !== null) {
+    const closeEffect = effects.find((entry) => entry.effect_id === pendingClose.effect_id);
+    if (!closeEffect || !closeEffect.path.endsWith("/close")) invalidState(source);
+  }
+
   return {
-    schema_version: 1,
+    schema_version: 2,
     run_id: runId,
     workspace_key: workspaceKey,
     workspace_path: workspacePath,
@@ -506,6 +636,8 @@ function parseRun(value: unknown, paths: PrometheusPaths, expectedRunId: string)
     outcome,
     candidate,
     checks: object.checks.map((entry, index) => parseCheck(entry, `${source} check ${index}`)),
+    effects,
+    pending_close: pendingClose,
     created_at: createdAt,
     updated_at: updatedAt,
     finished_at: finishedAt,
@@ -664,6 +796,28 @@ async function writeRunUnlocked(
     }
     if (Date.parse(parsed.updated_at) < Date.parse(existing.updated_at)) {
       invalidState("A Prometheus run update cannot move backwards in time.");
+    }
+    if (parsed.effects.length < existing.effects.length) {
+      invalidState("A Prometheus effect journal cannot lose entries.");
+    }
+    for (let index = 0; index < existing.effects.length; index += 1) {
+      const before = existing.effects[index]!;
+      const after = parsed.effects[index]!;
+      const fixed = (entry: PrometheusEffectJournalEntry) => ({
+        effect_id: entry.effect_id,
+        method: entry.method,
+        path: entry.path,
+        idempotency_key: entry.idempotency_key,
+        body: entry.body,
+        body_sha256: entry.body_sha256,
+        created_at: entry.created_at,
+      });
+      if (JSON.stringify(fixed(before)) !== JSON.stringify(fixed(after))) {
+        invalidState("A prepared Prometheus effect request cannot be changed.");
+      }
+      if (before.status === "committed" && JSON.stringify(before) !== JSON.stringify(after)) {
+        invalidState("A committed Prometheus effect cannot be changed.");
+      }
     }
   }
   if (isTerminal(parsed.outcome) && !options.allowTerminal) {

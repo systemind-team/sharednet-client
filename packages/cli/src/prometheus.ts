@@ -39,6 +39,8 @@ import {
   writeRun,
   writeTeam,
   type PrometheusPaths,
+  type PrometheusEffectJournalEntry,
+  type PrometheusPendingClose,
   type PrometheusRoster,
   type PrometheusRunState,
   type PrometheusTeamState,
@@ -161,22 +163,37 @@ async function readInputs(input: StartPrometheusInput): Promise<{ workspace: str
 function newRun(paths: PrometheusPaths, input: StartPrometheusInput, policy: PrometheusPolicy, goal: string, goalPath: string, now: Date): PrometheusRunState {
   const runId = `run_${now.toISOString().replace(/[-:.TZ]/g, "")}_${randomUUID().slice(0, 8)}`;
   const createdAt = now.toISOString();
+  const deadlineAt = new Date(now.getTime() + input.timeoutMs).toISOString();
   return {
-    schema_version: 1,
+    schema_version: 2,
     run_id: runId,
     workspace_key: paths.workspaceKey,
     workspace_path: paths.workspacePath,
-    configuration: { model: input.model, goal_path: goalPath, goal_sha256: hash(goal), policy_sha256: policy.sha256, check_command: input.check },
+    configuration: {
+      model: input.model,
+      goal_path: goalPath,
+      goal_sha256: hash(goal),
+      policy_sha256: policy.sha256,
+      check_command: input.check,
+      goal_request_body: { content: goal, until: [`at ${deadlineAt}`] },
+    },
     startup_checkpoint: "reserved",
     room: null,
     roster: null,
-    idempotency_keys: { room: `${runId}-room`, goal: `${runId}-goal`, roles: { coordinator: `${runId}-coordinator`, builder: `${runId}-builder`, reviewer: `${runId}-reviewer` }, kickoff: `${runId}-kickoff` },
-    deadline_at: new Date(now.getTime() + input.timeoutMs).toISOString(),
+    idempotency_keys: {
+      room: randomUUID(),
+      goal: randomUUID(),
+      roles: { coordinator: randomUUID(), builder: randomUUID(), reviewer: randomUUID() },
+      kickoff: randomUUID(),
+    },
+    deadline_at: deadlineAt,
     monitor: null,
     cancel_requested: false,
     outcome: "starting",
     candidate: null,
     checks: [],
+    effects: [],
+    pending_close: null,
     created_at: createdAt,
     updated_at: createdAt,
     finished_at: null,
@@ -192,6 +209,95 @@ async function saveCheckpoint(paths: PrometheusPaths, run: PrometheusRunState, c
     throw localError("prometheus_monitor_lease_lost", `Prometheus run ${run.run_id} is no longer active.`);
   }
   return authoritative;
+}
+
+function requestBodySha256(body: unknown): string {
+  return createHash("sha256").update(JSON.stringify(body), "utf8").digest("hex");
+}
+
+interface PreparedEffectInput {
+  effectId: string;
+  path: string;
+  body: unknown;
+  idempotencyKey?: string;
+  pendingClose?: Omit<PrometheusPendingClose, "effect_id" | "prepared_at">;
+}
+
+async function prepareEffect(
+  run: PrometheusRunState,
+  input: PreparedEffectInput,
+  dependencies: Pick<StartupDependencies, "paths" | "now">,
+): Promise<{ run: PrometheusRunState; effect: PrometheusEffectJournalEntry }> {
+  const bodySha256 = requestBodySha256(input.body);
+  const existing = run.effects.find((entry) => entry.effect_id === input.effectId);
+  if (existing) {
+    if (
+      existing.path !== input.path ||
+      existing.method !== "POST" ||
+      existing.body_sha256 !== bodySha256 ||
+      JSON.stringify(existing.body) !== JSON.stringify(input.body) ||
+      (input.idempotencyKey !== undefined && existing.idempotency_key !== input.idempotencyKey)
+    ) {
+      throw localError("prometheus_effect_conflict", `Prometheus effect ${input.effectId} was already prepared with a different request.`);
+    }
+    return { run, effect: existing };
+  }
+  const createdAt = timestampAfter(run.updated_at, dependencies.now());
+  const effect: PrometheusEffectJournalEntry = {
+    effect_id: input.effectId,
+    method: "POST",
+    path: input.path,
+    idempotency_key: input.idempotencyKey ?? randomUUID(),
+    body: input.body,
+    body_sha256: bodySha256,
+    status: "pending",
+    created_at: createdAt,
+    committed_at: null,
+  };
+  const pendingClose = input.pendingClose === undefined
+    ? run.pending_close
+    : { effect_id: effect.effect_id, ...input.pendingClose, prepared_at: createdAt };
+  const prepared = await saveCheckpoint(dependencies.paths, run, {
+    effects: [...run.effects, effect],
+    pending_close: pendingClose,
+  }, new Date(createdAt));
+  return { run: prepared, effect: prepared.effects.at(-1)! };
+}
+
+async function commitEffect(
+  run: PrometheusRunState,
+  effectId: string,
+  dependencies: Pick<StartupDependencies, "paths" | "now">,
+): Promise<PrometheusRunState> {
+  const index = run.effects.findIndex((entry) => entry.effect_id === effectId);
+  if (index < 0) throw localError("prometheus_effect_missing", `Prometheus effect ${effectId} is missing.`);
+  if (run.effects[index]!.status === "committed") return run;
+  const committedAt = timestampAfter(run.updated_at, dependencies.now());
+  const effects = run.effects.map((entry, candidate) => candidate === index
+    ? { ...entry, status: "committed" as const, committed_at: committedAt }
+    : entry);
+  return saveCheckpoint(dependencies.paths, run, { effects }, new Date(committedAt));
+}
+
+async function performEffect<T>(
+  run: PrometheusRunState,
+  input: PreparedEffectInput,
+  credential: string,
+  client: ApiClient,
+  dependencies: Pick<StartupDependencies, "paths" | "now">,
+  signal?: AbortSignal,
+): Promise<{ run: PrometheusRunState; response: T }> {
+  const prepared = await prepareEffect(run, input, dependencies);
+  const response = await client.request<T>(
+    "POST",
+    prepared.effect.path,
+    credential,
+    prepared.effect.body,
+    { "idempotency-key": prepared.effect.idempotency_key },
+    signal,
+  );
+  const committed = await commitEffect(prepared.run, prepared.effect.effect_id, dependencies);
+  return { run: committed, response };
 }
 
 async function readSavedInputs(run: PrometheusRunState): Promise<{ policy: PrometheusPolicy; goal: string }> {
@@ -233,19 +339,27 @@ interface StartupDependencies extends PrometheusDependencies {
 }
 
 async function finishStoppedRun(
-  run: PrometheusRunState,
+  initial: PrometheusRunState,
   lease: NonNullable<PrometheusRunState["monitor"]>,
   dependencies: Pick<StartupDependencies, "paths" | "now"> & { connection?: PrometheusConnection },
 ): Promise<PrometheusRunState> {
+  let run = initial;
   const outcome = run.cancel_requested ? "cancelled" : "timed_out";
   if (run.room && dependencies.connection) {
-    await dependencies.connection.client.request(
-      "POST",
-      `/rooms/${encodeURIComponent(run.room.room_id)}/close`,
+    const body = { trigger: `prometheus_${outcome}`, detail: run.run_id };
+    const closed = await performEffect(
+      run,
+      {
+        effectId: `close.${outcome}`,
+        path: `/rooms/${encodeURIComponent(run.room.room_id)}/close`,
+        body,
+        pendingClose: { outcome, revision_sha256: null, expected: null },
+      },
       dependencies.connection.apiKey,
-      { trigger: `prometheus_${outcome}`, detail: run.run_id },
-      { "idempotency-key": `${run.run_id}-close-${outcome}` },
+      dependencies.connection.client,
+      dependencies,
     );
+    run = await saveCheckpoint(dependencies.paths, closed.run, { pending_close: null }, dependencies.now());
   }
   const finishedAt = timestampAfter(run.updated_at, dependencies.now());
   const final: PrometheusRunState = {
@@ -441,14 +555,21 @@ async function continuePrometheusRun(
 
   try {
     if (run.startup_checkpoint === "reserved") {
-      const created = await whileRunActive(run, dependencies, (signal) =>
-        connection.client.request<{ room?: { id?: string } }>(
-          "POST", "/rooms", connection.memberToken,
-          { name: `Prometheus ${basename(dependencies.paths.workspacePath)}`, type: "compiled" },
-          { "idempotency-key": run.idempotency_keys.room },
-          signal,
-        ));
-      const roomId = created.room?.id;
+      const created = await whileRunActive(run, dependencies, (signal) => performEffect<{ room?: { id?: string } }>(
+        run,
+        {
+          effectId: "room.create",
+          path: "/rooms",
+          body: { name: `Prometheus ${basename(dependencies.paths.workspacePath)}`, type: "compiled" },
+          idempotencyKey: run.idempotency_keys.room,
+        },
+        connection.memberToken,
+        connection.client,
+        dependencies,
+        signal,
+      ));
+      run = created.run;
+      const roomId = created.response.room?.id;
       if (!roomId) throw localError("invalid_server_response", "The compiled Prometheus Room id did not come back.");
       run = await saveCheckpoint(dependencies.paths, run, { startup_checkpoint: "room_created", room: { room_id: roomId, goal_sequence: null, kickoff_sequence: null } }, dependencies.now());
       const stopped = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection });
@@ -456,15 +577,21 @@ async function continuePrometheusRun(
     }
 
     if (run.startup_checkpoint === "room_created") {
-      const remaining = Date.parse(run.deadline_at) - dependencies.now().getTime();
-      const started = await whileRunActive(run, dependencies, (signal) =>
-        connection.client.request<{ message?: { sequence?: number } }>(
-          "POST", `/rooms/${encodeURIComponent(run.room!.room_id)}/goal`, connection.apiKey,
-          { content: loaded.goal, until: [`after ${Math.max(1, Math.ceil(remaining / 1000))}s`] },
-          { "idempotency-key": run.idempotency_keys.goal },
-          signal,
-        ));
-      const goalSequence = started.message?.sequence;
+      const started = await whileRunActive(run, dependencies, (signal) => performEffect<{ message?: { sequence?: number } }>(
+        run,
+        {
+          effectId: "goal.start",
+          path: `/rooms/${encodeURIComponent(run.room!.room_id)}/goal`,
+          body: run.configuration.goal_request_body,
+          idempotencyKey: run.idempotency_keys.goal,
+        },
+        connection.apiKey,
+        connection.client,
+        dependencies,
+        signal,
+      ));
+      run = started.run;
+      const goalSequence = started.response.message?.sequence;
       if (!Number.isSafeInteger(goalSequence) || goalSequence! < 1) throw localError("invalid_server_response", "The Prometheus Goal sequence did not come back.");
       run = await saveCheckpoint(dependencies.paths, run, { startup_checkpoint: "goal_started", room: { ...run.room!, goal_sequence: goalSequence! } }, dependencies.now());
       const stopped = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection });
@@ -511,13 +638,21 @@ async function continuePrometheusRun(
         check: run.configuration.check_command,
         deadlineAt: run.deadline_at,
       });
-      const kicked = await whileRunActive(run, dependencies, (signal) =>
-        connection.client.request<{ message?: { sequence?: number } }>(
-          "POST", `/rooms/${encodeURIComponent(run.room!.room_id)}/owner-messages`, connection.apiKey,
-          { content, as: "runner" }, { "idempotency-key": run.idempotency_keys.kickoff },
-          signal,
-        ));
-      const kickoffSequence = kicked.message?.sequence;
+      const kicked = await whileRunActive(run, dependencies, (signal) => performEffect<{ message?: { sequence?: number } }>(
+        run,
+        {
+          effectId: "kickoff.post",
+          path: `/rooms/${encodeURIComponent(run.room!.room_id)}/owner-messages`,
+          body: { content, as: "runner" },
+          idempotencyKey: run.idempotency_keys.kickoff,
+        },
+        connection.apiKey,
+        connection.client,
+        dependencies,
+        signal,
+      ));
+      run = kicked.run;
+      const kickoffSequence = kicked.response.message?.sequence;
       if (!Number.isSafeInteger(kickoffSequence) || kickoffSequence! <= run.room!.goal_sequence!) throw localError("invalid_server_response", "The Prometheus kickoff sequence did not come back.");
       run = await saveCheckpoint(dependencies.paths, run, { startup_checkpoint: "kickoff_posted", outcome: "running", room: { ...run.room!, kickoff_sequence: kickoffSequence! } }, dependencies.now());
     }
