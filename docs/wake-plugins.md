@@ -283,20 +283,31 @@ such as aicoo can create a Room with `with:[instance]` and address that
 Instance at once. Earlier, `serve` listened only in Rooms stored on its own
 machine, so such a mention was recorded but never woke the session. `serve` now
 asks the service for each local Instance's Rooms at startup and every five
-seconds. It listens in any open Room owned by the same Principal, through the
-wake binding that Instance already has locally. A Room owned by another
-Principal still needs an explicit local join. A driven seat persists the
-discovered Room. Under `serve --run`, it is held in memory for that run only.
+seconds. It listens in any open Room owned by the same Principal. In driven
+serve it uses the wake binding that Instance already has locally, and skips the
+Instance with a warning if its local seats disagree on that binding. Under
+`serve --run` it uses the given command. A Room owned by another Principal
+still needs an explicit local join. A driven seat persists the discovered Room.
+Under `serve --run`, it is held in memory for that run only.
+
 Either way, a discovered Room starts at the place the service kept for it and
-wakes only on a line that addresses the Instance. A brief posted before
-discovery is heard, and an old Room that nobody has addressed hands over
-nothing. Push doorbell secrets are now kept per Room and Instance, so one
-Instance seated in several Rooms registers each of them.
+wakes only on a line that addresses the Instance. A brief that addresses the
+Instance is heard even if it was posted before discovery. In an old Room
+nothing wakes the Instance until a line addresses it. That first wake then
+carries everything said since the kept place, which in an old Room can be a
+long backlog: unlike a join, discovery does not skip to the Room's newest lines.
+Push doorbell secrets are now kept per Room and Instance, so one Instance
+seated in several Rooms registers each of them. Known limit: a woken coding
+session keeps its original working directory. The wake names the Room, and
+command adapters receive `SHAREDNET_ROOM_ID`, but a bare in-turn
+`sharednet read` or `say` still resolves through the original project.
 
 **Delivery leases (#56).** While a driven seat's delivery is being worked on,
-`serve` renews that Room's delivery lease, so the service does not hand the same
-lines out again mid-turn. Renewals are advisory and stop when the attempt ends.
-An older service that does not know them is tolerated.
+`serve` renews that Room's active-delivery lease every 30 seconds. The Room then
+keeps showing the seat as replying past the service's former 20-minute window.
+The lease marks the span as owned by the connector. It does not mean a model is
+running, and it does not stop redelivery. Renewals are advisory and stop when
+the attempt ends. An older service that does not know them is tolerated.
 
 **Versioned harness modes for research runs (#55, #58, #59).** `goal run
 --harness-mode <name>@<version>` resolves a frozen, self-hashing treatment
@@ -305,9 +316,13 @@ definition and records it in `episode.json`; see
 dirty source checkouts. #58 makes `runtime/serve-first@1` and
 `runtime/serve-all@1` executable through real per-seat `serve` processes, and
 #59 adds the one-seat `research/single@1` control. These modes are for research
-runs. Their tests use stand-ins for Docker and the service, plus one local
-Docker smoke with no model calls. No hosted or model-backed serve-mode run has
-been made for this release.
+runs. Their tests use stand-ins for Docker and the service, plus one Docker
+smoke with no model calls. #58 named a hosted no-model smoke of these modes as
+a release gate. It has not been run: the serve-backed modes cannot run against
+the hosted service without model calls. Treat `runtime/*@1` as unverified
+against the hosted service. Freezing the modes does not make the planned
+experiments runnable, because their completion barrier and hard budget are
+still separate work.
 
 #51 only fixes type checking of the shared source under the service
 repository's configuration. It does not change runtime behavior.
