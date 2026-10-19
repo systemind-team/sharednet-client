@@ -3375,6 +3375,52 @@ describe("sharednet say and wait", () => {
         expect(aborted).toBe(true);
       });
 
+      it("aborts the initial Room discovery when the caller stops serve during startup", async () => {
+        const space = await workspace();
+        const instanceId = "i_StartAbort1";
+        await seatIn(space, ROOM_ID, instanceId);
+        await writeSession(getStoragePaths(space.env), {
+          schema_version: 1,
+          base_url: "https://www.sharednet.ai",
+          principal_id: "p_StartAbort1",
+          agent_id: null,
+          instance_id: instanceId,
+          local_instance_key: null,
+          instance_token: MEMBER_TOKEN,
+          created_at: "2026-10-19T00:00:00.000Z",
+          lease_expires_at: "2099-10-19T00:00:00.000Z",
+          expires_at: null,
+        });
+        let entered!: () => void;
+        const inFlight = new Promise<void>((resolve) => (entered = resolve));
+        let aborted = false;
+        const roomsFetch = async (_input: string | URL | Request, init: RequestInit): Promise<Response> => {
+          entered();
+          return new Promise<Response>((_resolve, reject) => {
+            init.signal!.addEventListener("abort", () => {
+              aborted = true;
+              reject(init.signal!.reason);
+            }, { once: true });
+          });
+        };
+        const stop = new AbortController();
+        const serving = run(
+          ["serve", "--run", "true", "--json"],
+          space,
+          [],
+          {},
+          { signal: stop.signal, roomsFetch },
+        );
+        await inFlight;
+        stop.abort();
+        const result = await Promise.race([
+          serving,
+          new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("serve startup waited for the discovery timeout")), 500)),
+        ]);
+        expect(result.exitCode).toBe(0);
+        expect(aborted).toBe(true);
+      });
+
       it("writes a status only while the lock is its own, and never releases another connector's lock", async () => {
         const space = await joinedSpace();
         await seatCursor(space, ROOM_ID, MEMBER_ID, 1);

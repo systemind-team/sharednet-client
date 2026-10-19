@@ -3039,7 +3039,12 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
 
   const listSeats = () => (dependencies.listSeats ? dependencies.listSeats(() => heldSeats(paths)) : heldSeats(paths));
   const discoveryWarnings = new Set<string>();
-  const held = await discoverInstanceRooms(await listSeats(), paths, dependencies, { command, only, warned: discoveryWarnings });
+  const held = await discoverInstanceRooms(await listSeats(), paths, dependencies, {
+    command,
+    only,
+    warned: discoveryWarnings,
+    signal: dependencies.signal,
+  });
   const seats = held.filter(served);
   if (seats.length === 0 && !asService) {
     throw localError(
