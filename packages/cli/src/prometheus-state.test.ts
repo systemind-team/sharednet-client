@@ -42,6 +42,14 @@ const UPDATED_AT = "2026-10-18T00:01:00.000Z";
 const DEADLINE_AT = "2026-10-18T02:00:00.000Z";
 const SHA_A = "a".repeat(64);
 const SHA_B = "b".repeat(64);
+const UUIDS = {
+  room: "11111111-1111-4111-8111-111111111111",
+  goal: "22222222-2222-4222-8222-222222222222",
+  coordinator: "33333333-3333-4333-8333-333333333333",
+  builder: "44444444-4444-4444-8444-444444444444",
+  reviewer: "55555555-5555-4555-8555-555555555555",
+  kickoff: "66666666-6666-4666-8666-666666666666",
+} as const;
 
 afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -91,8 +99,9 @@ function team(paths: Awaited<ReturnType<typeof prometheusPaths>>): PrometheusTea
 }
 
 function run(paths: Awaited<ReturnType<typeof prometheusPaths>>): PrometheusRunState {
+  const deadlineAt = DEADLINE_AT;
   return {
-    schema_version: 1,
+    schema_version: 2,
     run_id: "run_20261018_demo",
     workspace_key: paths.workspaceKey,
     workspace_path: paths.workspacePath,
@@ -102,26 +111,32 @@ function run(paths: Awaited<ReturnType<typeof prometheusPaths>>): PrometheusRunS
       goal_sha256: SHA_B,
       policy_sha256: SHA_A,
       check_command: "pnpm test",
+      goal_request_body: {
+        content: "Build the requested artifact.\n",
+        until: [`at ${deadlineAt}`],
+      },
     },
     startup_checkpoint: "reserved",
     room: null,
     roster: null,
     idempotency_keys: {
-      room: "run_20261018_demo-room",
-      goal: "run_20261018_demo-goal",
+      room: UUIDS.room,
+      goal: UUIDS.goal,
       roles: {
-        coordinator: "run_20261018_demo-coordinator",
-        builder: "run_20261018_demo-builder",
-        reviewer: "run_20261018_demo-reviewer",
+        coordinator: UUIDS.coordinator,
+        builder: UUIDS.builder,
+        reviewer: UUIDS.reviewer,
       },
-      kickoff: "run_20261018_demo-kickoff",
+      kickoff: UUIDS.kickoff,
     },
-    deadline_at: DEADLINE_AT,
+    deadline_at: deadlineAt,
     monitor: null,
     cancel_requested: false,
     outcome: "starting",
     candidate: null,
     checks: [],
+    effects: [],
+    pending_close: null,
     created_at: CREATED_AT,
     updated_at: UPDATED_AT,
     finished_at: null,
@@ -137,16 +152,6 @@ function anotherRun(
   return {
     ...state,
     run_id: runId,
-    idempotency_keys: {
-      room: `${runId}-room`,
-      goal: `${runId}-goal`,
-      roles: {
-        coordinator: `${runId}-coordinator`,
-        builder: `${runId}-builder`,
-        reviewer: `${runId}-reviewer`,
-      },
-      kickoff: `${runId}-kickoff`,
-    },
   };
 }
 
@@ -206,6 +211,71 @@ function terminalRun(
 }
 
 describe("Prometheus owner-only state", () => {
+  it("persists schema v2 UUID operation keys and an empty durable effect journal", async () => {
+    const { paths } = await fixture();
+    const base = run(paths);
+    const state = {
+      ...base,
+      schema_version: 2,
+      configuration: {
+        ...base.configuration,
+        goal_request_body: {
+          content: "Build the requested artifact.\n",
+          until: [`at ${base.deadline_at}`],
+        },
+      },
+      idempotency_keys: {
+        room: UUIDS.room,
+        goal: UUIDS.goal,
+        roles: {
+          coordinator: UUIDS.coordinator,
+          builder: UUIDS.builder,
+          reviewer: UUIDS.reviewer,
+        },
+        kickoff: UUIDS.kickoff,
+      },
+      effects: [],
+      pending_close: null,
+    } as unknown as PrometheusRunState;
+
+    await reserveActiveRun(paths, state, fakeProbe().probe);
+
+    expect(await readRun(paths, state.run_id)).toEqual(state);
+  });
+
+  it("never lets a prepared effect id change its request body", async () => {
+    const { paths } = await fixture();
+    const state = run(paths);
+    await reserveActiveRun(paths, state, fakeProbe().probe);
+    const body = { content: "First immutable body", as: "runner" };
+    const prepared = {
+      ...state,
+      effects: [{
+        effect_id: "kickoff.post",
+        method: "POST" as const,
+        path: "/rooms/rom_OneRoom/owner-messages",
+        idempotency_key: UUIDS.kickoff,
+        body,
+        body_sha256: createHash("sha256").update(JSON.stringify(body)).digest("hex"),
+        status: "pending" as const,
+        created_at: UPDATED_AT,
+        committed_at: null,
+      }],
+    };
+    await writeRun(paths, prepared);
+    const changedBody = { content: "Different body", as: "runner" };
+
+    await expect(writeRun(paths, {
+      ...prepared,
+      effects: [{
+        ...prepared.effects[0]!,
+        body: changedBody,
+        body_sha256: createHash("sha256").update(JSON.stringify(changedBody)).digest("hex"),
+      }],
+      updated_at: "2026-10-18T00:02:00.000Z",
+    })).rejects.toMatchObject({ code: "invalid_local_state" });
+  });
+
   it("keys the local-v1 state root by the real workspace path", async () => {
     const root = await mkdtemp(join(tmpdir(), "sharednet-prometheus-path-"));
     cleanup.push(root);
