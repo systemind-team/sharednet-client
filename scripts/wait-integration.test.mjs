@@ -581,3 +581,151 @@ test("serve discovers a server-added Room and wakes the same Instance there", { 
     await rm(scratch, { recursive: true, force: true });
   }
 });
+
+test("serve --run hears a brief posted in a server-added Room before discovery, and not an old Room's history", { timeout: 30000 }, async () => {
+  // aicoo's order: `room_create {with:[agent]}`, then the brief at #1 at once, before any serve has
+  // looked at /rooms. A `--run` connector holds no wake binding to inherit, so it must neither skip
+  // the brief as history nor replay a long-admitted Room that nobody has addressed.
+  const scratch = await mkdtemp(join(tmpdir(), "sharednet-run-discovery-e2e-"));
+  const roomA = "rom_RunLocalA1";
+  const roomB = "rom_RunBrief01";
+  const roomOld = "rom_RunOldLog1";
+  const instanceId = "i_RunDisc0001";
+  const memberToken = `sni_${"R".repeat(43)}`;
+  const aicoo = { member_id: "i_AicooHost01", kind: "instance", name: "aicoo" };
+  const line = (room, sequence, content, mentions = []) => ({
+    id: `msg_${String(sequence).padStart(10, "0")}`, room_id: room, sequence, content, mentions, sender: aicoo, created_at: new Date().toISOString(),
+  });
+  const messages = new Map([
+    [roomA, []],
+    [roomB, [line(roomB, 1, `@${instanceId} tell me your thoughts here`, [instanceId])]],
+    [roomOld, Array.from({ length: 30 }, (_, index) => line(roomOld, index + 1, `old line ${index + 1}`))],
+  ]);
+  const places = new Map([...messages.keys()].map((room) => [room, { delivered_through: 0, acked_through: 0 }]));
+  const waitStarts = [];
+  const children = new Set();
+  const roomFrom = (pathname) => /^\/api\/v1\/rooms\/(rom_[A-Za-z0-9]+)(?:\/|$)/.exec(pathname)?.[1] ?? null;
+  const answer = (response, body, status = 200) => {
+    response.writeHead(status, { "content-type": "application/json" });
+    response.end(JSON.stringify(body));
+  };
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {};
+    const room = roomFrom(url.pathname);
+    if (request.method === "POST" && url.pathname === `/api/v1/rooms/${roomA}/join`) {
+      answer(response, {
+        room: { id: roomA, name: "Local", state: "open", type: "board" },
+        membership: { member_id: instanceId, kind: "instance", name: "Runner", state: "active" },
+        member_token: memberToken,
+        history: page([]),
+      });
+    } else if (request.headers.authorization !== `Bearer ${memberToken}`) {
+      answer(response, { error: { code: "invalid_credentials" } }, 401);
+    } else if (request.method === "GET" && url.pathname === "/api/v1/rooms") {
+      answer(response, { items: [...messages.keys()].map((id) => ({ id, principal_id: "p_RunDisc0001", name: id, state: "open", type: "board" })) });
+    } else if (request.method === "GET" && room && url.pathname === `/api/v1/rooms/${room}`) {
+      answer(response, { room: { id: room, name: room, state: "open", type: "board" }, memberships: [] });
+    } else if (room && url.pathname.endsWith("/subscription")) {
+      answer(response, { subscription: { room_id: room, ...places.get(room) } });
+    } else if (request.method === "POST" && room && url.pathname.endsWith("/ack")) {
+      const place = places.get(room);
+      place.acked_through = Math.max(place.acked_through, Number(body.through) || 0);
+      place.delivered_through = Math.max(place.delivered_through, place.acked_through);
+      answer(response, { subscription: { room_id: room, ...place } });
+    } else if (request.method === "POST" && room && url.pathname.endsWith("/subscription/heartbeat")) {
+      answer(response, { renewed: true, subscription: { room_id: room, ...places.get(room) } });
+    } else if (request.method === "GET" && room && url.pathname.endsWith("/messages")) {
+      const list = messages.get(room);
+      if (url.searchParams.get("order") === "desc") answer(response, page(list.slice(-1)));
+      else answer(response, page(list.filter((message) => message.sequence > Number(url.searchParams.get("after") ?? 0))));
+    } else if (request.method === "POST" && room && url.pathname.endsWith("/messages")) {
+      const list = messages.get(room);
+      const message = { ...line(room, list.length + 1, body.content), sender: { member_id: instanceId, kind: "instance", name: "Runner" } };
+      list.push(message);
+      answer(response, { message }, 201);
+    } else if (request.method === "GET" && room && url.pathname.endsWith("/wait")) {
+      const after = Number(url.searchParams.get("after") ?? 0);
+      const mentioned = url.searchParams.get("mentions");
+      waitStarts.push({ room, after, mentioned });
+      const list = messages.get(room).filter((message) => message.sequence > after);
+      // The service's mention filter wakes on an addressed line and hands over everything since.
+      const fresh = mentioned === null || list.some((message) => message.mentions.includes(mentioned)) ? list : [];
+      if (fresh.length > 0) places.get(room).delivered_through = fresh.at(-1).sequence;
+      // Hold an empty long-poll briefly, as the service would until its timeout.
+      if (fresh.length === 0 && Number(url.searchParams.get("timeout") ?? 0) > 0) await delay(200);
+      answer(response, page(fresh));
+    } else if (url.pathname === "/api/v1/instances/current" || url.pathname === "/api/v1/instances/current/heartbeat") {
+      answer(response, { instance: { id: instanceId } });
+    } else {
+      response.writeHead(404);
+      response.end();
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const project = join(scratch, "project");
+  const marker = join(scratch, "runs.ndjson");
+  const adapter = join(scratch, "run-adapter");
+  await mkdir(project);
+  await writeFile(adapter, `#!${process.execPath}\nlet input="";process.stdin.on("data",c=>input+=c).on("end",()=>{require("fs").appendFileSync(${JSON.stringify(marker)},JSON.stringify(JSON.parse(input))+"\\n");console.log("run reply")});\n`, { mode: 0o755 });
+  const env = {
+    PATH: process.env.PATH,
+    HOME: scratch,
+    XDG_CONFIG_HOME: join(scratch, "config"),
+    XDG_STATE_HOME: join(scratch, "state"),
+    SHAREDNET_BASE_URL: `http://127.0.0.1:${server.address().port}`,
+  };
+  const waitUntil = async (predicate, message, timeout = 12_000) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (await predicate()) return;
+      await delay(25);
+    }
+    assert.fail(message);
+  };
+  try {
+    await exec(process.execPath, [cli, "join", roomA, "--token", `rit_${"T".repeat(43)}`, "--name", "Runner", "--no-wake", "--json"], { cwd: project, env, timeout: 5000 });
+    const { getStoragePaths, writeSession } = await import("../packages/cli/dist/storage.js");
+    await writeSession(getStoragePaths(env), {
+      schema_version: 1,
+      base_url: env.SHAREDNET_BASE_URL,
+      principal_id: "p_RunDisc0001",
+      agent_id: null,
+      instance_id: instanceId,
+      local_instance_key: null,
+      instance_token: memberToken,
+      created_at: new Date().toISOString(),
+      lease_expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+      expires_at: null,
+    });
+    // Both Rooms, and the brief at #1, exist before serve starts: discovery is necessarily later.
+    const serving = spawn(process.execPath, [cli, "serve", "--run", adapter, "--reply", "--json"], { cwd: project, env });
+    children.add(serving);
+    let stderr = "";
+    serving.stderr.on("data", (chunk) => (stderr += chunk));
+    await waitUntil(() => messages.get(roomB).some((message) => message.content === "run reply"), `the brief posted before discovery was never handed to --run: ${stderr}`);
+    await waitUntil(() => waitStarts.some((entry) => entry.room === roomOld), `serve never listened in the old Room: ${stderr}`);
+    await delay(300);
+
+    const runs = (await readFile(marker, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0].room_id, roomB);
+    assert.deepEqual(runs[0].messages.map((message) => message.sequence), [1]);
+    assert.equal(waitStarts.find((entry) => entry.room === roomB).after, 0, "the brief's Room did not start at its admission place");
+    // The old Room is listened to for addresses only; its 30 lines are neither handed over nor answered.
+    assert.ok(waitStarts.filter((entry) => entry.room === roomOld).every((entry) => entry.mentioned === instanceId));
+    assert.equal(messages.get(roomOld).length, 30);
+    await waitUntil(() => places.get(roomB).acked_through >= 1, `serve answered but did not acknowledge the brief: ${stderr}`);
+  } finally {
+    for (const child of children) {
+      const closed = new Promise((resolve) => child.once("close", resolve));
+      child.kill("SIGKILL");
+      await closed;
+    }
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(scratch, { recursive: true, force: true });
+  }
+});

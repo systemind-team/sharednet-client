@@ -616,7 +616,7 @@ async function discoverInstanceRooms(
   seats: StoredRoomCredential[],
   paths: ReturnType<typeof getStoragePaths>,
   dependencies: GuestDependencies,
-  options: { command: string | undefined; only: Set<string> | null; warned: Set<string>; signal?: AbortSignal },
+  options: { command: string | undefined; only: Set<string> | null; warned: Set<string>; admitted: Set<string>; signal?: AbortSignal },
 ): Promise<StoredRoomCredential[]> {
   const discovered = [...seats];
   const known = new Set(seats.map((seat) => `${seat.room_id}/${seat.member_id}`));
@@ -735,6 +735,7 @@ async function discoverInstanceRooms(
         if (options.command !== undefined) {
           discovered.push(credential);
           known.add(key);
+          options.admitted.add(key);
           continue;
         }
         const created = await createRoomCredentialIfAbsent(paths, credential);
@@ -3039,10 +3040,13 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
 
   const listSeats = () => (dependencies.listSeats ? dependencies.listSeats(() => heldSeats(paths)) : heldSeats(paths));
   const discoveryWarnings = new Set<string>();
+  // Seats `--run` serves only because discovery found the Room on the service: never joined here.
+  const remotelyAdmitted = new Set<string>();
   const held = await discoverInstanceRooms(await listSeats(), paths, dependencies, {
     command,
     only,
     warned: discoveryWarnings,
+    admitted: remotelyAdmitted,
     signal: dependencies.signal,
   });
   const seats = held.filter(served);
@@ -3194,8 +3198,14 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     // A seat taken from inside a Codex or Claude Code session is driven: being addressed resumes
     // that session (the drivers). An explicit --run serves every seat with the command instead.
     const driving = !command && seat.wake !== undefined;
+    // A Room this Instance was admitted to on the service (an MCP client's `with`) was never joined
+    // here, so there is no local history to skip: its place is the one set at admission, and the
+    // line that brought it in (aicoo's brief) may already be waiting before discovery sees the Room.
+    // Like a driven seat it starts at that place and wakes only when addressed, so an old Room found
+    // this way hands over nothing until someone @s it.
+    const admitted = remotelyAdmitted.has(seatKey(seat));
     // Driven, a seat wakes when a line addresses it; the wake still carries everything said since.
-    const seatFilters = driving ? new URLSearchParams({ mentions: me }) : filters;
+    const seatFilters = driving || admitted ? new URLSearchParams({ mentions: me }) : filters;
     if (driving) {
       // A program that cannot start would take every wake and answer none (#20): look once, first,
       // and leave the seat's lines unread when it does not start.
@@ -3247,7 +3257,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     const kept = await keptPlace(client, seat.room_id, seat.member_token, mirrored ?? 0, sleep, dependencies);
     // A driven seat's join counted the history as handled, so its place is exact from then on, and
     // what was said since is the session's to hear when it is next woken.
-    let cursor = driving || kept > 0 || mirrored !== null ? kept : await roomEnd(client, seat);
+    let cursor = driving || admitted || kept > 0 || mirrored !== null ? kept : await roomEnd(client, seat);
     if (cursor > kept) await acknowledgeThrough(client, seat.room_id, seat.member_token, cursor, sleep, dependencies);
     await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
     if (doorbell !== null && base !== null) {
@@ -3535,7 +3545,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const look = () => {
     if (looking !== null || closing || stopping.signal.aborted) return;
     looking = listSeats()
-      .then((all) => discoverInstanceRooms(all, paths, dependencies, { command, only, warned: discoveryWarnings, signal: stopping.signal }))
+      .then((all) => discoverInstanceRooms(all, paths, dependencies, { command, only, warned: discoveryWarnings, admitted: remotelyAdmitted, signal: stopping.signal }))
       .then(async (all) => {
         if (closing) return;
         const fresh = all.filter(served).filter(begin);
