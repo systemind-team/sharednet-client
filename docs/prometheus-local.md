@@ -8,11 +8,19 @@ every run gets a fresh compiled SharedNet Room and fresh Room member ids.
 This is a local CLI runtime. It is not the hosted Prometheus control plane, an
 elastic agent pool, or either reserved `runtime/*@1` research harness.
 
+> **Availability gate:** this Preview is not compatible with the currently
+> deployed SharedNet write contract. Do not run it against production until a
+> coordinated server release provides replay-safe Goal, owner-message, invite,
+> role-join, and conditional-close operations. PR #57 remains a Draft until
+> that contract and a no-model hosted smoke test pass.
+
 ## Prerequisites
 
 - Node.js 22.18 or newer and this build of the `sharednet` CLI;
 - Docker, with permission to create containers and named volumes;
 - a SharedNet login for creating the Room and Goal;
+- a SharedNet server release that advertises the Prometheus write/CAS
+  contract described above;
 - a working Codex login or `OPENAI_API_KEY` for the three role containers; and
 - a real workspace directory containing `PROMETHEUS.md` and the Goal file.
 
@@ -45,8 +53,9 @@ member id. Prometheus sends one exact kickoff to the new Room's coordinator.
 
 ## Preview limitations
 
-Local v1 records every startup checkpoint and replays unfinished external
-writes with the run's original idempotency keys. It also verifies the exact
+Local v1 records every startup checkpoint and is designed to replay unfinished
+external writes with the run's original idempotency keys once the required
+server contract is deployed. It also verifies the exact
 saved image, user, labels, mounts, container names, volumes, and thread markers
 before reuse. A verified container left before bootstrap completion is resumed
 from bootstrap; an identity mismatch terminates the run instead of adopting an
@@ -57,9 +66,9 @@ The remaining preview boundaries are operational:
 - This remains a foreground controller. A crash needs an explicit `resume`;
   it does not launch a host service automatically.
 - A transient Docker, listener, authentication, or SharedNet transport error
-  leaves the checkpoint active for repair and `resume`. Stable external-write
-  keys prevent a repaired resume from creating another Room, Goal, role seat,
-  or kickoff.
+  leaves the checkpoint active for repair and `resume`. Replay safety depends
+  on the gated server contract; the currently deployed service cannot provide
+  the Room, Goal, role-seat, message, and close guarantees this client needs.
 - Partially created named volumes are retained. Verified containers and saved
   thread markers are reconciled, but unused volumes may require later cleanup.
 - `status` always returns durable state. For an active fully seeded run it also

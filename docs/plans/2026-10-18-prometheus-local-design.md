@@ -368,8 +368,10 @@ Local v1 deliberately defers:
 - automatic team reset, model migration, container-volume garbage collection,
   or import/export of a team;
 - making either reserved `runtime/*@1` harness mode available; and
-- new server routes or changes to the compiled Room protocol.
+- a server-owned scheduler beyond the minimal replay-safe write and
+  conditional-close contract required by local v1.
 
-Those features require their own versioned design. Local v1 proves the fixed
-three-role lifecycle and completion barrier using existing public service
-contracts.
+Those features require their own versioned design. Local v1 implements and
+locally verifies the fixed three-role lifecycle and completion barrier. It is
+not production-runnable until the coordinated server write/CAS contract and a
+no-model hosted smoke test pass.
