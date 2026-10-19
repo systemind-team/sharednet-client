@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { DEFAULT_IMAGE, type DockerRunner, type RunPlan } from "./goal-run.ts";
 import { cancelPrometheusRun, evaluatePrometheusBarrier, prometheusKickoff, prometheusStatus, readPrometheusMessages, resumePrometheusRun } from "./prometheus.ts";
-import { claimMonitor, prometheusPaths, readActiveRun, reserveActiveRun, writeRun, writeTeam, type PrometheusRunState, type PrometheusTeamState } from "./prometheus-state.ts";
+import { claimMonitor, prometheusPaths, readActiveRun, requestCancel, reserveActiveRun, writeRun, writeTeam, type PrometheusRunState, type PrometheusTeamState } from "./prometheus-state.ts";
 import type { ProcessProbe } from "./process-identity.ts";
 
 const candidate = {
@@ -293,13 +293,14 @@ describe("Prometheus lifecycle recovery", () => {
   });
 
   it("reconciles a success close that committed before the terminal record", async () => {
-    const fixture = await lifecycleFixture("kickoff_posted");
+    const fixture = await lifecycleFixture("kickoff_posted", "2026-10-18T00:30:00.000Z");
     const revision = "b".repeat(64);
     await writeRun(fixture.paths, {
       ...fixture.run,
       candidate: { compiled_digest: "a".repeat(64), work_id: "work-1", result_ref: "evt-1", revision_sha256: revision, observed_at: "2026-10-18T00:01:00.000Z" },
       updated_at: "2026-10-18T00:01:00.000Z",
     });
+    await requestCancel(fixture.paths, fixture.run.run_id);
     const result = await resumePrometheusRun(fixture.workspace, {
       env: fixture.env, cwd: fixture.workspace, now: () => new Date("2026-10-18T01:00:00.000Z"),
       docker: lifecycleDocker(fixture.team, []), plan: { ...plan, workspace: fixture.workspace }, processProbe: fixture.probe,
@@ -309,7 +310,38 @@ describe("Prometheus lifecycle recovery", () => {
       } } as never, memberToken: "member", apiKey: "api", baseUrl: "https://www.sharednet.ai" }),
     });
 
-    expect(result).toMatchObject({ outcome: "succeeded", candidate: { revision_sha256: revision }, reason: expect.stringContaining("Recovered") });
+    expect(result).toMatchObject({ outcome: "succeeded", cancel_requested: true, candidate: { revision_sha256: revision }, reason: expect.stringContaining("Recovered") });
+    expect(await readActiveRun(fixture.paths)).toBeNull();
+  });
+
+  it("does not create a Room when cancellation lands during reusable-team bootstrap", async () => {
+    const fixture = await lifecycleFixture("reserved", "2026-10-18T04:00:00.000Z");
+    const calls: string[][] = [];
+    const baseDocker = lifecycleDocker(fixture.team, []);
+    let cancelled = false;
+    const docker: DockerRunner = async (args, options) => {
+      calls.push([...args]);
+      if (!cancelled && args[0] === "start") {
+        cancelled = true;
+        await requestCancel(fixture.paths, fixture.run.run_id);
+        await new Promise<void>((resolve) => {
+          if (options?.signal?.aborted) resolve();
+          else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
+        expect(options?.signal?.aborted).toBe(true);
+      }
+      return baseDocker(args, options);
+    };
+    let connected = false;
+
+    const result = await resumePrometheusRun(fixture.workspace, {
+      env: fixture.env, cwd: fixture.workspace, now: () => new Date("2026-10-18T01:00:00.000Z"),
+      docker, plan: { ...plan, workspace: fixture.workspace }, processProbe: fixture.probe,
+      connect: async () => { connected = true; throw new Error("must not connect after cancellation"); },
+    });
+
+    expect(result).toMatchObject({ outcome: "cancelled", startup_checkpoint: "reserved" });
+    expect(connected).toBe(false);
     expect(await readActiveRun(fixture.paths)).toBeNull();
   });
 

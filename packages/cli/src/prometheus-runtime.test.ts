@@ -203,9 +203,36 @@ describe("persistent Prometheus runtime", () => {
       SHAREDNET_PROMETHEUS_REVISION_SHA256: "b".repeat(64),
     });
     expect(seen[0]!.args.join(" ")).not.toContain("run-1");
+    expect(seen[0]!.args).toContain("timeout");
+    expect(seen[0]!.args).toContain("120.000s");
     expect(result.exitCode).toBe(7);
     expect(Buffer.byteLength(result.output)).toBeLessThanOrEqual(64_000);
     expect(result.outputSha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("passes cancellation into an attached semantic-check container", async () => {
+    const controller = new AbortController();
+    let sawSignal = false;
+    const docker: DockerRunner = async (_args, options) => new Promise((resolve) => {
+      sawSignal = options?.signal === controller.signal;
+      options?.signal?.addEventListener("abort", () => resolve({ code: 143, stdout: "", stderr: "terminated" }), { once: true });
+    });
+    const pending = runPrometheusCheck(
+      { image: DEFAULT_IMAGE, workspace: plan.workspace },
+      "pnpm test",
+      {
+        SHAREDNET_PROMETHEUS_RUN_ID: "run-1",
+        SHAREDNET_PROMETHEUS_WORK_ID: "work-1",
+        SHAREDNET_PROMETHEUS_RESULT_REF: "evt-1",
+        SHAREDNET_PROMETHEUS_REVISION_SHA256: "b".repeat(64),
+      },
+      { docker, timeoutMs: 30_000, signal: controller.signal },
+    );
+
+    controller.abort();
+
+    await expect(pending).resolves.toMatchObject({ exitCode: 143 });
+    expect(sawSignal).toBe(true);
   });
 
   it("restarts unfiltered listeners for saved seats without joining again", async () => {

@@ -71,7 +71,7 @@ export interface DockerResult {
  */
 export type DockerRunner = (
   args: readonly string[],
-  options?: { input?: string; env?: Record<string, string>; onLine?: (line: string) => void },
+  options?: { input?: string; env?: Record<string, string>; onLine?: (line: string) => void; signal?: AbortSignal },
 ) => Promise<DockerResult>;
 
 export function dockerRunner(baseEnv: Record<string, string | undefined>): DockerRunner {
@@ -80,6 +80,15 @@ export function dockerRunner(baseEnv: Record<string, string | undefined>): Docke
   return (args, options = {}) =>
     new Promise((resolveRun) => {
       const child = spawn("docker", [...args], { env: { ...clientEnv, ...options.env } as NodeJS.ProcessEnv, stdio: ["pipe", "pipe", "pipe"] });
+      let settled = false;
+      let killTimer: ReturnType<typeof setTimeout> | null = null;
+      const abort = () => {
+        child.kill("SIGTERM");
+        killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+        killTimer.unref?.();
+      };
+      options.signal?.addEventListener("abort", abort, { once: true });
+      if (options.signal?.aborted) abort();
       let stdout = "";
       let stderr = "";
       let partial = "";
@@ -99,10 +108,17 @@ export function dockerRunner(baseEnv: Record<string, string | undefined>): Docke
       child.stderr.on("data", (chunk: string) => {
         stderr = (stderr + chunk).slice(-64_000);
       });
-      child.on("error", () => resolveRun({ code: 127, stdout, stderr: "docker could not be started" }));
+      const finish = (result: DockerResult) => {
+        if (settled) return;
+        settled = true;
+        options.signal?.removeEventListener("abort", abort);
+        if (killTimer) clearTimeout(killTimer);
+        resolveRun(result);
+      };
+      child.on("error", () => finish({ code: 127, stdout, stderr: "docker could not be started" }));
       child.on("close", (code) => {
         if (options.onLine && partial) options.onLine(partial);
-        resolveRun({ code: code ?? 1, stdout, stderr });
+        finish({ code: code ?? (options.signal?.aborted ? 143 : 1), stdout, stderr });
       });
       child.stdin.end(options.input ?? "");
     });

@@ -175,7 +175,11 @@ function newRun(paths: PrometheusPaths, input: StartPrometheusInput, policy: Pro
 async function saveCheckpoint(paths: PrometheusPaths, run: PrometheusRunState, changes: Partial<PrometheusRunState>, now: Date): Promise<PrometheusRunState> {
   const next = { ...run, ...changes, updated_at: timestampAfter(run.updated_at, now) };
   await writeRun(paths, next);
-  return next;
+  const authoritative = await readActiveRun(paths);
+  if (!authoritative || authoritative.run_id !== run.run_id) {
+    throw localError("prometheus_monitor_lease_lost", `Prometheus run ${run.run_id} is no longer active.`);
+  }
+  return authoritative;
 }
 
 async function readSavedInputs(run: PrometheusRunState): Promise<{ policy: PrometheusPolicy; goal: string }> {
@@ -270,6 +274,75 @@ async function finishFailedRun(
   return final;
 }
 
+async function finishRecoveredSuccess(
+  run: PrometheusRunState,
+  lease: NonNullable<PrometheusRunState["monitor"]>,
+  dependencies: Pick<StartupDependencies, "paths" | "now">,
+): Promise<PrometheusRunState> {
+  const revision = run.candidate!.revision_sha256;
+  const finishedAt = timestampAfter(run.updated_at, dependencies.now());
+  const final: PrometheusRunState = {
+    ...run,
+    monitor: lease,
+    outcome: "succeeded",
+    updated_at: finishedAt,
+    finished_at: finishedAt,
+    reason: `Recovered committed Prometheus success for ${revision}.`,
+  };
+  await finishRun(dependencies.paths, final, lease);
+  return final;
+}
+
+async function reloadActive(
+  runId: string,
+  dependencies: Pick<StartupDependencies, "paths">,
+): Promise<PrometheusRunState> {
+  const current = await readActiveRun(dependencies.paths);
+  if (!current || current.run_id !== runId) {
+    throw localError("prometheus_monitor_lease_lost", `Prometheus run ${runId} is no longer active.`);
+  }
+  return current;
+}
+
+function watchRunStop(
+  run: PrometheusRunState,
+  paths: PrometheusPaths,
+  now: () => Date,
+): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const remainingMs = Math.max(0, Date.parse(run.deadline_at) - now().getTime());
+  const deadline = setTimeout(() => controller.abort(), remainingMs);
+  deadline.unref?.();
+  let reading = false;
+  const poll = setInterval(() => {
+    if (reading || controller.signal.aborted) return;
+    reading = true;
+    void readActiveRun(paths).then((current) => {
+      if (!current || current.run_id !== run.run_id || current.cancel_requested) controller.abort();
+    }).catch(() => undefined).finally(() => { reading = false; });
+  }, 50);
+  poll.unref?.();
+  return {
+    signal: controller.signal,
+    dispose: () => { clearTimeout(deadline); clearInterval(poll); },
+  };
+}
+
+async function stopOrRecover(
+  run: PrometheusRunState,
+  lease: NonNullable<PrometheusRunState["monitor"]>,
+  dependencies: Pick<StartupDependencies, "paths" | "now"> & { connection?: PrometheusConnection },
+): Promise<PrometheusRunState | null> {
+  if (!run.cancel_requested && dependencies.now().getTime() < Date.parse(run.deadline_at)) return null;
+  if (run.room && run.candidate && dependencies.connection) {
+    const lifecycle = await roomLifecycle(run, { connection: dependencies.connection });
+    if (lifecycle.state !== "open" && lifecycle.endedBy?.trigger === "prometheus_success" && lifecycle.endedBy.detail === run.candidate.revision_sha256) {
+      return finishRecoveredSuccess(run, lease, dependencies);
+    }
+  }
+  return finishStoppedRun(run, lease, dependencies);
+}
+
 async function continuePrometheusRun(
   initial: PrometheusRunState,
   loaded: { policy: PrometheusPolicy; goal: string },
@@ -282,11 +355,12 @@ async function continuePrometheusRun(
 
   if (run.cancel_requested || dependencies.now().getTime() >= Date.parse(run.deadline_at)) {
     const connection = run.room ? await dependencies.connect() : undefined;
-    return finishStoppedRun(run, lease, { paths: dependencies.paths, now: dependencies.now, ...(connection ? { connection } : {}) });
+    return (await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, ...(connection ? { connection } : {}) }))!;
   }
 
   const existing = savedTeam ?? await readTeam(dependencies.paths);
   let team: PrometheusTeamState;
+  const bootstrapStop = watchRunStop(run, dependencies.paths, dependencies.now);
   try {
     if (run.startup_checkpoint !== "reserved" && !existing) {
       throw localError("prometheus_team_missing", "The active Prometheus run has no saved team.");
@@ -298,16 +372,32 @@ async function continuePrometheusRun(
       policySha256: loaded.policy.sha256,
       policy: loaded.policy.raw,
       plan: dependencies.plan,
+      deadlineAt: run.deadline_at,
       existing,
-    }, { docker: dependencies.docker, now: dependencies.now, sleep: dependencies.sleep });
+    }, {
+      docker: (args, options) => dependencies.docker(args, { ...options, signal: bootstrapStop.signal }),
+      now: dependencies.now,
+      sleep: dependencies.sleep,
+    });
   } catch (error) {
+    const current = await reloadActive(run.run_id, dependencies);
+    const stopped = await stopOrRecover(current, lease, { paths: dependencies.paths, now: dependencies.now });
+    if (stopped) return stopped;
     const failure = asCliError(error);
     if (!["prometheus_team_invalid", "prometheus_team_missing", "prometheus_team_mismatch"].includes(failure.code)) throw error;
     const connection = run.room ? await dependencies.connect().catch(() => undefined) : undefined;
     return finishFailedRun(run, lease, failure, { paths: dependencies.paths, now: dependencies.now, ...(connection ? { connection } : {}) });
+  } finally {
+    bootstrapStop.dispose();
   }
   await writeTeam(dependencies.paths, team);
+  run = await reloadActive(run.run_id, dependencies);
+  const stoppedAfterBootstrap = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now });
+  if (stoppedAfterBootstrap) return stoppedAfterBootstrap;
   const connection = await dependencies.connect();
+  run = await reloadActive(run.run_id, dependencies);
+  const stoppedAfterConnect = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection });
+  if (stoppedAfterConnect) return stoppedAfterConnect;
 
   if (run.startup_checkpoint === "reserved") {
     const created = await connection.client.request<{ room?: { id?: string } }>(
@@ -318,6 +408,8 @@ async function continuePrometheusRun(
     const roomId = created.room?.id;
     if (!roomId) throw localError("invalid_server_response", "The compiled Prometheus Room id did not come back.");
     run = await saveCheckpoint(dependencies.paths, run, { startup_checkpoint: "room_created", room: { room_id: roomId, goal_sequence: null, kickoff_sequence: null } }, dependencies.now());
+    const stopped = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection });
+    if (stopped) return stopped;
   }
 
   if (run.startup_checkpoint === "room_created") {
@@ -330,6 +422,8 @@ async function continuePrometheusRun(
     const goalSequence = started.message?.sequence;
     if (!Number.isSafeInteger(goalSequence) || goalSequence! < 1) throw localError("invalid_server_response", "The Prometheus Goal sequence did not come back.");
     run = await saveCheckpoint(dependencies.paths, run, { startup_checkpoint: "goal_started", room: { ...run.room!, goal_sequence: goalSequence! } }, dependencies.now());
+    const stopped = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection });
+    if (stopped) return stopped;
   }
 
   if (run.startup_checkpoint === "goal_started") {
@@ -338,6 +432,9 @@ async function continuePrometheusRun(
       { "idempotency-key": `${run.idempotency_keys.room}-invite` },
     );
     if (!invite.token) throw localError("invalid_server_response", "The Prometheus Room invite did not come back.");
+    run = await reloadActive(run.run_id, dependencies);
+    const stoppedAfterInvite = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection });
+    if (stoppedAfterInvite) return stoppedAfterInvite;
     const roster = await attachPrometheusRoom(team, {
       roomId: run.room!.room_id,
       inviteToken: invite.token,
@@ -345,11 +442,15 @@ async function continuePrometheusRun(
       idempotencyKeys: run.idempotency_keys.roles,
     }, { docker: dependencies.docker, now: dependencies.now, sleep: dependencies.sleep });
     run = await saveCheckpoint(dependencies.paths, run, { startup_checkpoint: "roles_joined", roster }, dependencies.now());
+    const stopped = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection });
+    if (stopped) return stopped;
   }
 
   if (run.startup_checkpoint === "roles_joined") {
     await ensurePrometheusListeners(team, run.room!.room_id, run.roster!, connection.baseUrl, { docker: dependencies.docker, now: dependencies.now, sleep: dependencies.sleep });
     run = await saveCheckpoint(dependencies.paths, run, { startup_checkpoint: "listeners_ready" }, dependencies.now());
+    const stopped = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection });
+    if (stopped) return stopped;
   }
 
   if (run.startup_checkpoint === "listeners_ready") {
@@ -447,43 +548,53 @@ export async function monitorPrometheusRun(run: PrometheusRunState, dependencies
   const feedbackAttempted = new Set<string>();
   try {
     for (;;) {
-      const current = (await readActiveRun(dependencies.paths)) ?? run;
+      const current = await reloadActive(run.run_id, dependencies);
       const now = dependencies.now();
       if (current.cancel_requested || now.getTime() >= Date.parse(current.deadline_at)) {
-        return finishStoppedRun(current, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
+        return (await stopOrRecover(current, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection }))!;
       }
       const lifecycle = await roomLifecycle(current, dependencies);
       if (lifecycle.state !== "open") {
         if (current.candidate && lifecycle.endedBy?.trigger === "prometheus_success" && lifecycle.endedBy.detail === current.candidate.revision_sha256) {
-          const finishedAt = timestampAfter(current.updated_at, dependencies.now());
-          const final: PrometheusRunState = {
-            ...current,
-            monitor: lease,
-            outcome: "succeeded",
-            updated_at: finishedAt,
-            finished_at: finishedAt,
-            reason: `Recovered committed Prometheus success for ${current.candidate.revision_sha256}.`,
-          };
-          await finishRun(dependencies.paths, final, lease);
-          return final;
+          return finishRecoveredSuccess(current, lease, dependencies);
         }
         throw localError("prometheus_room_closed", "The Prometheus Room closed before the completion barrier passed.");
       }
-      const observed = await snapshot(current, dependencies);
+      const afterLifecycle = await reloadActive(current.run_id, dependencies);
+      const stoppedAfterLifecycle = await stopOrRecover(afterLifecycle, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
+      if (stoppedAfterLifecycle) return stoppedAfterLifecycle;
+      const observed = await snapshot(afterLifecycle, dependencies);
+      const afterSnapshot = await reloadActive(current.run_id, dependencies);
+      const stoppedAfterSnapshot = await stopOrRecover(afterSnapshot, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
+      if (stoppedAfterSnapshot) return stoppedAfterSnapshot;
       if (observed.barrier.ready) {
         const revision = observed.barrier.candidate.revisionSha256;
-        const prior = current.checks.find((entry) => entry.revision_sha256 === revision);
+        const prior = afterSnapshot.checks.find((entry) => entry.revision_sha256 === revision);
         let passingCheck = prior?.exit_code === 0;
         if (!prior) {
-          const checked = await runPrometheusCheck({ image: dependencies.plan.image, workspace: current.workspace_path }, current.configuration.check_command, {
-            SHAREDNET_PROMETHEUS_RUN_ID: current.run_id,
-            SHAREDNET_PROMETHEUS_WORK_ID: observed.barrier.candidate.workId,
-            SHAREDNET_PROMETHEUS_RESULT_REF: observed.barrier.candidate.resultRef,
-            SHAREDNET_PROMETHEUS_REVISION_SHA256: revision,
-          }, { docker: dependencies.docker, now: dependencies.now });
+          const checkStop = watchRunStop(afterSnapshot, dependencies.paths, dependencies.now);
+          let checked: Awaited<ReturnType<typeof runPrometheusCheck>>;
+          try {
+            checked = await runPrometheusCheck({ image: dependencies.plan.image, workspace: current.workspace_path }, current.configuration.check_command, {
+              SHAREDNET_PROMETHEUS_RUN_ID: current.run_id,
+              SHAREDNET_PROMETHEUS_WORK_ID: observed.barrier.candidate.workId,
+              SHAREDNET_PROMETHEUS_RESULT_REF: observed.barrier.candidate.resultRef,
+              SHAREDNET_PROMETHEUS_REVISION_SHA256: revision,
+            }, {
+              docker: dependencies.docker,
+              now: dependencies.now,
+              timeoutMs: Date.parse(afterSnapshot.deadline_at) - dependencies.now().getTime(),
+              signal: checkStop.signal,
+            });
+          } finally {
+            checkStop.dispose();
+          }
+          const afterCheck = await reloadActive(current.run_id, dependencies);
+          const stoppedAfterCheck = await stopOrRecover(afterCheck, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
+          if (stoppedAfterCheck) return stoppedAfterCheck;
           if (checked.exitCode === 125) throw localError("prometheus_check_launch_failed", "The Prometheus semantic-check container could not be launched.");
           const summary = { revision_sha256: revision, started_at: checked.startedAt, finished_at: checked.finishedAt, exit_code: Math.max(0, checked.exitCode), output: checked.output, output_sha256: checked.outputSha256 };
-          run = await saveCheckpoint(dependencies.paths, current, { monitor: lease, checks: [...current.checks, summary] }, dependencies.now());
+          run = await saveCheckpoint(dependencies.paths, afterCheck, { monitor: lease, checks: [...afterCheck.checks, summary] }, dependencies.now());
           if (checked.exitCode !== 0) {
             const feedback = `@${current.roster!.coordinator.member_id} Semantic check failed for revision ${revision}:\n${checked.output.slice(-2_000)}`;
             await dependencies.connection.client.request("POST", `/rooms/${encodeURIComponent(current.room!.room_id)}/owner-messages`, dependencies.connection.apiKey, { content: feedback, as: "runner" }, { "idempotency-key": `${current.run_id}-check-${revision}` });
@@ -498,13 +609,28 @@ export async function monitorPrometheusRun(run: PrometheusRunState, dependencies
         }
         if (passingCheck) {
           const after = await snapshot(run, dependencies);
+          const beforeSuccess = await reloadActive(current.run_id, dependencies);
+          const stoppedBeforeSuccess = await stopOrRecover(beforeSuccess, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
+          if (stoppedBeforeSuccess) return stoppedBeforeSuccess;
           if (sameReady(observed.barrier, after.barrier)) {
-            const observedAt = timestampAfter(run.updated_at, dependencies.now());
-            run = await saveCheckpoint(dependencies.paths, run, {
+            const observedAt = timestampAfter(beforeSuccess.updated_at, dependencies.now());
+            run = await saveCheckpoint(dependencies.paths, beforeSuccess, {
               monitor: lease,
               candidate: { compiled_digest: observed.barrier.candidate.stateDigest, work_id: observed.barrier.candidate.workId, result_ref: observed.barrier.candidate.resultRef, revision_sha256: revision, observed_at: observedAt },
             }, dependencies.now());
-            await dependencies.connection.client.request("POST", `/rooms/${encodeURIComponent(current.room!.room_id)}/close`, dependencies.connection.apiKey, { trigger: "prometheus_success", detail: revision }, { "idempotency-key": `${current.run_id}-close-success` });
+            run = await reloadActive(run.run_id, dependencies);
+            const stoppedImmediatelyBeforeSuccess = await stopOrRecover(run, lease, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
+            if (stoppedImmediatelyBeforeSuccess) return stoppedImmediatelyBeforeSuccess;
+            const closed = await dependencies.connection.client.request<{ room?: { state?: unknown; goal?: { ended_by?: { trigger?: unknown; detail?: unknown } | null } | null } }>(
+              "POST",
+              `/rooms/${encodeURIComponent(current.room!.room_id)}/close`,
+              dependencies.connection.apiKey,
+              { trigger: "prometheus_success", detail: revision },
+              { "idempotency-key": `${current.run_id}-close-success` },
+            );
+            if (closed.room?.state !== "closed" || closed.room.goal?.ended_by?.trigger !== "prometheus_success" || closed.room.goal.ended_by.detail !== revision) {
+              throw localError("prometheus_success_unconfirmed", "SharedNet did not confirm the exact Prometheus success close.");
+            }
             const finishedAt = timestampAfter(run.updated_at, dependencies.now());
             const final: PrometheusRunState = { ...run, monitor: lease, outcome: "succeeded", updated_at: finishedAt, finished_at: finishedAt, reason: `Prometheus completion barrier passed for ${revision}.` };
             await finishRun(dependencies.paths, final, lease);
@@ -517,10 +643,13 @@ export async function monitorPrometheusRun(run: PrometheusRunState, dependencies
   } catch (error) {
     const failure = asCliError(error);
     if (failure.code === "prometheus_monitor_active" || failure.code === "prometheus_monitor_lease_lost") throw error;
+    // The close may have committed even when its response was lost or malformed. Keep the
+    // candidate durable so resume can reconcile authoritative Room ended_by before any stop.
+    if (failure.code === "prometheus_success_unconfirmed") throw error;
     // Transport and service failures do not prove the Room or run is invalid.
     // Keep the durable run active so a later `prometheus resume` can reclaim it.
     if (failure.exitCode === 5) throw failure;
-    const current = (await readActiveRun(dependencies.paths)) ?? run;
+    const current = await reloadActive(run.run_id, dependencies);
     return finishFailedRun(current, lease, failure, { paths: dependencies.paths, now: dependencies.now, connection: dependencies.connection });
   }
 }
@@ -584,7 +713,7 @@ export async function cancelPrometheusRun(workspace: string, dependencies: Prome
     const current = await readActiveRun(paths);
     if (!current) return { cancelled: true, active: false, recovered: false, run_id: active.run_id };
     const connection = current.room ? await dependencies.connect() : undefined;
-    const final = await finishStoppedRun(current, lease, { paths, now: dependencies.now, ...(connection ? { connection } : {}) });
+    const final = (await stopOrRecover(current, lease, { paths, now: dependencies.now, ...(connection ? { connection } : {}) }))!;
     return { cancelled: true, active: false, recovered: true, run_id: active.run_id, outcome: final.outcome };
   } catch (error) {
     const failure = asCliError(error);

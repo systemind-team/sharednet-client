@@ -28,6 +28,8 @@ export interface EnsureTeamInput {
   policySha256: string;
   policy: string;
   plan: RunPlan;
+  /** Absolute run deadline. Bootstrap turns must never outlive it. */
+  deadlineAt?: string;
   existing?: PrometheusTeamState | null;
 }
 
@@ -209,6 +211,16 @@ function bootstrapPrompt(role: PrometheusRole, policy: string): string {
   ].join("\n\n");
 }
 
+function bootstrapTimeoutSeconds(input: EnsureTeamInput, dependencies: PrometheusRuntimeDependencies): string {
+  const maximumMs = 120_000;
+  if (!input.deadlineAt) return "120";
+  const remainingMs = Date.parse(input.deadlineAt) - (dependencies.now ?? (() => new Date()))().getTime();
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    throw localError("prometheus_deadline_reached", "The Prometheus deadline passed before agent bootstrap completed.");
+  }
+  return `${(Math.min(maximumMs, remainingMs) / 1_000).toFixed(3)}s`;
+}
+
 /** Create the fixed local team once; subsequent calls verify and reuse its exact containers and threads. */
 export async function ensurePrometheusTeam(
   input: EnsureTeamInput,
@@ -273,7 +285,7 @@ export async function ensurePrometheusTeam(
       "exec", "--user", user, "--workdir", CONTAINER_WORKSPACE,
       "-e", `HOME=${CONTAINER_HOME}`, "-e", `CODEX_HOME=${CONTAINER_HOME}/.codex`,
       ...(input.plan.codexAuth?.kind === "api-key" ? ["-e", "OPENAI_API_KEY"] : []),
-      container, "timeout", "120", "codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-m", input.model, bootstrapPrompt(role, input.policy),
+      container, "timeout", "--signal=TERM", "--kill-after=5s", bootstrapTimeoutSeconds(input, dependencies), "codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-m", input.model, bootstrapPrompt(role, input.policy),
     ]);
     const thread = threadId(bootstrapped.stdout);
     if (bootstrapped.code !== 0 || thread === null) throw localError("agent_bootstrap_failed", `The ${role} persistent Codex thread could not be created.`);
@@ -398,16 +410,22 @@ export async function runPrometheusCheck(
   runtime: { image: string; workspace: string },
   check: string,
   environment: Record<"SHAREDNET_PROMETHEUS_RUN_ID" | "SHAREDNET_PROMETHEUS_WORK_ID" | "SHAREDNET_PROMETHEUS_RESULT_REF" | "SHAREDNET_PROMETHEUS_REVISION_SHA256", string>,
-  dependencies: Pick<PrometheusRuntimeDependencies, "docker" | "now">,
+  dependencies: Pick<PrometheusRuntimeDependencies, "docker" | "now"> & { timeoutMs?: number; signal?: AbortSignal },
 ): Promise<SemanticCheckResult> {
+  const timeoutMs = dependencies.timeoutMs ?? 120_000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw localError("prometheus_deadline_reached", "The Prometheus deadline passed before the semantic check could start.");
+  }
   const now = dependencies.now ?? (() => new Date());
   const startedAt = now().toISOString();
   const result = await dependencies.docker([
     "run", "--rm", "--volume", `${runtime.workspace}:${CONTAINER_WORKSPACE}`,
     "--workdir", CONTAINER_WORKSPACE,
     ...Object.keys(environment).flatMap((name) => ["-e", name]),
-    runtime.image, "sh", "-c", check,
-  ], { env: environment });
+    runtime.image,
+    "timeout", "--signal=TERM", "--kill-after=5s", `${(timeoutMs / 1_000).toFixed(3)}s`,
+    "sh", "-c", check,
+  ], { env: environment, signal: dependencies.signal });
   const output = bounded(`${result.stdout}${result.stderr}`);
   return {
     startedAt,
