@@ -365,6 +365,19 @@ describe("reach: forming a group from the account CLI", () => {
     expect(unpinnedModel.requests).toEqual([]);
   });
 
+  it("requires exactly one pinned agent for research/single before reading the goal", async () => {
+    const refused = await harness([
+      "goal", "run", "missing.md",
+      "--agent", "codex:gpt-test", "--agent", "codex:gpt-test",
+      "--until", "after: 1h",
+      "--harness-mode", "research/single@1",
+    ]);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr.join(" ")).toContain("harness_agent_count_mismatch");
+    expect(refused.stderr.join(" ")).toContain("exactly 1 Agent");
+    expect(refused.requests).toEqual([]);
+  });
+
   it("does not let low-level controls or compiled Rooms drift from a named harness profile", async () => {
     for (const extra of [
       ["--mention-gate"],

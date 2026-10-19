@@ -8,7 +8,8 @@ export type ResearchHarnessModeName =
   | "research/tasks@1"
   | "research/both@1"
   | "research/routing-only@1"
-  | "research/receipt-only@1";
+  | "research/receipt-only@1"
+  | "research/single@1";
 export type RuntimeHarnessModeName = "runtime/serve-first@1" | "runtime/serve-all@1";
 export type HarnessModeName = ResearchHarnessModeName | RuntimeHarnessModeName;
 
@@ -88,6 +89,14 @@ const researchProvenance = {
   source: ["packages/cli/src/goal-run.ts", "packages/cli/src/board-controls.ts", "packages/cli/src/task-guard.ts"],
 } as const;
 
+const singleResearchProvenance = {
+  repository: "systemind-team/sharednet-client",
+  // This commit adds the singular prompt and topology constraint used by the frozen mode.
+  mechanism_commit: "cebac16019be29d965698458f400dfff29c24909",
+  verified_against: "cebac16019be29d965698458f400dfff29c24909",
+  source: ["packages/cli/src/harness-modes.ts", "packages/cli/src/cli.ts", "packages/cli/src/goal-run.ts"],
+} as const;
+
 const runtimeProvenance = {
   repository: "systemind-team/sharednet-client",
   mechanism_commit: "e77597df9e2fae3d83c8c518c1c815eb7a3ede5d",
@@ -100,28 +109,35 @@ const available = { state: "available", command: "goal run" } as const;
 function research(
   name: ResearchHarnessModeName,
   controls: Pick<ResearchHarnessProfile, "mention_gate" | "task_gate" | "message_routing">,
+  agents?: 1,
+  provenance: HarnessModeProvenance = researchProvenance,
 ): ResearchHarnessModeSpec {
   const targeted = controls.message_routing === "mentions";
   return {
     name,
     family: "research",
     version: 1,
-    delivery: controls.mention_gate
-      ? "Before each post, the sender reads newer direct mentions and must retry after reviewing any it finds."
-      : "Posts use the ordinary SharedNet board path without a before-post receipt gate.",
-    wake: targeted
-      ? "Known direct mentions wake only their named seats; no mention, @all, and unknown-only mentions broadcast."
-      : "Every ordinary board message wakes every seat; task control events are suppressed only when the task gate is enabled.",
+    delivery: agents === 1
+      ? "One runner-owned seat works in the board Room without a before-post receipt gate."
+      : controls.mention_gate
+        ? "Before each post, the sender reads newer direct mentions and must retry after reviewing any it finds."
+        : "Posts use the ordinary SharedNet board path without a before-post receipt gate.",
+    wake: agents === 1
+      ? "The one seat is woken initially; later ordinary board messages wake that seat."
+      : targeted
+        ? "Known direct mentions wake only their named seats; no mention, @all, and unknown-only mentions broadcast."
+        : "Every ordinary board message wakes every seat; task control events are suppressed only when the task gate is enabled.",
     stop: "The runner stops at the first configured --until condition; a said claim runs the configured check before closure.",
     profile: {
       command: "goal run",
       room_type: "board",
       delivery: "runner-owned-turn-loop",
       initial_wake: "all-seats",
+      ...(agents === undefined ? {} : { agents }),
       ...controls,
     },
     availability: available,
-    provenance: researchProvenance,
+    provenance,
   };
 }
 
@@ -156,6 +172,7 @@ export const HARNESS_MODE_REGISTRY: readonly HarnessModeSpec[] = deepFreeze([
   research("research/both@1", { mention_gate: true, task_gate: true, message_routing: "mentions" }),
   research("research/routing-only@1", { mention_gate: false, task_gate: false, message_routing: "mentions" }),
   research("research/receipt-only@1", { mention_gate: true, task_gate: false, message_routing: "broadcast" }),
+  research("research/single@1", { mention_gate: false, task_gate: false, message_routing: "broadcast" }, 1, singleResearchProvenance),
   runtime("runtime/serve-first@1", "first"),
   runtime("runtime/serve-all@1", "all"),
 ]);

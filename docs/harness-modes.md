@@ -18,26 +18,43 @@ sharednet goal run TASK.md \
 `--harness-mode` fixes the Room, receipt gate, task gate, and message-routing
 controls. It cannot be combined with `--mention-gate`, `--task-gate`, or
 `--message-routing`. All named modes use a board Room. Other run settings,
-including agents, models, image, web search, end conditions, and turn limit,
-remain explicit inputs and are recorded in `episode.json`.
+including models, image, web search, end conditions, and turn limit, remain
+explicit inputs and are recorded in `episode.json`. Agent topology also remains
+explicit except for `research/single@1`, which requires exactly one seat.
 Every agent in a named mode must pin its model as `driver:model`; an implicit
 provider default is refused because that default can change between runs.
 
 ## Research modes available in this build
 
-All six modes use the current `goal run` runner-owned turn loop. The goal wakes
+All seven modes use the current `goal run` runner-owned turn loop. The goal wakes
 all seats initially. After that, the routing column decides which seats a Room
 message wakes. Every mode stops at the first configured `--until` condition; a
 `said` claim runs the configured check before the Room closes.
 
-| Canonical mode | Before-post receipt gate | Task claim/done gate | Message routing | Spec SHA-256 |
-| --- | --- | --- | --- | --- |
-| `research/baseline@1` | off | off | broadcast | `3bced23adad81117a2eb039fe5a284eeab49ad7711e1a2efc4506db553a95514` |
-| `research/mentions@1` | on | off | direct mentions; broadcast for no mention, `@all`, or unknown-only mentions | `3885aaf5b0615bd9facfa86a3043313ba8598a98f3440626890b05897e2bf793` |
-| `research/tasks@1` | off | on | broadcast, except suppressed task-control events | `0b44d68ad0e8131da4b557a3cce5b633c93b2fdb5ecfcf275ad1751d80e7b156` |
-| `research/both@1` | on | on | direct mentions; broadcast for no mention, `@all`, or unknown-only mentions | `c4be25291d7aca3a1193119f12bfd70ca0d2723b5cd3bf08d281a1afb6bf6f28` |
-| `research/routing-only@1` | off | off | direct mentions; broadcast for no mention, `@all`, or unknown-only mentions | `bd1f751ca8ec726a8632bb99b0148b5e81693af50a623c89230320e92f836f88` |
-| `research/receipt-only@1` | on | off | broadcast | `902d907b2f390a03b17593184836bf644fcdf5dae8f8e412d973f8010717d052` |
+| Canonical mode | Agent count | Before-post receipt gate | Task claim/done gate | Message routing | Spec SHA-256 |
+| --- | ---: | --- | --- | --- | --- |
+| `research/baseline@1` | explicit run input | off | off | broadcast | `3bced23adad81117a2eb039fe5a284eeab49ad7711e1a2efc4506db553a95514` |
+| `research/mentions@1` | explicit run input | on | off | direct mentions; broadcast for no mention, `@all`, or unknown-only mentions | `3885aaf5b0615bd9facfa86a3043313ba8598a98f3440626890b05897e2bf793` |
+| `research/tasks@1` | explicit run input | off | on | broadcast, except suppressed task-control events | `0b44d68ad0e8131da4b557a3cce5b633c93b2fdb5ecfcf275ad1751d80e7b156` |
+| `research/both@1` | explicit run input | on | on | direct mentions; broadcast for no mention, `@all`, or unknown-only mentions | `c4be25291d7aca3a1193119f12bfd70ca0d2723b5cd3bf08d281a1afb6bf6f28` |
+| `research/routing-only@1` | explicit run input | off | off | direct mentions; broadcast for no mention, `@all`, or unknown-only mentions | `bd1f751ca8ec726a8632bb99b0148b5e81693af50a623c89230320e92f836f88` |
+| `research/receipt-only@1` | explicit run input | on | off | broadcast | `902d907b2f390a03b17593184836bf644fcdf5dae8f8e412d973f8010717d052` |
+| `research/single@1` | exactly 1 | off | off | broadcast to the one seat | `07f5fe9cd06cddedba4d295af89115b9cb96ff0afd86c8d529fde1ae8d47de22` |
+
+`research/single@1` freezes the one-seat topology and uses a singular opening
+prompt without teammate instructions. It deliberately does not pretend to add
+an experiment-wide model-call cap, a completion barrier, or a signed self-review
+receipt. Those controls must be supplied and attested separately. The existing
+`--until "budget 400k tokens"` condition counts aggregate fresh tokens after
+completed turns, so it is not by itself the hard, race-safe budget required by
+the frozen ProgramBench protocol.
+
+```bash
+sharednet goal run TASK.md \
+  --harness-mode research/single@1 \
+  --agent codex:gpt-6.1-sol \
+  --until "budget 400k tokens" --until "after: 45m"
+```
 
 The receipt gate makes a sender read newer direct mentions immediately before
 posting and retry after reviewing any it finds. The task gate adds the typed
@@ -55,6 +72,11 @@ The spec hash covers the immutable mode semantics and fixed mechanism
 provenance. Mutable availability and later re-verification metadata are kept in
 the registry but excluded from the hash, so merging an already reviewed
 implementation cannot silently redefine `@1`.
+
+The single-seat topology constraint and singular prompt were introduced and
+verified separately at client commit
+`cebac16019be29d965698458f400dfff29c24909`; that commit is the immutable
+mechanism provenance in the `research/single@1` spec.
 
 ## Serve-backed runtime modes available in this build
 

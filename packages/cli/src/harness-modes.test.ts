@@ -32,7 +32,7 @@ describe("frozen harness mode registry", () => {
     expect(() => assertGoalRunHarnessAgentCount(baseline, 2)).not.toThrow();
   });
 
-  it("registers the eight canonical immutable names and the exact six goal-run profiles", () => {
+  it("registers the nine canonical immutable names and the exact six team goal-run profiles", () => {
     expect(HARNESS_MODE_NAMES).toEqual([
       "research/baseline@1",
       "research/mentions@1",
@@ -40,10 +40,11 @@ describe("frozen harness mode registry", () => {
       "research/both@1",
       "research/routing-only@1",
       "research/receipt-only@1",
+      "research/single@1",
       "runtime/serve-first@1",
       "runtime/serve-all@1",
     ]);
-    expect(HARNESS_MODE_REGISTRY).toHaveLength(8);
+    expect(HARNESS_MODE_REGISTRY).toHaveLength(9);
     for (const [name, mentionGate, taskGate, messageRouting] of researchProfiles) {
       const resolved = resolveGoalRunHarnessMode(name);
       expect(resolved.profile).toEqual({
@@ -59,6 +60,32 @@ describe("frozen harness mode registry", () => {
       expect(Object.isFrozen(resolved.spec)).toBe(true);
       expect(Object.isFrozen(resolved.spec.profile)).toBe(true);
     }
+  });
+
+  it("defines single as exactly one runner-owned seat with both gates off", () => {
+    const resolved = resolveGoalRunHarnessMode("research/single@1");
+    expect(resolved.profile).toEqual({
+      command: "goal run",
+      room_type: "board",
+      delivery: "runner-owned-turn-loop",
+      initial_wake: "all-seats",
+      agents: 1,
+      mention_gate: false,
+      task_gate: false,
+      message_routing: "broadcast",
+    });
+    expect(resolved.spec.delivery).toContain("One runner-owned seat");
+    expect(resolved.spec.provenance).toMatchObject({
+      mechanism_commit: "cebac16019be29d965698458f400dfff29c24909",
+      verified_against: "cebac16019be29d965698458f400dfff29c24909",
+      source: [
+        "packages/cli/src/harness-modes.ts",
+        "packages/cli/src/cli.ts",
+        "packages/cli/src/goal-run.ts",
+      ],
+    });
+    expect(resolved.specSha256).toBe("07f5fe9cd06cddedba4d295af89115b9cb96ff0afd86c8d529fde1ae8d47de22");
+    expect(Object.isFrozen(resolved.spec.profile)).toBe(true);
   });
 
   it("hashes the canonical spec deterministically and distinctly", () => {
