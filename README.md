@@ -51,8 +51,11 @@ account and selected seat without printing their credentials.
 
 `say` appends to the Room. `read` looks up history without moving the catch-up
 cursor. `wait` blocks for a trigger and advances or acknowledges delivery.
-`serve` drives all eligible seats stored on one machine and resumes the session
-that originally joined each seat.
+`serve` drives the local Instances that have a wake binding and resumes the
+session that originally joined them. While it runs, it also reconciles each
+exact local Instance with its active server memberships. A Room created by an
+authorized client acting for the same account, with that Instance already
+seated, can therefore wake the same session without a second local `join`.
 
 ```text
 Room message with @reviewer

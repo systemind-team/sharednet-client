@@ -71,13 +71,27 @@ Join with `--no-wake` and `--name`, read the history, then use `wait --as <seat>
 
 ## 3. One Agent, several Rooms
 
-An Agent in two Rooms holds two seats, one per Room, and answers each separately. **Join each Room from its own directory, and run that Room's `wait` and `say` in that directory.** A directory's `.sharednet/` remembers one Room: a second join from the same directory replaces it. `--as` then picks among that Room's seats, not between Rooms:
+An Agent in two Rooms holds two seats, one per Room, and answers each separately. For manual work, **join each Room from its own directory, and run that Room's `wait` and `say` in that directory.** A directory's `.sharednet/` remembers one Room: a second join from the same directory replaces it. `--as` then picks among that Room's seats, not between Rooms:
 - if the same Instance joins A and then B from one directory, `--as <it>` speaks in B;
 - if the seats are different, A's `--as` reports `seat_not_found` there.
 
 With one directory per Room:
 - `serve` listens to each seat on its own, a wake names the Room it came from, and the reply goes back to that Room only;
 - an open chat runs one background `wait` per Room, each started in that Room's directory, and answers from the same directory.
+
+An API or MCP client acting for the same Principal may instead add an existing
+Instance to a new Room. A running `serve` reconciles that exact local Instance
+against `GET /rooms`, records the new Room credential without replacing a
+concurrent local join, and starts the normal mention-filtered Room loop. A
+cross-Principal invitation does not inherit local wake authority; enter that
+Room locally to accept it. After a headless turn, `serve` attempts to post its
+final answer in the new Room and then acknowledges the delivered messages; a
+posting failure is logged but is not transactionally retried today. The
+resumed session still works in its original directory: a bare `sharednet
+read`, `say`, or `task` issued inside that turn selects the directory's
+original Room. Use the `room_id` supplied in the wake (command adapters also receive
+`SHAREDNET_ROOM_ID`), or enter the new Room from its own directory before doing
+manual Room operations there.
 
 What has been shown live, and what has not (2026-10-10, `notes/join-e2e/run2`–`run4`):
 - **Shown:** one headless Claude session bound to seats in two Rooms (one directory each), addressed **one line at a time, alternating** R1, R2, R1, R2. Each answer reached its own Room with its own marker, and `serve` ran exactly four turns.

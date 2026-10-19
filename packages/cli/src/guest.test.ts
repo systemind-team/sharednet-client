@@ -12,6 +12,7 @@ import { runCli } from "./cli.ts";
 import type { CommandRunner } from "./guest.ts";
 import { processAlive, systemProcessProbe, type ProcessProbe } from "./process-identity.ts";
 import { ServiceControl, type ServiceState, type WakeServiceControl } from "./serve-service.ts";
+import { getStoragePaths, writeSession } from "./storage.ts";
 import type { CheckOptions, CheckResult, CheckStep, SeatWake, TurnRunner, TurnSpec } from "./wake-driver.ts";
 
 const cleanup: string[] = [];
@@ -107,6 +108,7 @@ async function run(
     processProbe?: ProcessProbe;
     rescanMs?: number;
     listSeats?: <T>(read: () => Promise<T>) => Promise<T>;
+    roomsFetch?: (input: string | URL | Request, init: RequestInit) => Promise<Response>;
     lockPause?: () => Promise<void>;
     wakeService?: (env: Record<string, string | undefined>) => WakeServiceControl;
   } = {},
@@ -119,12 +121,20 @@ async function run(
   // The seat's place is the service's (wait PR 5). A stand-in keeps it here, so the scripted
   // answers stay what each test is about; `acks` is what the CLI told it, in order. Pass the same
   // `service` to two runs and it carries over, as the real one does.
-  const { service: kept, ackFailure, fetch: fetchOverride, onStderr, ...dependencyOverrides } = overrides;
+  const { service: kept, ackFailure, fetch: fetchOverride, onStderr, roomsFetch, ...dependencyOverrides } = overrides;
   const service = kept ?? { delivered_through: 0, acked_through: 0 };
   const acks: number[] = [];
   const heartbeats: Array<{ through: number }> = [];
   const scriptedFetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
-    const heartbeat = /\/api\/v1\/rooms\/rom_[A-Za-z0-9]+\/subscription\/heartbeat$/.exec(new URL(String(input)).pathname);
+    const requestUrl = new URL(String(input));
+    if (argv[0] === "serve" && init.method === "GET" && requestUrl.pathname === "/api/v1/rooms") {
+      if (roomsFetch) return roomsFetch(input, init);
+      return new Response(JSON.stringify({ items: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const heartbeat = /\/api\/v1\/rooms\/rom_[A-Za-z0-9]+\/subscription\/heartbeat$/.exec(requestUrl.pathname);
     if (heartbeat) {
       const body = JSON.parse(String(init.body)) as { through: number };
       heartbeats.push(body);
@@ -133,7 +143,7 @@ async function run(
         headers: { "content-type": "application/json" },
       });
     }
-    const place = /\/api\/v1\/rooms\/(rom_[A-Za-z0-9]+)\/(subscription|ack)$/.exec(new URL(String(input)).pathname);
+    const place = /\/api\/v1\/rooms\/(rom_[A-Za-z0-9]+)\/(subscription|ack)$/.exec(requestUrl.pathname);
     if (place) {
       if (place[2] === "ack" && ackFailure) {
         return new Response(JSON.stringify(ackFailure.body), { status: ackFailure.status, headers: { "content-type": "application/json" } });
@@ -3312,6 +3322,57 @@ describe("sharednet say and wait", () => {
         expect(result.requests.some((request) => request.url.includes("rom_SecondRoom"))).toBe(false);
         expect(result.stderr).not.toContain("now also sitting in");
         expect(endedWhileLooking).toBe(false);
+      });
+
+      it("aborts an in-flight Room discovery before shutdown gives the serve lock back", async () => {
+        const space = await workspace();
+        const instanceId = "i_AbortDisc1";
+        await seatIn(space, ROOM_ID, instanceId);
+        await writeSession(getStoragePaths(space.env), {
+          schema_version: 1,
+          base_url: "https://www.sharednet.ai",
+          principal_id: "p_AbortDisc1",
+          agent_id: null,
+          instance_id: instanceId,
+          local_instance_key: null,
+          instance_token: MEMBER_TOKEN,
+          created_at: "2026-10-19T00:00:00.000Z",
+          lease_expires_at: "2099-10-19T00:00:00.000Z",
+          expires_at: null,
+        });
+        let reads = 0;
+        let entered!: () => void;
+        const inFlight = new Promise<void>((resolve) => (entered = resolve));
+        let aborted = false;
+        const roomsFetch = async (_input: string | URL | Request, init: RequestInit): Promise<Response> => {
+          reads += 1;
+          if (reads === 1) {
+            return new Response(JSON.stringify({ items: [] }), { status: 200, headers: { "content-type": "application/json" } });
+          }
+          entered();
+          return new Promise<Response>((_resolve, reject) => {
+            init.signal!.addEventListener("abort", () => {
+              aborted = true;
+              reject(init.signal!.reason);
+            }, { once: true });
+          });
+        };
+        const stop = new AbortController();
+        const serving = run(
+          ["serve", "--run", "true", "--json"],
+          space,
+          [revoked()],
+          {},
+          { signal: stop.signal, rescanMs: 10, roomsFetch },
+        );
+        await inFlight;
+        stop.abort();
+        const result = await Promise.race([
+          serving,
+          new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("serve shutdown waited for the discovery timeout")), 500)),
+        ]);
+        expect(result.exitCode).toBe(0);
+        expect(aborted).toBe(true);
       });
 
       it("writes a status only while the lock is its own, and never releases another connector's lock", async () => {

@@ -8,9 +8,11 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   backupStoredApiCredential,
+  createRoomCredentialIfAbsent,
   getOrCreateInstallationSecret,
   getStoragePaths,
   listSessions,
+  readRoomCredential,
   readStoredApiCredential,
   writeSession,
   writeStoredApiCredential,
@@ -126,6 +128,35 @@ describe("secure local state", () => {
     expect(new Set(secrets)).toHaveLength(1);
     expect(Buffer.from(secrets[0]!, "base64url")).toHaveLength(32);
     expect((await stat(paths.installationFile)).mode & 0o777).toBe(0o600);
+  });
+
+  it("creates a discovered Room credential once without replacing a concurrent local join", async () => {
+    const root = await fixtureRoot();
+    const paths = getStoragePaths({
+      HOME: root,
+      XDG_CONFIG_HOME: join(root, "config"),
+      XDG_STATE_HOME: join(root, "state"),
+    });
+    const base = {
+      schema_version: 1 as const,
+      base_url: "https://www.sharednet.ai",
+      room_id: "rom_AtomicRoom1",
+      member_id: "i_AtomicSeat1",
+      name: "agent",
+      joined_at: "2026-10-19T00:00:00.000Z",
+    };
+    const attempts = await Promise.all(
+      Array.from({ length: 16 }, (_, index) =>
+        createRoomCredentialIfAbsent(paths, { ...base, member_token: `sni_candidate_${index}` }),
+      ),
+    );
+
+    expect(attempts.filter(Boolean)).toHaveLength(1);
+    const stored = await readRoomCredential(paths, base.room_id, base.member_id);
+    expect(stored?.member_token).toMatch(/^sni_candidate_\d+$/);
+    expect((await stat(join(paths.roomsDir, base.room_id, `${base.member_id}.json`))).mode & 0o777).toBe(0o600);
+    expect(await createRoomCredentialIfAbsent(paths, { ...base, member_token: "sni_must_not_replace" })).toBe(false);
+    expect((await readRoomCredential(paths, base.room_id, base.member_id))?.member_token).toBe(stored?.member_token);
   });
 
   it("backs a credential up byte for byte, owner-only, without overwriting an earlier copy", async () => {

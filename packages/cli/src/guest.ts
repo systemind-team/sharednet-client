@@ -19,6 +19,7 @@ import { codebuddyProgram } from "./wake-codebuddy.ts";
 import { DEFAULT_TURN_LIMIT_MS, validTurnLimit, livePrompt, onPath, replyFrom, runTurn, sandboxed, wakeTurnPrompt, startVerdict, STEP_LABELS, type CheckOptions, type CheckResult, type Delivery, type SeatWake, type TurnRunner } from "./wake-driver.ts";
 import { describeWake, isWakeDriver, pluginFor, seatWakeFrom } from "./wake-plugins.ts";
 import {
+  createRoomCredentialIfAbsent,
   getOrCreateInstallationSecret,
   getStoragePaths,
   readProjectRoom,
@@ -589,6 +590,171 @@ async function heldSeats(paths: ReturnType<typeof getStoragePaths>): Promise<Sto
     }
   }
   return seats;
+}
+
+type ListedRoom = { id: string; principal_id: string; state: "open" | "closed"; type?: "board" | "compiled" };
+
+function wakeBinding(wake: SeatWake): string {
+  return JSON.stringify([
+    wake.driver,
+    wake.session ?? null,
+    wake.cwd,
+    wake.command,
+    wake.codex_home ?? null,
+    wake.live_pid ?? null,
+    wake.turn_limit_ms ?? null,
+    wake.config_dir ?? null,
+  ]);
+}
+
+/**
+ * Finds Rooms an exact local Instance was admitted to remotely (for example by an MCP client).
+ * The server membership is authoritative, but the wake binding stays local: only an Instance with
+ * a stored session and one unambiguous local binding may acquire another Room loop.
+ */
+async function discoverInstanceRooms(
+  seats: StoredRoomCredential[],
+  paths: ReturnType<typeof getStoragePaths>,
+  dependencies: GuestDependencies,
+  options: { command: string | undefined; only: Set<string> | null; warned: Set<string>; signal?: AbortSignal },
+): Promise<StoredRoomCredential[]> {
+  const discovered = [...seats];
+  const known = new Set(seats.map((seat) => `${seat.room_id}/${seat.member_id}`));
+  const byInstance = new Map<string, StoredRoomCredential[]>();
+  for (const seat of seats) {
+    if (!seat.member_id.startsWith("i_")) continue;
+    const group = byInstance.get(seat.member_id) ?? [];
+    group.push(seat);
+    byInstance.set(seat.member_id, group);
+  }
+
+  for (const [instanceId, candidates] of byInstance) {
+    if (options.signal?.aborted) break;
+    const session = await readSessionById(paths, instanceId).catch(() => null);
+    if (!session) continue;
+    const local = candidates.filter((seat) => sameOrigin(seat.base_url, session.base_url));
+    const sources = options.command === undefined ? local.filter((seat) => seat.wake !== undefined) : local;
+    if (sources.length === 0) continue;
+    if (options.command === undefined) {
+      const bindings = new Set(sources.map((seat) => wakeBinding(seat.wake!)));
+      if (bindings.size !== 1) {
+        const warning = `binding:${instanceId}`;
+        if (!options.warned.has(warning)) {
+          dependencies.stderr?.(`serve: ${instanceId} has conflicting local wake bindings; remotely added Rooms are not driven until they agree\n`);
+          options.warned.add(warning);
+        }
+        continue;
+      }
+    }
+    const source = [...sources].sort((left, right) => right.joined_at.localeCompare(left.joined_at))[0]!;
+    const request = boundedFetch(dependencies, null, false);
+    const client = new ApiClient(
+      session.base_url,
+      (input, init) => request(input, { ...init, ...(options.signal ? { signal: options.signal } : {}) }),
+    );
+    try {
+      // Instance tokens are permanent until revoked; this authenticated read also renews presence.
+      // Do not run a separate lease refresh here, since discovery must remain one bounded request.
+      const response = await client.request<{ items?: unknown }>("GET", "/rooms", session.instance_token);
+      if (!Array.isArray(response.items)) throw invalidServerResponse();
+      // The network request may have been in flight while this Instance was revoked, rotated, or
+      // rebound. Do not persist anything from that stale authority; the next scan can retry with
+      // the replacement session.
+      const currentSession = await readSessionById(paths, instanceId).catch(() => null);
+      if (
+        !currentSession ||
+        currentSession.base_url !== session.base_url ||
+        currentSession.principal_id !== session.principal_id ||
+        currentSession.instance_token !== session.instance_token
+      ) {
+        continue;
+      }
+      for (const item of response.items) {
+        if (options.signal?.aborted) break;
+        if (typeof item !== "object" || item === null) throw invalidServerResponse();
+        const room = item as Partial<ListedRoom>;
+        if (
+          typeof room.id !== "string" ||
+          !ROOM_ID_PATTERN.test(room.id) ||
+          typeof room.principal_id !== "string" ||
+          (room.state !== "open" && room.state !== "closed") ||
+          (room.type !== undefined && room.type !== "board" && room.type !== "compiled")
+        ) {
+          throw invalidServerResponse();
+        }
+        // Remote admission may also come from a stranger inviting a public Instance. Only Rooms
+        // owned by this Instance's Principal inherit a privileged local wake automatically; a
+        // cross-Principal Room still requires an explicit local join/acceptance.
+        if (room.principal_id !== session.principal_id || room.state !== "open" || (options.only && !options.only.has(room.id))) continue;
+        const key = `${room.id}/${instanceId}`;
+        if (known.has(key)) continue;
+
+        let existing: StoredRoomCredential | null;
+        try {
+          existing = await readRoomCredential(paths, room.id, instanceId);
+        } catch (error) {
+          const warning = `credential:${key}`;
+          if (!options.warned.has(warning)) {
+            dependencies.stderr?.(`serve: ${key} has an unreadable local credential; it was not replaced (${error instanceof CliError ? error.code : "error"})\n`);
+            options.warned.add(warning);
+          }
+          continue;
+        }
+        if (existing) {
+          discovered.push(existing);
+          known.add(key);
+          continue;
+        }
+
+        let currentSource = source;
+        if (options.command === undefined) {
+          // The GET may have been slow while the operator ran `wake off` or rebound this Instance.
+          // Re-read local authority before copying it into another Room; a stale snapshot must not
+          // revive a wake that was just revoked.
+          const currentLocal = (await heldSeats(paths)).filter(
+            (seat) => seat.member_id === instanceId && sameOrigin(seat.base_url, session.base_url) && seat.wake !== undefined,
+          );
+          const currentBindings = new Set(currentLocal.map((seat) => wakeBinding(seat.wake!)));
+          if (currentBindings.size !== 1 || !currentBindings.has(wakeBinding(source.wake!))) continue;
+          currentSource = [...currentLocal].sort((left, right) => right.joined_at.localeCompare(left.joined_at))[0]!;
+        }
+
+        const credential: StoredRoomCredential = {
+          schema_version: 1,
+          base_url: currentSession.base_url,
+          room_id: room.id,
+          member_id: instanceId,
+          name: currentSource.name,
+          member_token: currentSession.instance_token,
+          joined_at: dependencies.now().toISOString(),
+          ...(room.type === "compiled" ? { room_type: "compiled" as const } : { room_type: "board" as const }),
+          ...(options.command === undefined && currentSource.wake ? { wake: currentSource.wake } : {}),
+        };
+        // A command is supplied by this invocation and is not durable local authority. Listen in
+        // memory for this run, leaving a later ordinary serve free to inherit its current wake.
+        if (options.command !== undefined) {
+          discovered.push(credential);
+          known.add(key);
+          continue;
+        }
+        const created = await createRoomCredentialIfAbsent(paths, credential);
+        const stored = created ? credential : await readRoomCredential(paths, room.id, instanceId);
+        if (stored) {
+          discovered.push(stored);
+          known.add(key);
+        }
+      }
+      options.warned.delete(`rooms:${instanceId}`);
+    } catch (error) {
+      if (options.signal?.aborted) break;
+      const warning = `rooms:${instanceId}`;
+      if (!options.warned.has(warning)) {
+        dependencies.stderr?.(`serve: could not discover Rooms for ${instanceId}; existing Room listeners continue (${error instanceof CliError ? error.code : "error"})\n`);
+        options.warned.add(warning);
+      }
+    }
+  }
+  return discovered;
 }
 
 /**
@@ -2608,7 +2774,7 @@ function contentTypeFor(filename: string): string {
 async function openDoorbell(port: number, dependencies: GuestDependencies, signal: AbortSignal) {
   const { createServer } = await import("node:http");
   const { createHmac, timingSafeEqual } = await import("node:crypto");
-  const secrets = new Map<string, string>();
+  const secrets = new Map<string, { memberId: string; secret: string }>();
   const pending = new Set<string>();
   const waiters = new Map<string, (rung: boolean) => void>();
   const server = createServer((request, response) => {
@@ -2627,24 +2793,32 @@ async function openDoorbell(port: number, dependencies: GuestDependencies, signa
     });
     request.on("end", () => {
       const body = Buffer.concat(chunks).toString("utf8");
-      const secret = secrets.get(memberId);
       const timestamp = String(request.headers["x-sharednet-timestamp"] ?? "");
       const given = String(request.headers["x-sharednet-signature"] ?? "");
-      const expected = secret === undefined ? "" : `sha256=${createHmac("sha256", secret).update(`${timestamp}.${body}`).digest("hex")}`;
       // A ring more than five minutes off is a replay, or a clock to fix; either way it is refused.
       const fresh = /^\d+$/.test(timestamp) && Math.abs(dependencies.now().getTime() - Number(timestamp) * 1000) <= 300_000;
-      const valid = secret !== undefined && fresh && given.length === expected.length && timingSafeEqual(Buffer.from(given), Buffer.from(expected));
-      if (!valid) {
+      let key: string | null = null;
+      if (fresh) {
+        for (const [candidateKey, candidate] of secrets) {
+          if (candidate.memberId !== memberId) continue;
+          const expected = `sha256=${createHmac("sha256", candidate.secret).update(`${timestamp}.${body}`).digest("hex")}`;
+          if (given.length === expected.length && timingSafeEqual(Buffer.from(given), Buffer.from(expected))) {
+            key = candidateKey;
+            break;
+          }
+        }
+      }
+      if (key === null) {
         response.writeHead(401).end();
         return;
       }
       response.writeHead(204).end();
-      const waiter = waiters.get(memberId);
+      const waiter = waiters.get(key);
       if (waiter) {
-        waiters.delete(memberId);
+        waiters.delete(key);
         waiter(true);
       } else {
-        pending.add(memberId);
+        pending.add(key);
       }
     });
   });
@@ -2663,14 +2837,15 @@ async function openDoorbell(port: number, dependencies: GuestDependencies, signa
     { once: true },
   );
   return {
-    register(memberId: string, secret: string) {
-      secrets.set(memberId, secret);
+    register(roomId: string, memberId: string, secret: string) {
+      secrets.set(`${roomId}/${memberId}`, { memberId, secret });
     },
     /** Resolves true when the seat is rung (or was, while it was busy), false once serve is stopping. */
-    rung(memberId: string): Promise<boolean> {
+    rung(roomId: string, memberId: string): Promise<boolean> {
+      const key = `${roomId}/${memberId}`;
       if (signal.aborted) return Promise.resolve(false);
-      if (pending.delete(memberId)) return Promise.resolve(true);
-      return new Promise((resolve) => waiters.set(memberId, resolve));
+      if (pending.delete(key)) return Promise.resolve(true);
+      return new Promise((resolve) => waiters.set(key, resolve));
     },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
@@ -2863,7 +3038,8 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   const served = (seat: StoredRoomCredential) => (only ? only.has(seat.room_id) : true) && (command !== undefined || seat.wake !== undefined);
 
   const listSeats = () => (dependencies.listSeats ? dependencies.listSeats(() => heldSeats(paths)) : heldSeats(paths));
-  const held = await listSeats();
+  const discoveryWarnings = new Set<string>();
+  const held = await discoverInstanceRooms(await listSeats(), paths, dependencies, { command, only, warned: discoveryWarnings });
   const seats = held.filter(served);
   if (seats.length === 0 && !asService) {
     throw localError(
@@ -3074,7 +3250,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         push_url: `${base}/sharednet/push/${seat.member_id}`,
       });
       if (typeof set?.push?.secret !== "string") throw invalidServerResponse();
-      doorbell.register(seat.member_id, set.push.secret);
+      doorbell.register(seat.room_id, seat.member_id, set.push.secret);
     }
     const handled = async (through: number) => {
       cursor = through;
@@ -3216,7 +3392,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       }
       // Behind a doorbell there is no long-poll: once nothing is left to hand over, the seat waits to
       // be rung, and looks once when it is.
-      if (doorbell !== null && idle && !(await doorbell.rung(seat.member_id))) return;
+      if (doorbell !== null && idle && !(await doorbell.rung(seat.room_id, seat.member_id))) return;
       await current();
       await setHealth(seat, "listening");
       const page = await waitPage(client, seat.room_id, seat.member_token, polled, doorbell !== null ? 0 : WAIT_MAX_SECONDS, seatFilters);
@@ -3351,9 +3527,10 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   // A look still in flight when the loops are done must finish before the lock is given back: it
   // could otherwise begin a seat, and write a status, after a successor has taken the lock.
   let looking: Promise<void> | null = null;
-  const rescan = setInterval(() => {
+  const look = () => {
     if (looking !== null || closing || stopping.signal.aborted) return;
     looking = listSeats()
+      .then((all) => discoverInstanceRooms(all, paths, dependencies, { command, only, warned: discoveryWarnings, signal: stopping.signal }))
       .then(async (all) => {
         if (closing) return;
         const fresh = all.filter(served).filter(begin);
@@ -3363,7 +3540,10 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       })
       .catch(() => undefined)
       .finally(() => (looking = null));
-  }, dependencies.rescanMs ?? RESCAN_MS);
+  };
+  const rescan = setInterval(look, dependencies.rescanMs ?? RESCAN_MS);
+  // Reconcile once now instead of making an already-addressed remote Room wait for the first tick.
+  look();
   await finished;
   clearInterval(rescan);
   closing = true;

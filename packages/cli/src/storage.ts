@@ -494,6 +494,20 @@ export async function writeRoomCredential(
   );
 }
 
+/**
+ * Records a Room membership discovered by a running connector without replacing a credential
+ * written concurrently by `join` or another local setup command.
+ */
+export async function createRoomCredentialIfAbsent(
+  paths: StoragePaths,
+  credential: StoredRoomCredential,
+): Promise<boolean> {
+  return createSecureJsonIfAbsent(
+    roomCredentialFile(paths, credential.room_id, credential.member_id),
+    credential,
+  );
+}
+
 export async function readRoomCredential(
   paths: StoragePaths,
   roomId: string,
