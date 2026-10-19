@@ -38,6 +38,7 @@ const TERMINAL_OUTCOMES = new Set<PrometheusTerminalOutcome>([
 ]);
 const HEX_SHA256 = /^[0-9a-f]{64}$/;
 const COMPILED_STATE_DIGEST = /^sha256:[0-9a-f]{24}$/;
+const PROMETHEUS_WORK_ID = /^[A-Za-z0-9_.:-]{1,64}$/;
 const WORKSPACE_KEY = /^[0-9a-f]{24}$/;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const ROOM_ID = /^rom_[A-Za-z0-9]+$/;
@@ -509,8 +510,8 @@ function parseCandidate(value: unknown, source: string): PrometheusCandidateSumm
   );
   return {
     compiled_digest: pattern(object.compiled_digest, COMPILED_STATE_DIGEST, source),
-    work_id: pattern(object.work_id, SAFE_ID, source),
-    result_ref: pattern(object.result_ref, SAFE_ID, source),
+    work_id: pattern(object.work_id, PROMETHEUS_WORK_ID, source),
+    result_ref: pattern(object.result_ref, COMPILED_STATE_DIGEST, source),
     revision_sha256: pattern(object.revision_sha256, HEX_SHA256, source),
     observed_at: timestamp(object.observed_at, source),
   };
