@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { mkdir, open, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve as resolvePathFrom } from "node:path";
 
@@ -256,6 +256,26 @@ function assertOnlyOptions(arguments_: ParsedArguments, allowed: string[]): void
 function assertPositionals(arguments_: ParsedArguments, count: number): void {
   if (arguments_.positionals.length !== count) {
     throw localError("invalid_arguments", "The command received the wrong number of arguments.");
+  }
+}
+
+/** Proves the runner can create, write and remove records before it creates a remote Room. */
+async function preflightGoalOutput(out: string): Promise<void> {
+  const probe = join(out, `.sharednet-write-probe-${randomUUID()}`);
+  try {
+    await mkdir(out, { recursive: true });
+    if (!(await stat(out)).isDirectory()) throw new Error("the path is not a directory");
+    const handle = await open(probe, "wx", 0o600);
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await rm(probe);
+  } catch (error) {
+    await rm(probe, { force: true }).catch(() => undefined);
+    const detail = error instanceof Error ? error.message : "the path cannot be written";
+    throw localError("invalid_arguments", `--out ${out} is not a writable directory: ${detail}`);
   }
 }
 
@@ -632,6 +652,9 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (!(await stat(workspace).then((entry) => entry.isDirectory(), () => false))) {
     throw localError("invalid_arguments", `--workspace ${workspace} is not a directory.`);
   }
+  const requestedOut = option(parsed, "out");
+  const outputRoot = resolvePathFrom(dependencies.cwd, requestedOut ?? "runs");
+  await preflightGoalOutput(outputRoot);
   const checkEveryMs = parsed.options.has("check-every") ? parseDuration(option(parsed, "check-every"), "--check-every") : 60_000;
   const baseUrl = resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL);
   const apiKey = await resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), baseUrl);
@@ -665,7 +688,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     });
     const invite = await client.request<{ token?: string }>("POST", `/rooms/${encodeURIComponent(roomId)}/invites`, session.instance_token);
     if (!invite?.token) throw new CliError("invalid_server_response", "The Agents' invite did not come back.", 5);
-    const out = resolvePathFrom(dependencies.cwd, option(parsed, "out") ?? join("runs", roomId));
+    const out = requestedOut === undefined ? join(outputRoot, roomId) : outputRoot;
     dependencies.stderr(`goal: ${roomId} is open; the record goes to ${out}\n`);
     // Ctrl-C ends the run without leaving Agents at work in containers nobody watches.
     const interrupt = () => {
@@ -755,6 +778,9 @@ async function goalServeDemoCommand(
   if (!(await stat(workspace).then((entry) => entry.isDirectory(), () => false))) {
     throw localError("invalid_arguments", `--workspace ${workspace} is not a directory.`);
   }
+  const requestedOut = option(parsed, "out");
+  const outputRoot = resolvePathFrom(dependencies.cwd, requestedOut ?? "runs");
+  await preflightGoalOutput(outputRoot);
   const checkEveryMs = parsed.options.has("check-every") ? parseDuration(option(parsed, "check-every"), "--check-every") : 60_000;
   const baseUrl = resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL);
   const apiKey = await resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), baseUrl);
@@ -784,7 +810,7 @@ async function goalServeDemoCommand(
     if (!roomId) throw new CliError("invalid_server_response", "The Room was created but its id did not come back.", 5);
     const invite = await client.request<{ token?: string }>("POST", `/rooms/${encodeURIComponent(roomId)}/invites`, session.instance_token);
     if (!invite?.token) throw new CliError("invalid_server_response", "The Agents' invite did not come back.", 5);
-    const out = resolvePathFrom(dependencies.cwd, option(parsed, "out") ?? join("runs", roomId));
+    const out = requestedOut === undefined ? join(outputRoot, roomId) : outputRoot;
     dependencies.stderr(`goal: ${roomId} is empty while three real serve listeners start; the record goes to ${out}\n`);
     return runServeGoalDemo(
       client,

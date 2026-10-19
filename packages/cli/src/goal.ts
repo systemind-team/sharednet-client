@@ -124,6 +124,8 @@ export interface GoalWatchDependencies {
   now: () => Date;
   sleep?: (ms: number) => Promise<void>;
   stderr?: (value: string) => void;
+  /** Stops a watcher before it can close the Room; serve-backed runs use this on process signals. */
+  signal?: AbortSignal;
   /** Runs a `check` in the workspace; tests replace it. */
   check?: CheckRunner;
   /** Takes a workspace snapshot; tests replace it, and null turns snapshots off. */
@@ -266,9 +268,17 @@ export async function goalWatch(
   const snapshot = dependencies.snapshot === undefined ? workspaceSnapshots(options.workspace, options.out) : dependencies.snapshot;
   const roomPath = `/rooms/${encodeURIComponent(options.roomId)}`;
   const roomCheckMs = options.roomCheckMs ?? 30_000;
+  const throwIfAborted = () => {
+    if (!dependencies.signal?.aborted) return;
+    throw dependencies.signal.reason instanceof Error
+      ? dependencies.signal.reason
+      : localError("goal_interrupted", "Goal watch was interrupted.");
+  };
 
   const readRoom = () => client.request<RoomShape>("GET", roomPath, memberToken);
+  throwIfAborted();
   let view = await readRoom();
+  throwIfAborted();
   const goal = view.room?.goal ?? null;
   if (!goal) throw localError("not_a_goal_room", "That Room has no goal. Start one with sharednet room create --goal <file> --until <trigger>.");
   const startedAt = Date.parse(goal.started_at);
@@ -421,6 +431,7 @@ export async function goalWatch(
         continue;
       }
     }
+    throwIfAborted();
 
     let claim: MessageShape | null = null;
     for (const item of items.sort((left, right) => left.sequence - right.sequence)) {
@@ -486,8 +497,10 @@ export async function goalWatch(
   }
 
   // Close with the trigger that fired; the service keeps the first end it was told.
+  throwIfAborted();
   let endedBy = endedByService;
   for (let attempt = 1; !endedBy && end; attempt += 1) {
+    throwIfAborted();
     try {
       const closed = await client.request<{ room?: { goal?: GoalShape | null } }>("POST", `${roomPath}/close`, apiKey, end);
       endedBy = closed?.room?.goal?.ended_by ?? { ...end, at: dependencies.now().toISOString() };

@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { ApiClient } from "./api-client.ts";
 import { DEFAULT_IMAGE, containerName, runContainers, type DockerRunner, type RunPlan } from "./goal-run.ts";
+import { goalWatch } from "./goal.ts";
 import { resolveRuntimeHarnessMode } from "./harness-modes.ts";
 import {
   assertServeDemoGoalUnaddressed,
@@ -40,6 +41,8 @@ async function lifecycleScenario(options: {
   signals?: boolean;
   signalOnSubscribe?: ServeDemoSignal;
   watchError?: string;
+  realWatchSignal?: ServeDemoSignal;
+  copyFailure?: { seat: string; artifact: "sessions" | "serve.log" };
 } = {}) {
   const out = await temporary();
   const workspace = await temporary();
@@ -69,6 +72,11 @@ async function lifecycleScenario(options: {
     }
     if (args[0] === "stop") return { code: options.stopCode ?? 0, stdout: "", stderr: options.stopCode ? "stop broke" : "" };
     if (args[0] === "rm") return { code: options.removeCode ?? 0, stdout: "", stderr: options.removeCode ? "remove broke" : "" };
+    if (args[0] === "cp" && options.copyFailure) {
+      const source = args[1] ?? "";
+      const artifactMatches = options.copyFailure.artifact === "sessions" ? source.endsWith("/.codex/sessions") : source.endsWith("/serve.log");
+      if (source.includes(`/${options.copyFailure.seat}/`) && artifactMatches) return { code: 9, stdout: "", stderr: "copy broke" };
+    }
     if (args[0] === "ps") {
       return { code: 0, stdout: options.remainingAfterRemove ? `${runContainers(ROOM, parseServeDemoAgents([])).join("\n")}\n` : "", stderr: "" };
     }
@@ -91,6 +99,27 @@ async function lifecycleScenario(options: {
     async request(method: string, path: string, _token: string, body?: unknown) {
       if (method === "POST" && path.endsWith("/goal")) return { room: {}, message: { sequence: 1 } };
       if (method === "POST" && path.endsWith("/owner-messages")) return { message: { sequence: 2 } };
+      if (method === "GET" && path === `/rooms/${ROOM}`) {
+        return {
+          room: {
+            id: ROOM,
+            type: "board",
+            state: "open",
+            goal: {
+              message_id: "msg_goal000001",
+              sequence: 1,
+              until: ["said DONE"],
+              started_at: "2026-10-14T20:00:00.000Z",
+              ended_by: null,
+            },
+          },
+          memberships: [],
+        };
+      }
+      if (method === "GET" && path.startsWith(`/rooms/${ROOM}/wait?`)) {
+        if (options.realWatchSignal) handlers.get(options.realWatchSignal)?.();
+        return { items: [{ sequence: 3, content: "DONE", sender: { member_id: "i_AgentOne01", name: "codex-1" } }] };
+      }
       if (method === "POST" && path.endsWith("/close")) {
         closes.push(body as Record<string, unknown>);
         return { room: { state: "closed" } };
@@ -131,7 +160,7 @@ async function lifecycleScenario(options: {
     roomId: ROOM,
     inviteToken: "rit_invite-secret",
     goal: "Build the demo.",
-    until: ["after 20m"],
+    until: options.realWatchSignal ? ["said DONE"] : ["after 20m"],
     baseUrl: "https://www.sharednet.ai",
     out,
     checkEveryMs: 60_000,
@@ -144,14 +173,20 @@ async function lifecycleScenario(options: {
     gid: 4343,
     sleep: async () => undefined,
     ...(signalHost ? { signalHost } : {}),
-    watch: async () => {
-      enterWatch();
-      if (options.holdWatch) await heldWatch;
-      if (options.watchError) throw new Error(options.watchError);
-      return { room_id: ROOM, ended_by: { trigger: "after 20m", at: "2026-10-14T20:20:00.000Z", detail: null }, messages: 2, checks: 0, snapshots: 0, out };
-    },
+    watch: options.realWatchSignal
+      ? (client, memberToken, apiKey, watchOptions, watchDependencies) => {
+          enterWatch();
+          return goalWatch(client, memberToken, apiKey, watchOptions, { ...watchDependencies, snapshot: null });
+        }
+      : async () => {
+          enterWatch();
+          if (options.holdWatch) await heldWatch;
+          if (options.watchError) throw new Error(options.watchError);
+          await writeFile(join(out, "episode.json"), `${JSON.stringify({ schema_version: 1, room_id: ROOM, totals: {} })}\n`);
+          return { room_id: ROOM, ended_by: { trigger: "after 20m", at: "2026-10-14T20:20:00.000Z", detail: null }, messages: 2, checks: 0, snapshots: 0, out };
+        },
   });
-  return { calls, closes, exits, exitCalled, finishFirstCreate, finishWatch, firstCreateEntered, handlers, promise, watchEntered };
+  return { calls, closes, exits, exitCalled, finishFirstCreate, finishWatch, firstCreateEntered, handlers, out, promise, watchEntered };
 }
 
 describe("serve-first Goal demo", () => {
@@ -527,6 +562,16 @@ describe("serve-first Goal demo", () => {
     expect(scenario.handlers).toHaveLength(0);
   });
 
+  it("keeps the Room open when a signal lands inside the real watcher before its close request", async () => {
+    const scenario = await lifecycleScenario({ signals: true, realWatchSignal: "SIGINT" });
+
+    await scenario.exitCalled;
+    await expect(scenario.promise).rejects.toMatchObject({ code: "goal_interrupted" });
+    expect(scenario.closes).toEqual([]);
+    expect(scenario.exits).toEqual([130]);
+    expect(scenario.calls.filter((args) => args[0] === "rm")).toHaveLength(1);
+  });
+
   it("keeps the Room open when SIGINT arrives before startup begins", async () => {
     const scenario = await lifecycleScenario({ signals: true, signalOnSubscribe: "SIGINT" });
 
@@ -573,6 +618,25 @@ describe("serve-first Goal demo", () => {
 
     await expect(scenario.promise).resolves.toMatchObject({ mode: "real-serve" });
     expect(scenario.calls.filter((args) => args[0] === "ps")).toHaveLength(1);
+  });
+
+  it("fails an incomplete evidence export, records exactly what is missing, and still removes every container", async () => {
+    const scenario = await lifecycleScenario({ copyFailure: { seat: "codex-2", artifact: "sessions" } });
+
+    await expect(scenario.promise).rejects.toMatchObject({
+      code: "artifact_copy_failed",
+      message: expect.stringContaining("codex-2 Codex sessions"),
+    });
+    expect(scenario.calls.filter((args) => args[0] === "rm")).toHaveLength(1);
+    const record = JSON.parse(await readFile(join(scenario.out, "serve-demo.json"), "utf8"));
+    expect(record.artifact_export).toMatchObject({
+      complete: false,
+      copies: expect.arrayContaining([
+        { seat: "codex-2", artifact: "codex_sessions", status: "failed", exit_code: 9 },
+      ]),
+    });
+    const episode = JSON.parse(await readFile(join(scenario.out, "episode.json"), "utf8"));
+    expect(episode.artifact_export).toEqual(record.artifact_export);
   });
 
   it("reports both the run failure and a cleanup failure", async () => {

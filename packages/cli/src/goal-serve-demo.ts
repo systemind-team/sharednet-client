@@ -131,6 +131,19 @@ export interface ServeGoalDemoResult extends GoalWatchResult {
   mode: "real-serve";
   kickoff: ServeKickoff;
   agents: ServeDemoSeat[];
+  artifact_export: ServeDemoArtifactExport;
+}
+
+export interface ServeDemoArtifactCopy {
+  seat: string;
+  artifact: "codex_sessions" | "serve_log";
+  status: "copied" | "failed";
+  exit_code: number;
+}
+
+export interface ServeDemoArtifactExport {
+  complete: boolean;
+  copies: ServeDemoArtifactCopy[];
 }
 
 export function serveSessionPrompt(seat: Pick<AgentSpec, "name">, seats: ReadonlyArray<Pick<AgentSpec, "name">>, until: readonly string[], kickoff: ServeKickoff): string {
@@ -211,6 +224,7 @@ export async function runServeGoalDemo(
   await mkdir(input.out, { recursive: true });
 
   let interrupted: ServeDemoSignal | null = null;
+  const watchAbort = new AbortController();
   const interruptedError = () => localError("goal_interrupted", `goal serve-demo was interrupted by ${interrupted ?? "a signal"}.`);
   const startManagedContainer = async (name: string, createArgs: readonly string[]) => {
     if (interrupted) throw interruptedError();
@@ -310,6 +324,7 @@ export async function runServeGoalDemo(
       const listener = () => {
         if (interrupted) return;
         interrupted = signal;
+        watchAbort.abort(interruptedError());
         void cleanupContainers().then(
           () => {
             detachSignals();
@@ -493,6 +508,7 @@ export async function runServeGoalDemo(
           now: dependencies.now,
           ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
           stderr: log,
+          signal: watchAbort.signal,
           check: async (command) => {
             const result = await docker(["exec", "--user", agentUser, "--workdir", CONTAINER_WORKSPACE, checks, "sh", "-c", command]);
             return { exitCode: result.code, output: `${result.stdout}${result.stderr}` };
@@ -511,6 +527,7 @@ export async function runServeGoalDemo(
     }
 
     await stopContainers();
+    const copies: ServeDemoArtifactCopy[] = [];
     for (const seat of seats) {
       const target = join(input.out, "agents", seat.name, "home");
       await rm(target, { recursive: true, force: true });
@@ -518,11 +535,14 @@ export async function runServeGoalDemo(
       // Copy only evidence paths, never credential files. The raw session trace can still contain
       // sensitive content or a secret that an agent itself read and surfaced.
       const sessions = await docker(["cp", `${containerName(input.roomId, seat.name)}:${CONTAINER_HOMES}/${seat.name}/.codex/sessions`, join(target, ".codex", "sessions")]);
+      copies.push({ seat: seat.name, artifact: "codex_sessions", status: sessions.code === 0 ? "copied" : "failed", exit_code: sessions.code });
       if (sessions.code !== 0) log(`goal: ${seat.name}'s Codex trace could not be copied out: ${sessions.stderr.trim()}\n`);
       const serveLog = await docker(["cp", `${containerName(input.roomId, seat.name)}:${CONTAINER_HOMES}/${seat.name}/serve.log`, join(target, "serve.log")]);
+      copies.push({ seat: seat.name, artifact: "serve_log", status: serveLog.code === 0 ? "copied" : "failed", exit_code: serveLog.code });
       if (serveLog.code !== 0) log(`goal: ${seat.name}'s serve log could not be copied out: ${serveLog.stderr.trim()}\n`);
     }
-    const result: ServeGoalDemoResult = { ...watched, mode: "real-serve", kickoff: input.kickoff, agents: seats };
+    const artifactExport: ServeDemoArtifactExport = { complete: copies.every((copy) => copy.status === "copied"), copies };
+    const result: ServeGoalDemoResult = { ...watched, mode: "real-serve", kickoff: input.kickoff, agents: seats, artifact_export: artifactExport };
     const harness = input.harnessMode && input.codeProvenance ? {
       mode: input.harnessMode.name,
       spec_sha256: input.harnessMode.specSha256,
@@ -544,12 +564,18 @@ export async function runServeGoalDemo(
       goal_sha256: createHash("sha256").update(input.goal).digest("hex"),
       opening_prompt_sha256: openingPromptHashes,
     } : null;
-    if (harness) {
-      const episodePath = join(input.out, "episode.json");
-      const episode = JSON.parse(await readFile(episodePath, "utf8")) as Record<string, unknown>;
-      await writeFile(episodePath, `${JSON.stringify({ ...episode, image: plan.image, web_search: input.webSearch ?? "live", turn_limit_s: Math.round(turnLimitMs / 1000), harness }, null, 2)}\n`);
+    const episodePath = join(input.out, "episode.json");
+    const episode = JSON.parse(await readFile(episodePath, "utf8")) as Record<string, unknown>;
+    await writeFile(episodePath, `${JSON.stringify({
+      ...episode,
+      artifact_export: artifactExport,
+      ...(harness ? { image: plan.image, web_search: input.webSearch ?? "live", turn_limit_s: Math.round(turnLimitMs / 1000), harness } : {}),
+    }, null, 2)}\n`);
+    await writeFile(join(input.out, "serve-demo.json"), `${JSON.stringify({ mode: result.mode, kickoff: result.kickoff, image: plan.image, turn_limit_ms: turnLimitMs, goal_sequence: goalSequence, kickoff_message: kickoff, artifact_export: artifactExport, ...(harness ? { harness } : {}), agents: seats }, null, 2)}\n`);
+    if (!artifactExport.complete) {
+      const missing = copies.filter((copy) => copy.status === "failed").map((copy) => `${copy.seat} ${copy.artifact === "codex_sessions" ? "Codex sessions" : "serve log"}`).join(", ");
+      throw localError("artifact_copy_failed", `The Goal ended, but its evidence export is incomplete (${missing}). See serve-demo.json for the recorded copy status.`);
     }
-    await writeFile(join(input.out, "serve-demo.json"), `${JSON.stringify({ mode: result.mode, kickoff: result.kickoff, image: plan.image, turn_limit_ms: turnLimitMs, goal_sequence: goalSequence, kickoff_message: kickoff, ...(harness ? { harness } : {}), agents: seats }, null, 2)}\n`);
     return result;
   } catch (error) {
     runFailure = error;

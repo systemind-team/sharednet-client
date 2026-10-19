@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -449,6 +449,52 @@ describe("reach: forming a group from the account CLI", () => {
     expect(refused.exitCode).not.toBe(0);
     expect(refused.stderr.join(" ")).toContain("between 1m and 24h");
     expect(refused.requests).toEqual([]);
+  });
+
+  it("refuses an unusable serve-demo output path before creating a Room", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sharednet-serve-out-"));
+    cleanup.push(root);
+    await writeFile(join(root, "TASK.md"), "Build it.\n");
+    const blocked = join(root, "not-a-directory");
+    await writeFile(blocked, "occupied\n");
+    const requests: string[] = [];
+    const responses = [registered("i_serveOut01")];
+    const fetch = async (input: string | URL | Request) => {
+      requests.push(String(input));
+      const next = responses.shift();
+      if (!next) throw new Error("Unexpected fetch");
+      return Response.json(next.body, { status: next.status ?? 200 });
+    };
+    const env = {
+      HOME: root,
+      XDG_CONFIG_HOME: join(root, "config"),
+      XDG_STATE_HOME: join(root, "state"),
+      SHAREDNET_BASE_URL: "http://127.0.0.1:3001",
+      SHAREDNET_API_KEY: "snk_synthetic",
+      OPENAI_API_KEY: "sk-synthetic",
+      CODEX_SESSION_ID: "serve-output-test",
+    };
+    const entry = new URL("./main.ts", import.meta.url).pathname;
+    expect(await runCli(["session", "start", "--json"], { cwd: root, env, fetch, stdout: () => undefined })).toBe(0);
+    requests.length = 0;
+    const stderr: string[] = [];
+
+    const exitCode = await runCli(
+      ["goal", "serve-demo", "TASK.md", "--kickoff", "first", "--until", "after 1h", "--out", blocked],
+      {
+        cwd: root,
+        env,
+        fetch,
+        cliEntry: entry,
+        docker: async () => ({ code: 0, stdout: "", stderr: "" }),
+        stdout: () => undefined,
+        stderr: (line) => stderr.push(line),
+      },
+    );
+
+    expect(exitCode).toBe(2);
+    expect(stderr.join(" ")).toContain("--out");
+    expect(requests).toEqual([]);
   });
 
   it("accepts independent board gates before validating the rest of a run", async () => {
