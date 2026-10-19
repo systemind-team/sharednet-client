@@ -321,6 +321,30 @@ describe("persistent Prometheus runtime", () => {
     }
   });
 
+  it("passes the run cancellation signal into artifact downloads", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sharednet-prometheus-artifacts-cancel-"));
+    const snapshot = join(root, "snapshot");
+    const controller = new AbortController();
+    let sawSignal = false;
+    try {
+      await expect(materializePrometheusArtifactSnapshot(
+        [{ name: "submission", artifactId: "art_Submit0001", sha256: "a".repeat(64) }],
+        {
+          requestBytes: async (_path: string, _credential: string, signal?: AbortSignal) => {
+            sawSignal = signal === controller.signal;
+            throw new Error("stopped");
+          },
+        } as never,
+        "member",
+        snapshot,
+        controller.signal,
+      )).rejects.toThrow("stopped");
+      expect(sawSignal).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("restarts unfiltered listeners for saved seats without joining again", async () => {
     const calls: string[][] = [];
     const team: PrometheusTeamState = {

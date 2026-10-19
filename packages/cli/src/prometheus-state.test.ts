@@ -321,21 +321,16 @@ describe("Prometheus owner-only state", () => {
     const { paths } = await fixture();
     const state = run(paths);
     const syntheticCapability = ["sn", "k_visibly-synthetic-test-only"].join("");
-    const secretNames = [
+    const credentialPrefixes = [
       ["sn", "k_"].join(""),
       ["sn", "i_"].join(""),
       ["ri", "t_"].join(""),
-      "member_token",
-      "api_key",
-      "invite",
-      "OPENAI_API_KEY",
-      "auth.json",
     ];
 
     await writeTeam(paths, team(paths));
     await reserveActiveRun(paths, state, fakeProbe().probe);
     const serialized = `${await readFile(paths.teamFile, "utf8")}\n${await readFile(paths.runFile(state.run_id), "utf8")}`;
-    for (const forbidden of secretNames) expect(serialized).not.toContain(forbidden);
+    for (const forbidden of credentialPrefixes) expect(serialized).not.toContain(forbidden);
 
     await expect(
       writeTeam(paths, { ...team(paths), api_key: syntheticCapability } as PrometheusTeamState),
@@ -346,6 +341,29 @@ describe("Prometheus owner-only state", () => {
         environment: { OPENAI_API_KEY: syntheticCapability },
       } as PrometheusRunState),
     ).rejects.toMatchObject({ code: "invalid_local_state" });
+  });
+
+  it("persists ordinary checker output that names credential concepts", async () => {
+    const { paths } = await fixture();
+    const output = "invite flow failed while reading api_key from auth.json fixture";
+    const state = {
+      ...run(paths),
+      checks: [
+        {
+          revision_sha256: SHA_A,
+          artifact_snapshot_sha256: SHA_B,
+          started_at: CREATED_AT,
+          finished_at: UPDATED_AT,
+          exit_code: 1,
+          output,
+          output_sha256: createHash("sha256").update(output).digest("hex"),
+        },
+      ],
+    };
+
+    await reserveActiveRun(paths, run(paths), fakeProbe().probe);
+    await writeRun(paths, state);
+    expect((await readRun(paths, state.run_id)).checks[0]?.output).toBe(output);
   });
 
   it("rejects synthetic OpenAI and Codex credentials embedded in free text", async () => {
@@ -407,6 +425,7 @@ describe("Prometheus owner-only state", () => {
 
     for (const makeState of cases) {
       const { paths } = await fixture();
+      await reserveActiveRun(paths, run(paths), fakeProbe().probe);
       await expect(writeRun(paths, makeState(run(paths)))).rejects.toMatchObject({
         code: "invalid_local_state",
       });

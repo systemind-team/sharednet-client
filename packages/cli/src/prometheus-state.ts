@@ -37,13 +37,14 @@ const TERMINAL_OUTCOMES = new Set<PrometheusTerminalOutcome>([
   "failed",
 ]);
 const HEX_SHA256 = /^[0-9a-f]{64}$/;
+const COMPILED_STATE_DIGEST = /^sha256:[0-9a-f]{24}$/;
 const WORKSPACE_KEY = /^[0-9a-f]{24}$/;
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const ROOM_ID = /^rom_[A-Za-z0-9]+$/;
 const MEMBER_ID = /^(?:i|mem)_[A-Za-z0-9]+$/;
 const DOCKER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const MODEL_NAME = /^[A-Za-z0-9._/-]{1,100}$/;
-const FORBIDDEN_STATE_TEXT = /(?:snk_|sni_|rit_|member_token|api_key|invite|OPENAI_API_KEY|auth\.json|access_token|refresh_token|id_token|client_secret|\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{16,})/i;
+const FORBIDDEN_STATE_TEXT = /(?:\b(?:snk|sni|rit|clp|afk)_[A-Za-z0-9_-]{16,}\b|\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{16,}|(?:\\?")(?:access_token|refresh_token|id_token|client_secret|api_key|member_token)(?:\\?")\s*:\s*(?:\\?")[^"\\\r\n]{16,})/i;
 const FORBIDDEN_JWT = /(?:\bBearer\s+[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})/i;
 
 export type PrometheusStartupCheckpoint = (typeof STARTUP_CHECKPOINTS)[number];
@@ -388,7 +389,7 @@ function parseCandidate(value: unknown, source: string): PrometheusCandidateSumm
     source,
   );
   return {
-    compiled_digest: pattern(object.compiled_digest, HEX_SHA256, source),
+    compiled_digest: pattern(object.compiled_digest, COMPILED_STATE_DIGEST, source),
     work_id: pattern(object.work_id, SAFE_ID, source),
     result_ref: pattern(object.result_ref, SAFE_ID, source),
     revision_sha256: pattern(object.revision_sha256, HEX_SHA256, source),

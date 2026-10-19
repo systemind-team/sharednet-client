@@ -13,7 +13,7 @@ import { claimMonitor, prometheusPaths, readActiveRun, requestCancel, reserveAct
 import type { ProcessProbe } from "./process-identity.ts";
 
 const candidate = {
-  stateDigest: "a".repeat(64),
+  stateDigest: `sha256:${"a".repeat(24)}`,
   workId: "work-1",
   resultRef: "evt-1",
   artifacts: [],
@@ -125,9 +125,12 @@ function lifecycleDocker(team: PrometheusTeamState, calls: Array<{ args: readonl
 describe("Prometheus completion barrier", () => {
   it("reads every message page so late terminal receipts remain visible", async () => {
     const paths: string[] = [];
+    const controller = new AbortController();
+    const signals: Array<AbortSignal | undefined> = [];
     const client = {
-      request: async (_method: string, path: string) => {
+      request: async (_method: string, path: string, _credential: string, _body?: unknown, _headers?: Record<string, string>, signal?: AbortSignal) => {
         paths.push(path);
+        signals.push(signal);
         if (path.includes("after=0")) {
           return {
             items: Array.from({ length: 100 }, (_, index) => ({ sequence: index + 1, content: `message ${index + 1}` })),
@@ -141,7 +144,7 @@ describe("Prometheus completion barrier", () => {
       },
     };
 
-    const messages = await readPrometheusMessages(client as never, "rom_123", "token");
+    const messages = await readPrometheusMessages(client as never, "rom_123", "token", controller.signal);
 
     expect(messages).toHaveLength(101);
     expect(messages.at(-1)?.sequence).toBe(101);
@@ -149,6 +152,7 @@ describe("Prometheus completion barrier", () => {
       "/rooms/rom_123/messages?after=0&order=asc&limit=100",
       "/rooms/rom_123/messages?after=100&order=asc&limit=100",
     ]);
+    expect(signals).toEqual([controller.signal, controller.signal]);
   });
 
   it("requires candidate, all authenticated receipts, listening seats, and no handed work", () => {
@@ -307,7 +311,7 @@ describe("Prometheus lifecycle recovery", () => {
     const revision = "b".repeat(64);
     await writeRun(fixture.paths, {
       ...fixture.run,
-      candidate: { compiled_digest: "a".repeat(64), work_id: "work-1", result_ref: "evt-1", revision_sha256: revision, observed_at: "2026-10-18T00:01:00.000Z" },
+      candidate: { compiled_digest: `sha256:${"a".repeat(24)}`, work_id: "work-1", result_ref: "evt-1", revision_sha256: revision, observed_at: "2026-10-18T00:01:00.000Z" },
       updated_at: "2026-10-18T00:01:00.000Z",
     });
     await requestCancel(fixture.paths, fixture.run.run_id);
@@ -352,6 +356,33 @@ describe("Prometheus lifecycle recovery", () => {
 
     expect(result).toMatchObject({ outcome: "cancelled", startup_checkpoint: "reserved" });
     expect(connected).toBe(false);
+    expect(await readActiveRun(fixture.paths)).toBeNull();
+  });
+
+  it("aborts an in-flight Room request when cancellation is persisted", async () => {
+    const fixture = await lifecycleFixture("reserved", "2026-10-18T04:00:00.000Z");
+    let sawSignal = false;
+
+    const result = await resumePrometheusRun(fixture.workspace, {
+      env: fixture.env, cwd: fixture.workspace, now: () => new Date("2026-10-18T01:00:00.000Z"),
+      docker: lifecycleDocker(fixture.team, []), plan: { ...plan, workspace: fixture.workspace }, processProbe: fixture.probe,
+      connect: async () => ({
+        client: { request: async (_method: string, path: string, _credential: string, _body?: unknown, _headers?: Record<string, string>, signal?: AbortSignal) => {
+          if (path !== "/rooms") throw new Error(`unexpected request ${path}`);
+          sawSignal = signal instanceof AbortSignal;
+          await requestCancel(fixture.paths, fixture.run.run_id);
+          await new Promise<void>((resolve) => {
+            if (signal?.aborted) resolve();
+            else signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          throw new Error("request aborted");
+        } } as never,
+        memberToken: "member", apiKey: "api", baseUrl: "https://www.sharednet.ai",
+      }),
+    });
+
+    expect(sawSignal).toBe(true);
+    expect(result).toMatchObject({ outcome: "cancelled", startup_checkpoint: "reserved" });
     expect(await readActiveRun(fixture.paths)).toBeNull();
   });
 

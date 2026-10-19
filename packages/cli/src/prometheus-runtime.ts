@@ -459,6 +459,7 @@ export async function materializePrometheusArtifactSnapshot(
   client: Pick<ApiClient, "requestBytes">,
   memberToken: string,
   target: string,
+  signal?: AbortSignal,
 ): Promise<PrometheusArtifactSnapshot> {
   if (artifacts.length !== 1 || artifacts[0]?.name !== "submission") {
     throw localError("prometheus_artifact_snapshot_invalid", "Prometheus local v1 requires exactly one submission tar artifact.");
@@ -477,7 +478,7 @@ export async function materializePrometheusArtifactSnapshot(
   try {
     const manifestArtifacts: ArtifactSnapshotManifest["artifacts"] = [];
     for (const artifact of artifacts) {
-      const downloaded = await client.requestBytes(`/artifacts/${encodeURIComponent(artifact.artifactId)}/content`, memberToken);
+      const downloaded = await client.requestBytes(`/artifacts/${encodeURIComponent(artifact.artifactId)}/content`, memberToken, signal);
       const digest = createHash("sha256").update(downloaded.bytes).digest("hex");
       if (digest !== artifact.sha256 || (downloaded.sha256 !== null && downloaded.sha256 !== artifact.sha256)) {
         throw localError("prometheus_artifact_changed", `Artifact ${artifact.artifactId} does not match its compiled receipt.`);
