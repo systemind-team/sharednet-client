@@ -354,10 +354,22 @@
     "packages/cli/src/serve-service.test.ts",
     "docs/harness-modes.md",
     "docs/superpowers/plans/2026-10-16-harness-mode-registry.md",
+    "docs/plans/2026-10-18-prometheus-local-design.md",
+    "docs/superpowers/plans/2026-10-18-prometheus-local-v1.md",
     "packages/cli/src/harness-modes.ts",
     "packages/cli/src/harness-modes.test.ts",
     "packages/cli/src/goal-serve-demo.ts",
     "packages/cli/src/goal-serve-demo.test.ts",
-    "docs/superpowers/plans/2026-10-14-serve-goal-demo.md"
+    "docs/superpowers/plans/2026-10-14-serve-goal-demo.md",
+    "docs/prometheus-local.md",
+    "packages/cli/src/prometheus-protocol.ts",
+    "packages/cli/src/prometheus-protocol.test.ts",
+    "packages/cli/src/prometheus-state.ts",
+    "packages/cli/src/prometheus-state-race.test.ts",
+    "packages/cli/src/prometheus-state.test.ts",
+    "packages/cli/src/prometheus-runtime.ts",
+    "packages/cli/src/prometheus-runtime.test.ts",
+    "packages/cli/src/prometheus.ts",
+    "packages/cli/src/prometheus.test.ts"
   ]
 }

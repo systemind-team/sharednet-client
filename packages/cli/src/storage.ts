@@ -153,10 +153,16 @@ export function getStoragePaths(env: Environment = process.env): StoragePaths {
   };
 }
 
-async function ensureSecureDirectory(path: string): Promise<void> {
+/** Validate an existing owner-only directory without following a symlink. */
+export async function assertOwnerOnlyDirectory(path: string): Promise<boolean> {
   if (process.platform === "win32") unsafeStorage();
-  await mkdir(path, { recursive: true, mode: 0o700 });
-  const info = await lstat(path);
+  let info;
+  try {
+    info = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
   if (
     info.isSymbolicLink() ||
     !info.isDirectory() ||
@@ -165,9 +171,18 @@ async function ensureSecureDirectory(path: string): Promise<void> {
   ) {
     unsafeStorage();
   }
+  return true;
 }
 
-async function readSecureFile(path: string): Promise<string | null> {
+/** Ensure a directory is private to the current OS owner and is not a symlink. */
+export async function ensureOwnerOnlyDirectory(path: string): Promise<void> {
+  if (process.platform === "win32") unsafeStorage();
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  if (!(await assertOwnerOnlyDirectory(path))) unsafeStorage();
+}
+
+/** Read an owner-only regular file without following a symlink. */
+export async function readOwnerOnlyFile(path: string): Promise<string | null> {
   let info;
   try {
     info = await lstat(path);
@@ -188,7 +203,14 @@ async function readSecureFile(path: string): Promise<string | null> {
   let handle;
   try {
     const noFollow = "O_NOFOLLOW" in constants ? constants.O_NOFOLLOW : 0;
-    handle = await open(path, constants.O_RDONLY | noFollow);
+    try {
+      handle = await open(path, constants.O_RDONLY | noFollow);
+    } catch (error) {
+      // A concurrent owner may remove the file after lstat. That is the same
+      // observable state as a file which was absent at the initial lookup.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
     const openedInfo = await handle.stat();
     if (
       !openedInfo.isFile() ||
@@ -205,12 +227,13 @@ async function readSecureFile(path: string): Promise<string | null> {
   }
 }
 
-async function writeSecureJson(path: string, value: unknown): Promise<void> {
+/** Atomically replace an owner-only JSON file and durably sync its parent directory. */
+export async function writeOwnerOnlyJson(path: string, value: unknown): Promise<void> {
   const parent = dirname(path);
-  await ensureSecureDirectory(parent);
+  await ensureOwnerOnlyDirectory(parent);
 
   // Validate an existing target before an atomic replacement. Missing is fine.
-  await readSecureFile(path);
+  await readOwnerOnlyFile(path);
   const temp = join(parent, `.sharednet-${randomBytes(12).toString("hex")}.tmp`);
   let handle;
   try {
@@ -234,13 +257,14 @@ async function writeSecureJson(path: string, value: unknown): Promise<void> {
   }
 }
 
-async function createSecureJsonIfAbsent(path: string, value: unknown): Promise<boolean> {
+/** Atomically create a complete owner-only JSON file, returning false when it already exists. */
+export async function createOwnerOnlyJsonIfAbsent(path: string, value: unknown): Promise<boolean> {
   return createSecureTextIfAbsent(path, `${JSON.stringify(value)}\n`);
 }
 
 async function createSecureTextIfAbsent(path: string, text: string): Promise<boolean> {
   const parent = dirname(path);
-  await ensureSecureDirectory(parent);
+  await ensureOwnerOnlyDirectory(parent);
   const temp = join(parent, `.sharednet-${randomBytes(12).toString("hex")}.tmp`);
   let handle;
   try {
@@ -332,7 +356,7 @@ function parseSession(raw: string): StoredSession {
 export async function readStoredApiCredential(
   paths: StoragePaths,
 ): Promise<StoredApiCredential | null> {
-  const raw = await readSecureFile(paths.credentialsFile);
+  const raw = await readOwnerOnlyFile(paths.credentialsFile);
   return raw === null ? null : parseCredential(raw);
 }
 
@@ -341,7 +365,7 @@ export async function writeStoredApiCredential(
   paths: StoragePaths,
   credential: StoredApiCredential,
 ): Promise<void> {
-  await writeSecureJson(paths.credentialsFile, credential);
+  await writeOwnerOnlyJson(paths.credentialsFile, credential);
 }
 
 /**
@@ -353,7 +377,7 @@ export async function backupStoredApiCredential(
   paths: StoragePaths,
   now: Date,
 ): Promise<string | null> {
-  const raw = await readSecureFile(paths.credentialsFile);
+  const raw = await readOwnerOnlyFile(paths.credentialsFile);
   if (raw === null) return null;
   const stamp = now.toISOString().replace(/[:.]/g, "-");
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -369,7 +393,7 @@ export async function getOrCreateInstallationSecret(
   const credential = await readStoredApiCredential(paths);
   if (credential) return credential.installation_secret;
 
-  const raw = await readSecureFile(paths.installationFile);
+  const raw = await readOwnerOnlyFile(paths.installationFile);
   if (raw !== null) {
     const value = parseJsonObject(raw, "The installation file");
     if (value.schema_version !== 1) {
@@ -382,11 +406,11 @@ export async function getOrCreateInstallationSecret(
     schema_version: 1,
     installation_secret: randomBytes(32).toString("base64url"),
   };
-  if (await createSecureJsonIfAbsent(paths.installationFile, installation)) {
+  if (await createOwnerOnlyJsonIfAbsent(paths.installationFile, installation)) {
     return installation.installation_secret;
   }
 
-  const winnerRaw = await readSecureFile(paths.installationFile);
+  const winnerRaw = await readOwnerOnlyFile(paths.installationFile);
   if (winnerRaw === null) {
     throw localError("invalid_local_state", "The installation secret could not be created.");
   }
@@ -404,13 +428,13 @@ export async function writeSession(
   if (!/^i_[A-Za-z0-9_-]+$/.test(session.instance_id)) {
     throw localError("invalid_local_state", "The Instance ID is invalid.");
   }
-  await writeSecureJson(join(paths.sessionsDir, `${session.instance_id}.json`), session);
+  await writeOwnerOnlyJson(join(paths.sessionsDir, `${session.instance_id}.json`), session);
 }
 
 export async function listSessions(paths: StoragePaths): Promise<StoredSession[]> {
   let entries;
   try {
-    await ensureSecureDirectory(paths.sessionsDir);
+    await ensureOwnerOnlyDirectory(paths.sessionsDir);
     entries = await readdir(paths.sessionsDir, { withFileTypes: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
@@ -420,7 +444,7 @@ export async function listSessions(paths: StoragePaths): Promise<StoredSession[]
   for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
     if (!entry.name.endsWith(".json")) continue;
     if (!entry.isFile() || entry.isSymbolicLink()) unsafeStorage();
-    const raw = await readSecureFile(join(paths.sessionsDir, entry.name));
+    const raw = await readOwnerOnlyFile(join(paths.sessionsDir, entry.name));
     if (raw !== null) sessions.push(parseSession(raw));
   }
   return sessions;
@@ -433,14 +457,14 @@ export async function readSessionById(
   if (!/^i_[A-Za-z0-9_-]+$/.test(instanceId)) {
     throw localError("invalid_session_id", "The Instance ID is invalid.");
   }
-  const raw = await readSecureFile(join(paths.sessionsDir, `${instanceId}.json`));
+  const raw = await readOwnerOnlyFile(join(paths.sessionsDir, `${instanceId}.json`));
   return raw === null ? null : parseSession(raw);
 }
 
 export async function deleteSession(paths: StoragePaths, instanceId: string): Promise<void> {
   if (!/^i_[A-Za-z0-9_-]+$/.test(instanceId)) return;
   const path = join(paths.sessionsDir, `${instanceId}.json`);
-  const raw = await readSecureFile(path);
+  const raw = await readOwnerOnlyFile(path);
   if (raw === null) return;
   await unlink(path);
 }
@@ -488,7 +512,7 @@ export async function writeRoomCredential(
   paths: StoragePaths,
   credential: StoredRoomCredential,
 ): Promise<void> {
-  await writeSecureJson(
+  await writeOwnerOnlyJson(
     roomCredentialFile(paths, credential.room_id, credential.member_id),
     credential,
   );
@@ -499,7 +523,7 @@ export async function readRoomCredential(
   roomId: string,
   memberId: string,
 ): Promise<StoredRoomCredential | null> {
-  const raw = await readSecureFile(roomCredentialFile(paths, roomId, memberId));
+  const raw = await readOwnerOnlyFile(roomCredentialFile(paths, roomId, memberId));
   return raw === null ? null : parseRoomCredential(raw);
 }
 

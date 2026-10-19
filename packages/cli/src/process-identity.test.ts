@@ -4,13 +4,41 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import { identitySupportedOn, looksLikeServe, processAlive, statStartTime, systemProcessProbe } from "./process-identity.ts";
+import {
+  identitySupportedOn,
+  inspectProcessIdentity,
+  looksLikeServe,
+  processAlive,
+  statStartTime,
+  systemProcessProbe,
+  type ProcessProbe,
+} from "./process-identity.ts";
 
 const failing = (code: string) => () => {
   throw Object.assign(new Error(code), { code });
 };
 
 describe("is the process that wrote the lock still there", () => {
+  it("distinguishes the exact live process from a dead, reused, or unverifiable pid", () => {
+    const statuses = new Map<number, { alive: boolean; identity: string | null }>([
+      [10, { alive: true, identity: "same-start" }],
+      [11, { alive: false, identity: null }],
+      [12, { alive: true, identity: "new-start" }],
+      [13, { alive: true, identity: null }],
+    ]);
+    const probe: ProcessProbe = {
+      supported: true,
+      alive: (pid) => statuses.get(pid)?.alive ?? false,
+      identity: (pid) => statuses.get(pid)?.identity ?? null,
+      argv: () => null,
+    };
+
+    expect(inspectProcessIdentity(probe, { pid: 10, start_identity: "same-start" })).toBe("alive");
+    expect(inspectProcessIdentity(probe, { pid: 11, start_identity: "old-start" })).toBe("dead");
+    expect(inspectProcessIdentity(probe, { pid: 12, start_identity: "old-start" })).toBe("reused");
+    expect(inspectProcessIdentity(probe, { pid: 13, start_identity: "old-start" })).toBe("unknown");
+  });
+
   it("counts EPERM from signal 0 as alive (someone else's process), and only ESRCH or a bad pid as gone", () => {
     expect(processAlive(4242, () => true)).toBe(true);
     expect(processAlive(4242, failing("EPERM"))).toBe(true);

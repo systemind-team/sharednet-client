@@ -20,6 +20,7 @@ import type { ProcessProbe } from "./process-identity.ts";
 import type { WakeServiceControl } from "./serve-service.ts";
 import type { CheckOptions, CheckResult, SeatWake, TurnRunner } from "./wake-driver.ts";
 import { validTurnLimit } from "./wake-driver.ts";
+import { cancelPrometheusRun, prometheusStatus, resumePrometheusRun, startPrometheusRun } from "./prometheus.ts";
 
 
 type Environment = Record<string, string | undefined>;
@@ -135,6 +136,9 @@ const optionValueNames = new Set([
   "harness-mode",
   "kickoff",
   "type",
+  "model",
+  "check",
+  "timeout",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate"]);
 
@@ -881,9 +885,111 @@ async function execute(
   if (resource === "goal") {
     return goalCommand(action, commandArgs, globals, dependencies);
   }
+  if (resource === "prometheus") {
+    const parsed = parseArguments(commandArgs);
+    const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
+    if (action === "status") {
+      assertPositionals(parsed, 0);
+      assertOnlyOptions(parsed, ["workspace"]);
+      const local = await prometheusStatus(workspace, dependencies.env);
+      if (!local.run || !local.team) return local;
+      try {
+        const docker = dependencies.docker ?? dockerRunner(dependencies.env);
+        const cliEntry = dependencies.cliEntry ?? realpathSync(process.argv[1]!);
+        const plan = await prepareRun({ agents: (["coordinator", "builder", "reviewer"] as const).map((name) => ({ name, driver: "codex" as const, model: local.run!.configuration.model })), image: null, workspace, env: dependencies.env, home: dependencies.env.HOME ?? homedir(), entry: cliEntry }, docker, dependencies.stderr);
+        let connection: Awaited<ReturnType<NonNullable<Parameters<typeof resumePrometheusRun>[1]["connect"]>>> | undefined;
+        return prometheusStatus(workspace, dependencies.env, {
+          docker, plan,
+          ...(dependencies.processProbe ? { processProbe: dependencies.processProbe } : {}),
+          connect: async () => {
+            if (connection) return connection;
+            const baseUrl = resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL);
+            const apiKey = await resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), baseUrl);
+            connection = await withSelectedSession(globals, dependencies, async (client, session) => ({ client, memberToken: session.instance_token, apiKey, baseUrl }));
+            return connection;
+          },
+        });
+      } catch (error) {
+        const failure = asCliError(error);
+        return { ...local, live: { available: false, error: { code: failure.code, message: failure.message } } };
+      }
+    }
+    if (action === "cancel") {
+      assertPositionals(parsed, 0);
+      assertOnlyOptions(parsed, ["workspace"]);
+      let connection: Awaited<ReturnType<NonNullable<Parameters<typeof resumePrometheusRun>[1]["connect"]>>> | undefined;
+      return cancelPrometheusRun(workspace, {
+        env: dependencies.env, cwd: dependencies.cwd, now: dependencies.now,
+        ...(dependencies.processProbe ? { processProbe: dependencies.processProbe } : {}),
+        connect: async () => {
+          if (connection) return connection;
+          const baseUrl = resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL);
+          const apiKey = await resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), baseUrl);
+          connection = await withSelectedSession(globals, dependencies, async (client, session) => ({ client, memberToken: session.instance_token, apiKey, baseUrl }));
+          return connection;
+        },
+      });
+    }
+    if (action === "resume") {
+      assertPositionals(parsed, 0);
+      assertOnlyOptions(parsed, ["workspace"]);
+      const status = await prometheusStatus(workspace, dependencies.env);
+      const model = status.run?.configuration.model ?? "gpt-6-sol";
+      const docker = dependencies.docker ?? dockerRunner(dependencies.env);
+      const cliEntry = dependencies.cliEntry ?? realpathSync(process.argv[1]!);
+      let connection: Awaited<ReturnType<NonNullable<Parameters<typeof resumePrometheusRun>[1]["connect"]>>> | undefined;
+      return resumePrometheusRun(workspace, {
+        env: dependencies.env, cwd: dependencies.cwd, now: dependencies.now, docker,
+        ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
+        ...(dependencies.processProbe ? { processProbe: dependencies.processProbe } : {}),
+        preparePlan: () => prepareRun({ agents: (["coordinator", "builder", "reviewer"] as const).map((name) => ({ name, driver: "codex" as const, model })), image: null, workspace, env: dependencies.env, home: dependencies.env.HOME ?? homedir(), entry: cliEntry }, docker, dependencies.stderr),
+        connect: async () => {
+          if (connection) return connection;
+          const baseUrl = resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL);
+          const apiKey = await resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), baseUrl);
+          connection = await withSelectedSession(globals, dependencies, async (client, session) => ({ client, memberToken: session.instance_token, apiKey, baseUrl }));
+          return connection;
+        },
+      });
+    }
+    if (action === "run") {
+      assertPositionals(parsed, 1);
+      assertOnlyOptions(parsed, ["workspace", "model", "check", "timeout"]);
+      const model = requiredOption(parsed, "model");
+      const check = requiredOption(parsed, "check");
+      const timeoutMs = parseDuration(requiredOption(parsed, "timeout"), "--timeout");
+      const docker = dependencies.docker ?? dockerRunner(dependencies.env);
+      const cliEntry = dependencies.cliEntry ?? realpathSync(process.argv[1]!);
+      let connection: Awaited<ReturnType<NonNullable<Parameters<typeof startPrometheusRun>[1]["connect"]>>> | undefined;
+      return startPrometheusRun({ workspace, goalPath: parsed.positionals[0]!, model, check, timeoutMs }, {
+        env: dependencies.env,
+        cwd: dependencies.cwd,
+        now: dependencies.now,
+        docker,
+        ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
+        ...(dependencies.processProbe ? { processProbe: dependencies.processProbe } : {}),
+        preparePlan: () => prepareRun({
+          agents: (["coordinator", "builder", "reviewer"] as const).map((name) => ({ name, driver: "codex" as const, model })),
+          image: null,
+          workspace,
+          env: dependencies.env,
+          home: dependencies.env.HOME ?? homedir(),
+          entry: cliEntry,
+        }, docker, dependencies.stderr),
+        connect: async () => {
+          if (connection) return connection;
+          const baseUrl = resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL);
+          const apiKey = await resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), baseUrl);
+          connection = await withSelectedSession(globals, dependencies, async (client, session) => ({ client, memberToken: session.instance_token, apiKey, baseUrl }));
+          return connection;
+        },
+      });
+    }
+    throw localError("unknown_command", "Use sharednet prometheus run|status|resume|cancel.");
+  }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/ack/watch/handed/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/serve-demo/watch/export, and decision list/approve/deny.",
+    "Use login, whoami, join/say/read/wait/ack/watch/handed/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/serve-demo/watch/export, prometheus run/status/resume/cancel, and decision list/approve/deny.",
   );
 }
 

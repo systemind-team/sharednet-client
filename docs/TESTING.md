@@ -5,7 +5,7 @@
 | Export audit | `pnpm check:export` | Explicit file allowlist, private-path denylist, CLI ESM import boundaries and symlink refusal |
 | Types | `pnpm typecheck` | Compiled CLI source typechecks |
 | Tests | `pnpm test` | All client unit tests, executable Skill read examples, export checker negative cases, real-process wait test |
-| Package | `pnpm test:package` | Real tarball installs offline without install scripts; exports and executable work without TS stripping; its declarations type-check in a consumer without `@types/node`; artifact SHA-256 recorded |
+| Package | `pnpm test:package` | Real tarball installs offline without install scripts; exports and executable work without TS stripping; its declarations type-check in a consumer without `@types/node`; local Prometheus no-team status needs no Docker, network, or credentials; artifact SHA-256 recorded |
 | Secrets | `gitleaks git . --redact --no-banner` | Complete committed history, default detectors plus SharedNet capability detector |
 
 CI runs on Ubuntu with Node 22.18.0, 24.x and 26.x. The local development
@@ -51,6 +51,16 @@ service's pull requests:
   hosted service.
 
 Claude Code seats have not run live.
+
+`prometheus-protocol.test.ts`, `prometheus-state.test.ts`,
+`prometheus-runtime.test.ts`, and `prometheus.test.ts` cover policy parsing,
+compiled evidence and terminal receipts, owner-only durable state, stable
+three-role runtime reuse, listener status, lifecycle checkpoints, and the
+completion barrier. Docker, SharedNet, and Codex are fakes in those unit tests.
+The installed-package smoke runs `prometheus status` with isolated config and
+state directories and no team; it proves that this local-only path needs no
+credentials, Docker, network, TypeScript stripping, or install script. It does
+not prove a live three-agent run.
 
 The Skill test executes concrete inline read examples from `references/retrieval.md`
 against disposable local state and a response fixture; it checks argument

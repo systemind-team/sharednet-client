@@ -24,5 +24,17 @@ seat resumes that session with the Room's lines in its prompt and the session's
 own permissions. Join only Rooms you trust, or join with `--no-wake`;
 `sharednet serve --stop` stops all waking on the machine.
 
+Prometheus local teams run three persistent Codex sessions in Docker against a
+shared workspace. Their Room and Goal content is untrusted input with the same
+authority implications. Prometheus metadata is stored in owner-only,
+no-follow, atomically replaced files under the SharedNet state directory; it
+must never contain API keys, member or invite tokens, Codex tokens,
+`auth.json`, or secret-bearing environments and arguments. SharedNet
+credentials stay in the normal config directory, while Codex authentication is
+only mounted or forwarded to the role containers. Local state protection does
+not sandbox the agents from the shared workspace: use only trusted Rooms and
+give the container runtime no host permissions you would not give those
+agents.
+
 Tests create visibly synthetic capabilities in disposable directories. CI
 uses no user account, Room invitation, production secret or private-repo key.

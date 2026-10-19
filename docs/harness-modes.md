@@ -58,7 +58,8 @@ implementation cannot silently redefine `@1`.
 
 ## Serve-backed runtime modes available in this build
 
-The runtime family describes the serve-backed runner developed in PR #48. Its
+The runtime family reserves names for the serve-backed runner first developed
+in PR #48. Its
 three agents each own a production `sharednet serve` listener and persistent
 Codex thread; the runner provisions the Room and containers, observes the run,
 checks the result, and exports evidence.
