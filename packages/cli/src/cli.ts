@@ -133,6 +133,9 @@ const optionValueNames = new Set([
   "turn-limit",
   "message-routing",
   "harness-mode",
+  "initiation-policy",
+  "termination-policy",
+  "policy-seed",
   "kickoff",
   "type",
 ]);
@@ -597,9 +600,37 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "harness-mode"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "initiation-policy", "termination-policy", "policy-seed"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
+  const rawInitiationPolicy = option(parsed, "initiation-policy") ?? "all";
+  if (rawInitiationPolicy !== "all" && rawInitiationPolicy !== "random-single") {
+    throw localError("invalid_arguments", "--initiation-policy must be all or random-single.");
+  }
+  const initiationPolicy = rawInitiationPolicy;
+  const rawTerminationPolicy = option(parsed, "termination-policy") ?? "first";
+  if (rawTerminationPolicy !== "first" && rawTerminationPolicy !== "all-agents") {
+    throw localError("invalid_arguments", "--termination-policy must be first or all-agents.");
+  }
+  const terminationPolicy = rawTerminationPolicy;
+  const rawPolicySeed = option(parsed, "policy-seed");
+  let policySeed: number | undefined;
+  if (rawPolicySeed !== undefined) {
+    policySeed = Number(rawPolicySeed);
+    if (!/^\d+$/.test(rawPolicySeed) || !Number.isInteger(policySeed) || policySeed < 0 || policySeed > 0xffff_ffff) {
+      throw localError("invalid_arguments", "--policy-seed must be a uint32 value.");
+    }
+  }
+  if (initiationPolicy === "random-single" && policySeed === undefined) {
+    throw localError("invalid_arguments", "--initiation-policy random-single requires --policy-seed with a uint32 value.");
+  }
+  if (initiationPolicy === "all" && policySeed !== undefined) {
+    throw localError("invalid_arguments", "--policy-seed is only valid with --initiation-policy random-single.");
+  }
+  const policyFlags = ["initiation-policy", "termination-policy", "policy-seed"];
+  if (namedMode !== undefined && policyFlags.some((name) => parsed.options.has(name))) {
+    throw localError("invalid_arguments", "--harness-mode fixes the initiation and termination policy; do not combine it with policy flags.");
+  }
   if (namedMode !== undefined && ["mention-gate", "task-gate", "message-routing"].some((name) => parsed.options.has(name))) {
     throw localError("invalid_arguments", "--harness-mode fixes the gate and routing controls; do not combine it with --mention-gate, --task-gate, or --message-routing.");
   }
@@ -623,7 +654,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--initiation-policy all|random-single] [--termination-policy first|all-agents] [--policy-seed <uint32>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
@@ -647,8 +678,14 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (turnLimitMs !== undefined && turnLimitMs < 60_000) {
     throw localError("invalid_arguments", "--turn-limit is at least 1m.");
   }
-  const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
   const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime(), { budget: true });
+  if (terminationPolicy === "all-agents" && !until.triggers.some((trigger) => trigger.kind === "said")) {
+    throw localError("invalid_arguments", "--termination-policy all-agents requires at least one said end condition.");
+  }
+  if (terminationPolicy === "all-agents" && until.triggers.some((trigger) => trigger.kind === "message" || trigger.kind === "mention")) {
+    throw localError("invalid_arguments", "--termination-policy all-agents does not accept message or mention end conditions because they bypass the completion quorum.");
+  }
+  const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
   const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
   if (!(await stat(workspace).then((entry) => entry.isDirectory(), () => false))) {
     throw localError("invalid_arguments", `--workspace ${workspace} is not a directory.`);
@@ -717,6 +754,9 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           quietChecks: parsed.options.get("quiet-checks") === true,
           mentionGate,
           taskGate,
+          initiationPolicy,
+          terminationPolicy,
+          ...(policySeed === undefined ? {} : { policySeed }),
           ...(messageRouting ? { messageRouting } : {}),
           ...(harnessMode ? { harnessMode } : {}),
           ...(codeProvenance ? { codeProvenance } : {}),
