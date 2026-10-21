@@ -197,6 +197,22 @@ describe("a turn", () => {
     expect(opening).not.toContain("Agree in the Room who does what");
   });
 
+  it("tells every Agent about the all-Agent completion barrier and reset rule", () => {
+    const seats = parseAgents(["codex", "claude-code"]);
+    const opening = openingPrompt({
+      seat: seats[0]!,
+      seats,
+      roomId: ROOM,
+      goal: "Make the tests pass.",
+      goalSequence: 1,
+      until: ["check pytest -q", "said /^DONE$/", "after 1h"],
+      terminationPolicy: "all-agents",
+    });
+    expect(opening).toContain("Completion requires a matching claim from every Agent");
+    expect(opening).toContain("every Agent must confirm again after repair");
+    expect(opening).not.toContain("Room ends when the first");
+  });
+
   it("forwards only a development service on this machine's loopback into the container", () => {
     expect(loopbackPort("http://127.0.0.1:3117")).toBe(3117);
     expect(loopbackPort("https://www.sharednet.ai")).toBeNull();
@@ -528,6 +544,9 @@ describe("runGoal", () => {
         quietChecks: false,
         ...(harnessMode ? {
           harnessMode,
+          // The CLI passes canonical defaults after it rejects explicit policy flags.
+          initiationPolicy: "all" as const,
+          terminationPolicy: "first" as const,
         } : {}),
       },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
@@ -680,7 +699,247 @@ describe("runGoal", () => {
       });
     }
   });
+
+  async function runInitiationPolicy(
+    policy: "default" | "random-single",
+    seed = 0,
+    terminationPolicy: "first" | "all-agents" = "first",
+  ) {
+    const out = await temporary();
+    const workspace = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents(["codex:gpt-test", "codex:gpt-test", "codex:gpt-test"]),
+      workspace,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "api-key" },
+      claudeAuth: null,
+    };
+    const members = new Map([
+      ["codex-1", "i_CodexOne01"],
+      ["codex-2", "i_CodexTwo02"],
+      ["codex-3", "i_CodexThree3"],
+    ]);
+    const names = new Map([...members].map(([name, member]) => [member, name]));
+    const prompts: Array<{ seat: string; prompt: string }> = [];
+    const waits = new Map<string, number>();
+    const { docker } = fakeDocker((_call, command) => {
+      const member = _call.args.find((arg) => arg.startsWith("SHAREDNET_SEAT="))?.slice("SHAREDNET_SEAT=".length) ?? null;
+      if (command[0] === "sharednet" && command[1] === "join") {
+        const name = command[command.indexOf("--name") + 1]!;
+        return { stdout: JSON.stringify({ member_id: members.get(name) }) };
+      }
+      if (command[0] === "sharednet" && command[1] === "wait") {
+        const count = (waits.get(member!) ?? 0) + 1;
+        waits.set(member!, count);
+        if (count === 1) {
+          return {
+            stdout: JSON.stringify({
+              wake_id: `wk_${member}`,
+              fired: ["message"],
+              from: 1,
+              through: 2,
+              events: [],
+              messages: [{ sequence: 2, content: "First delivered wake.", sender: { member_id: "i_owner", name: "owner" } }],
+            }),
+          };
+        }
+        return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 2, through: 2, events: [{ kind: "closed" }], messages: [] }) };
+      }
+      if (command[2] === "codex") {
+        const name = names.get(member!)!;
+        prompts.push({ seat: name, prompt: command.at(-1)! });
+        const resumed = command[4] === "resume";
+        return {
+          lines: [
+            ...(resumed ? [] : [JSON.stringify({ type: "thread.started", thread_id: `thread-${member}` })]),
+            JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } }),
+          ],
+        };
+      }
+      return {};
+    });
+    const goal = {
+      message_id: "msg_goal000001",
+      sequence: 1,
+      until: ["said FINISH", "after 1h"],
+      started_at: "2026-10-21T00:00:00.000Z",
+      ended_by: null,
+    };
+    let finishDelivered = 0;
+    let closeCount = 0;
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) {
+          return { room: { id: ROOM, type: "board", state: "open", goal }, memberships: [] };
+        }
+        if (method === "GET" && path.startsWith(`/rooms/${ROOM}/wait?`)) {
+          while (new Set(prompts.map((entry) => entry.seat)).size < 3 || prompts.length < 4) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+          }
+          if (terminationPolicy === "all-agents") {
+            const sender_instance_id = [...members.values()][finishDelivered];
+            if (!sender_instance_id) return { items: [] };
+            finishDelivered += 1;
+            return { items: [{ sequence: finishDelivered + 2, content: "FINISH", sender_instance_id }] };
+          }
+          if (finishDelivered > 0) return { items: [] };
+          finishDelivered = 1;
+          return { items: [{ sequence: 3, content: "FINISH", sender_instance_id: "i_owner" }] };
+        }
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) {
+          if (terminationPolicy === "all-agents" && finishDelivered < members.size) throw new Error("all-agents closed before every claim arrived");
+          closeCount += 1;
+          return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: "2026-10-21T00:01:00.000Z" } } } };
+        }
+        throw new Error(`unexpected ${method} ${path}`);
+      },
+    } as unknown as ApiClient;
+    let tick = Date.parse("2026-10-21T00:00:00.000Z");
+    const policyOptions = policy === "random-single"
+      ? { initiationPolicy: "random-single" as const, terminationPolicy, policySeed: seed }
+      : { terminationPolicy };
+    await runGoal(
+      client,
+      "sni_owner-seat",
+      OWNER_KEY,
+      {
+        plan,
+        roomType: "board",
+        roomId: ROOM,
+        inviteToken: INVITE,
+        goal: "Implement the parser.\n",
+        goalSequence: 1,
+        until: goal.until,
+        baseUrl: "https://www.sharednet.ai",
+        out,
+        checkEveryMs: 60_000,
+        quietChecks: true,
+        codeProvenance: {
+          clientCommit: "1".repeat(40),
+          runnerCommit: "1".repeat(40),
+          sourceWorktreeDirty: false,
+          packageVersion: "0.1.17-test",
+          packageManifestSha256: "2".repeat(64),
+          entrySha256: "3".repeat(64),
+          codeTreeSha256: "4".repeat(64),
+        },
+        ...policyOptions,
+      },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
+    );
+    const firstPrompts = new Map<string, string>();
+    for (const entry of prompts) if (!firstPrompts.has(entry.seat)) firstPrompts.set(entry.seat, entry.prompt);
+    return {
+      out,
+      firstPrompts,
+      episode: JSON.parse(await readFile(join(out, "episode.json"), "utf8")),
+      policy: (await readFile(join(out, "policy.ndjson"), "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)),
+      closeCount,
+    };
+  }
+
+  it.each([
+    ["all", "first"],
+    ["random-single", "first"],
+    ["all", "all-agents"],
+    ["random-single", "all-agents"],
+  ] as const)("runs the %s × %s arm through fake Docker and service end to end", async (initiationPolicy, terminationPolicy) => {
+    const run = await runInitiationPolicy(initiationPolicy === "all" ? "default" : "random-single", 20261021, terminationPolicy);
+    expect(run.episode).toMatchObject({
+      initiation_policy: initiationPolicy,
+      termination_policy: terminationPolicy,
+      ended_by: { trigger: "said FINISH" },
+      policy_seed: initiationPolicy === "random-single" ? 20261021 : null,
+      completion_required_agent_member_ids: terminationPolicy === "all-agents" ? [...membersForPolicyTest().values()] : [],
+      completion_confirmed_agent_member_ids: terminationPolicy === "all-agents" ? [...membersForPolicyTest().values()] : [],
+      completion_reset_count: 0,
+    });
+    if (initiationPolicy === "random-single") {
+      expect(run.episode.starter).toMatch(/^codex-/);
+      expect(run.episode.starter_member_id).toBe(membersForStarter(run.episode.starter));
+    } else {
+      expect(run.episode).toMatchObject({ starter: null, starter_member_id: null });
+    }
+    expect(run.closeCount).toBe(1);
+    const starts = run.policy.filter((event: { type?: string }) => event.type === "agent_started");
+    expect(starts).toHaveLength(3);
+    expect(starts.filter((event: { reason?: string }) => event.reason === "initial")).toHaveLength(initiationPolicy === "all" ? 3 : 1);
+    expect(starts.filter((event: { reason?: string }) => event.reason === "wake")).toHaveLength(initiationPolicy === "all" ? 0 : 2);
+    const immediatePrompts = [...run.firstPrompts.values()].filter((prompt) => prompt.includes("<goal>") && !prompt.includes("First delivered wake."));
+    expect(immediatePrompts).toHaveLength(initiationPolicy === "all" ? 3 : 1);
+    expect(run.policy.filter((event: { type?: string }) => event.type === "starter_selected")).toHaveLength(initiationPolicy === "random-single" ? 1 : 0);
+    expect(run.policy.filter((event: { type?: string }) => event.type === "completion_confirmed")).toHaveLength(terminationPolicy === "all-agents" ? 3 : 0);
+    expect(run.policy.filter((event: { type?: string }) => event.type === "completion_quorum")).toHaveLength(terminationPolicy === "all-agents" ? 1 : 0);
+  });
+
+  it("keeps all and first as the recorded defaults, with every Agent starting immediately", async () => {
+    const run = await runInitiationPolicy("default");
+    expect([...run.firstPrompts.values()].filter((prompt) => prompt.includes("<goal>") && !prompt.includes("First delivered wake."))).toHaveLength(3);
+    expect(run.episode).toMatchObject({
+      initiation_policy: "all",
+      termination_policy: "first",
+      policy_seed: null,
+      starter: null,
+    });
+  });
+
+  it("selects one reproducible starter and gives each dormant Agent the goal with its first wake", async () => {
+    const first = await runInitiationPolicy("random-single", 20261021);
+    const repeated = await runInitiationPolicy("random-single", 20261021);
+    const immediate = [...first.firstPrompts].filter(([, prompt]) => prompt.includes("<goal>") && !prompt.includes("First delivered wake."));
+    expect(immediate).toHaveLength(1);
+    const starter = immediate[0]![0];
+    expect(
+      [...first.firstPrompts]
+        .filter(([seat]) => seat !== starter)
+        .every(([, prompt]) => prompt.includes("<goal>\nImplement the parser.\n</goal>") && prompt.includes("#2 owner: First delivered wake.")),
+    ).toBe(true);
+    expect(
+      [...repeated.firstPrompts].find(([, prompt]) => prompt.includes("<goal>") && !prompt.includes("First delivered wake."))?.[0],
+    ).toBe(starter);
+  });
+
+  it("records the selected policies, seed, and starter in the episode", async () => {
+    const run = await runInitiationPolicy("random-single", 20261021);
+    const starter = [...run.firstPrompts].find(([, prompt]) => prompt.includes("<goal>") && !prompt.includes("First delivered wake."))![0];
+    expect(run.episode).toMatchObject({
+      initiation_policy: "random-single",
+      termination_policy: "first",
+      policy_seed: 20261021,
+      starter,
+    });
+  });
+
+  it("writes reproducible starter-selection evidence with the selected member identity", async () => {
+    const run = await runInitiationPolicy("random-single", 20261021);
+    const starter = [...run.firstPrompts].find(([, prompt]) => prompt.includes("<goal>") && !prompt.includes("First delivered wake."))![0];
+    const policy = (await readFile(join(run.out, "policy.ndjson"), "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(policy).toContainEqual(expect.objectContaining({
+      type: "starter_selected",
+      at: expect.stringMatching(/^2026-10-21T/),
+      initiation_policy: "random-single",
+      policy_seed: 20261021,
+      starter,
+      member_id: membersForStarter(starter),
+    }));
+  });
 });
+
+function membersForStarter(starter: string): string {
+  return membersForPolicyTest().get(starter)!;
+}
+
+function membersForPolicyTest(): Map<string, string> {
+  return new Map([
+    ["codex-1", "i_CodexOne01"],
+    ["codex-2", "i_CodexTwo02"],
+    ["codex-3", "i_CodexThree3"],
+  ]);
+}
 
 describe("a check", () => {
   it("runs in the checks' own container, on the shared workspace, under no Agent's home", async () => {

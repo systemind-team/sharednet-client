@@ -14,6 +14,8 @@ const ROOM = "rom_AbCdEfGhIj";
 const HUMAN = "i_HumanSeat01";
 const RUNNER = "i_RunnerSeat1";
 const AGENT = "i_AgentSeat01";
+const AGENT_TWO = "i_AgentSeat02";
+const UNKNOWN_AGENT = "i_UnknownSeat1";
 
 const cleanup: string[] = [];
 afterEach(async () => {
@@ -70,6 +72,7 @@ function fakeRoom(options: {
   states?: Array<{ state: "open" | "closed"; ended_by?: { trigger: string; at: string; detail: string | null } | null } | CliError>;
   /** Errors the close answers with, in turn, before it succeeds. */
   closes?: CliError[];
+  memberships?: Array<{ member_id: string; name: string; runtime_kind: string }>;
 }) {
   const calls: Call[] = [];
   const pages = [...options.pages];
@@ -84,7 +87,7 @@ function fakeRoom(options: {
         if (state instanceof CliError) throw state;
         return {
           room: { id: ROOM, state: state.state, goal: { ...goal, ended_by: state.ended_by ?? null } },
-          memberships: [
+          memberships: options.memberships ?? [
             { member_id: HUMAN, name: "Ada Lovelace", runtime_kind: "human" },
             { member_id: AGENT, name: "codex", runtime_kind: "codex" },
           ],
@@ -118,6 +121,256 @@ function clock(start = Date.parse("2026-10-05T12:00:00.000Z"), step = 5_000) {
 }
 
 describe("goal watch", () => {
+  it("keeps legacy first-completion semantics when terminationPolicy is first", async () => {
+    const out = await temporary();
+    const { client } = fakeRoom({
+      until: ["said /^DONE$/", "after 2h"],
+      pages: [[{ sequence: 2, content: "DONE", sender: AGENT }]],
+    });
+    const result = await goalWatch(client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: out,
+      out,
+      checkEveryMs: 60_000,
+      quietChecks: true,
+      terminationPolicy: "first",
+      agentMemberIds: [AGENT, AGENT_TWO],
+    }, {
+      now: clock(),
+      sleep: async () => undefined,
+      snapshot: null,
+    });
+    expect(result).toMatchObject({ messages: 1, ended_by: { trigger: "said /^DONE$/", detail: "DONE" } });
+  });
+
+  it.each(["message", "mention"])("rejects %s as an all-Agent end condition because it bypasses quorum", async (bypass) => {
+    const out = await temporary();
+    const { client } = fakeRoom({ until: ["said /^DONE$/", bypass, "after 2h"], pages: [] });
+    await expect(goalWatch(client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: out,
+      out,
+      checkEveryMs: 60_000,
+      quietChecks: true,
+      terminationPolicy: "all-agents",
+      agentMemberIds: [AGENT, AGENT_TWO],
+    }, {
+      now: clock(),
+      sleep: async () => undefined,
+      snapshot: null,
+    })).rejects.toMatchObject({ code: "invalid_arguments" });
+  });
+
+  it("counts one exact completion per supplied Agent and ignores duplicates or other senders", async () => {
+    const out = await temporary();
+    const { client, calls } = fakeRoom({
+      until: ["said /^DONE$/", "after 2h"],
+      memberships: [
+        { member_id: HUMAN, name: "Ada Lovelace", runtime_kind: "human" },
+        { member_id: RUNNER, name: "goal runner", runtime_kind: "runner" },
+        { member_id: AGENT, name: "codex", runtime_kind: "codex" },
+        { member_id: AGENT_TWO, name: "claude", runtime_kind: "claude-code" },
+        { member_id: UNKNOWN_AGENT, name: "extra agent", runtime_kind: "codex" },
+      ],
+      pages: [
+        [{ sequence: 2, content: "DONE", sender: HUMAN }],
+        [{ sequence: 3, content: "DONE", sender: RUNNER }],
+        [{ sequence: 4, content: "DONE", sender: UNKNOWN_AGENT }],
+        [{ sequence: 5, content: "DONE", sender: AGENT }],
+        [{ sequence: 6, content: "DONE", sender: AGENT }],
+        [{ sequence: 7, content: "DONE", sender: AGENT_TWO }],
+      ],
+    });
+    const result = await goalWatch(client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: out,
+      out,
+      checkEveryMs: 60_000,
+      quietChecks: true,
+      terminationPolicy: "all-agents",
+      agentMemberIds: [AGENT, AGENT_TWO],
+    }, {
+      now: clock(),
+      sleep: async () => undefined,
+      snapshot: null,
+    });
+    expect(result).toMatchObject({ messages: 6, ended_by: { trigger: "said /^DONE$/", detail: "DONE" } });
+    expect(calls.filter((call) => call.path.includes("/wait?")).length).toBe(6);
+    const policy = (await readFile(join(out, "policy.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(policy.filter((event) => event.type === "completion_ignored")).toHaveLength(3);
+    expect(policy.filter((event) => event.type === "completion_duplicate_ignored")).toHaveLength(1);
+    expect(policy.filter((event) => event.type === "completion_confirmed")).toHaveLength(2);
+    expect(policy.filter((event) => event.type === "completion_quorum")).toHaveLength(1);
+  });
+
+  it("does not let a scheduled passing check bypass the all-Agent quorum", async () => {
+    const out = await temporary();
+    const { client } = fakeRoom({
+      until: ["said /^DONE$/", "check make test", "after 2h"],
+      pages: [
+        [{ sequence: 2, content: "DONE", sender: AGENT }],
+        [{ sequence: 3, content: "DONE", sender: AGENT_TWO }],
+      ],
+    });
+    const result = await goalWatch(client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: out,
+      out,
+      checkEveryMs: 3_600_000,
+      quietChecks: true,
+      terminationPolicy: "all-agents",
+      agentMemberIds: [AGENT, AGENT_TWO],
+    }, {
+      now: clock(),
+      sleep: async () => undefined,
+      check: async () => ({ exitCode: 0, output: "all pass" }),
+      snapshot: null,
+    });
+    expect(result).toMatchObject({ messages: 2, ended_by: { trigger: "check make test", detail: "all pass" } });
+  });
+
+  it("clears confirmations after a failed quorum check so every Agent must confirm again", async () => {
+    const out = await temporary();
+    const { client } = fakeRoom({
+      until: ["said /^DONE$/", "check make test", "after 2h"],
+      pages: [
+        [{ sequence: 2, content: "DONE", sender: AGENT }],
+        [{ sequence: 3, content: "DONE", sender: AGENT_TWO }],
+        [{ sequence: 4, content: "DONE", sender: AGENT }],
+        [{ sequence: 5, content: "DONE", sender: AGENT_TWO }],
+      ],
+    });
+    const outcomes = [
+      { exitCode: 1, output: "initial failure" },
+      { exitCode: 1, output: "quorum failure" },
+      { exitCode: 0, output: "after reset pass" },
+    ];
+    const result = await goalWatch(client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: out,
+      out,
+      checkEveryMs: 3_600_000,
+      quietChecks: true,
+      terminationPolicy: "all-agents",
+      agentMemberIds: [AGENT, AGENT_TWO],
+    }, {
+      now: clock(),
+      sleep: async () => undefined,
+      check: async () => outcomes.shift() ?? { exitCode: 1, output: "unexpected extra check" },
+      snapshot: null,
+    });
+    expect(result).toMatchObject({ messages: 4, checks: 3, ended_by: { trigger: "check make test", detail: "after reset pass" } });
+    const policy = (await readFile(join(out, "policy.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(policy.filter((event) => event.type === "completion_confirmed")).toHaveLength(4);
+    expect(policy).toContainEqual(expect.objectContaining({ type: "completion_reset_after_check_failure", reset_count: 1 }));
+    const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
+    expect(episode).toMatchObject({
+      termination_policy: "all-agents",
+      completion_required_agent_member_ids: [AGENT, AGENT_TWO],
+      completion_confirmed_agent_member_ids: [AGENT, AGENT_TWO],
+      completion_reset_count: 1,
+    });
+  });
+
+  it("keeps after and at as hard bounds when the all-Agent quorum is incomplete", async () => {
+    const afterOut = await temporary();
+    const afterRoom = fakeRoom({ until: ["said /^DONE$/", "after 1s"], pages: [] });
+    const afterResult = await goalWatch(afterRoom.client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: afterOut,
+      out: afterOut,
+      checkEveryMs: 60_000,
+      quietChecks: true,
+      terminationPolicy: "all-agents",
+      agentMemberIds: [AGENT, AGENT_TWO],
+    }, {
+      now: clock(Date.parse("2026-10-05T12:00:00.000Z"), 2_000),
+      sleep: async () => undefined,
+      snapshot: null,
+    });
+    expect(afterResult.ended_by).toMatchObject({ trigger: "after 1s" });
+
+    const atOut = await temporary();
+    const atRoom = fakeRoom({ until: ["said /^DONE$/", "at 2026-10-05T12:00:01.000Z"], pages: [] });
+    const atResult = await goalWatch(atRoom.client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: atOut,
+      out: atOut,
+      checkEveryMs: 60_000,
+      quietChecks: true,
+      terminationPolicy: "all-agents",
+      agentMemberIds: [AGENT, AGENT_TWO],
+    }, {
+      now: clock(Date.parse("2026-10-05T12:00:00.000Z"), 2_000),
+      sleep: async () => undefined,
+      snapshot: null,
+    });
+    expect(atResult.ended_by?.trigger).toMatch(/^at /);
+    expect(Date.parse(atResult.ended_by!.trigger.slice(3))).toBe(Date.parse("2026-10-05T12:00:01.000Z"));
+  });
+
+  it("keeps the token budget and an owner close as hard bounds when quorum is incomplete", async () => {
+    const budgetOut = await temporary();
+    const budgetRoom = fakeRoom({ until: ["said /^DONE$/", "budget 10 tokens", "after 2h"], pages: [] });
+    const budgetResult = await goalWatch(budgetRoom.client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: budgetOut,
+      out: budgetOut,
+      checkEveryMs: 60_000,
+      quietChecks: true,
+      terminationPolicy: "all-agents",
+      agentMemberIds: [AGENT, AGENT_TWO],
+    }, {
+      now: clock(),
+      sleep: async () => undefined,
+      spend: () => 10,
+      snapshot: null,
+    });
+    expect(budgetResult.ended_by).toMatchObject({ trigger: "budget 10 tokens", detail: "10 tokens" });
+
+    const ownerOut = await temporary();
+    const ownerEnd = { trigger: "owner", at: "2026-10-05T12:00:10.000Z", detail: "stopped" };
+    const ownerRoom = fakeRoom({
+      until: ["said /^DONE$/", "after 2h"],
+      pages: [[]],
+      states: [{ state: "open" }, { state: "closed", ended_by: ownerEnd }],
+    });
+    const ownerResult = await goalWatch(ownerRoom.client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: ownerOut,
+      out: ownerOut,
+      checkEveryMs: 60_000,
+      quietChecks: true,
+      roomCheckMs: 0,
+      terminationPolicy: "all-agents",
+      agentMemberIds: [AGENT, AGENT_TWO],
+    }, {
+      now: clock(),
+      sleep: async () => undefined,
+      snapshot: null,
+    });
+    expect(ownerResult.ended_by).toEqual(ownerEnd);
+  });
+
+  it("treats one exact completion as quorum when the supplied roster has one Agent", async () => {
+    const out = await temporary();
+    const { client } = fakeRoom({ until: ["said /^DONE$/", "after 2h"], pages: [[{ sequence: 2, content: "DONE", sender: AGENT }]] });
+    const result = await goalWatch(client, "sni_member", "snk_owner", {
+      roomId: ROOM,
+      workspace: out,
+      out,
+      checkEveryMs: 60_000,
+      quietChecks: true,
+      terminationPolicy: "all-agents",
+      agentMemberIds: [AGENT],
+    }, {
+      now: clock(),
+      sleep: async () => undefined,
+      snapshot: null,
+    });
+    expect(result).toMatchObject({ messages: 1, ended_by: { trigger: "said /^DONE$/", detail: "DONE" } });
+  });
+
   it("ends the Room with the check that starts to pass, and writes the record", async () => {
     const out = await temporary();
     const { client, calls } = fakeRoom({
