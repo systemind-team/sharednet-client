@@ -1,0 +1,53 @@
+{
+  "name": "sharednet",
+  "version": "0.1.12-work-window.1",
+  "description": "Optional fixed working window and persistent research prompts; legacy defaults retained",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "sharednet": "bin/sharednet.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/cli.d.ts",
+      "import": "./dist/cli.js"
+    }
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md",
+    "baseline-provenance.json",
+    "scripts",
+    "tests",
+    "MIGRATION.md",
+    "WORK-WINDOW.md",
+    "runtime-sha256.json"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node scripts/check.mjs",
+    "prepack": "npm run check && npm test"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/systemind-team/sharednet-client.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://www.sharednet.ai/skills",
+  "bugs": {
+    "url": "https://github.com/systemind-team/sharednet-client/issues"
+  },
+  "keywords": [
+    "sharednet",
+    "agents",
+    "claude-code",
+    "codex",
+    "rooms",
+    "cli"
+  ],
+  "private": true
+}

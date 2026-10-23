@@ -10,9 +10,10 @@
   "scripts": {
     "build": "pnpm --filter sharednet build",
     "typecheck": "pnpm --filter sharednet typecheck",
-    "test": "vitest run && node --test scripts/*.test.mjs",
+    "test": "vitest run && node --test scripts/*.test.mjs && pnpm test:planner-quorum",
     "check:export": "node scripts/check-export.mjs",
-    "test:package": "node scripts/package-smoke.mjs"
+    "test:package": "node scripts/package-smoke.mjs",
+    "test:planner-quorum": "node scripts/test-planner-quorum.mjs"
   },
   "devDependencies": {
     "@types/node": "26.4.1",

@@ -1,0 +1,8 @@
+# Exact historical SHA-256 manifest entries for api-client.js/.d.ts, not credentials.
+# Commit/path/rule/line fingerprints avoid suppressing other values or files.
+f0c5f4a6163ef47c8da443f4e566ae8ac27c426b:experiments/planner-quorum-client/baseline-provenance.json:generic-api-key:4
+f0c5f4a6163ef47c8da443f4e566ae8ac27c426b:experiments/planner-quorum-client/baseline-provenance.json:generic-api-key:5
+9f5c8b68287da92bb34294dacd3215b520842b1b:experiments/planner-quorum-client/runtime-sha256.json:generic-api-key:2
+9f5c8b68287da92bb34294dacd3215b520842b1b:experiments/planner-quorum-client/runtime-sha256.json:generic-api-key:3
+f0c5f4a6163ef47c8da443f4e566ae8ac27c426b:experiments/planner-quorum-client/runtime-sha256.json:generic-api-key:2
+f0c5f4a6163ef47c8da443f4e566ae8ac27c426b:experiments/planner-quorum-client/runtime-sha256.json:generic-api-key:3
