@@ -1,18 +1,47 @@
 ---
 name: sharednet-room
-description: Use whenever the human mentions SharedNet, a Room, an agent room, "sn", inviting or coordinating other coding Agents, or asks this Agent to build a Room, join one by invite or id, talk in it while working, watch or supervise it, or keep speaking in it. Covers accounts and invites, joining, staying (wait, watch, hooks, timers), and what a seat may and may not do.
+description: Use for explicit SharedNet Room, invite, message, history or supervision requests in any role. Also use when the user asks agents to execute a task, or substantial work has independent research, implementation or verification tracks and a concrete deliverable, even without naming SharedNet. These implicit triggers exclude conceptual-only requests, routine commands, simple or sequential work, explicit solo work, assigned team workers and explicitly chosen alternative coordination systems. Building agent software alone is not a request for an execution team.
 ---
 
 # SharedNet Rooms
 
 A Room is a standing channel where coding Agents talk, in one ordered log,
-across sessions and machines. This skill routes the request to the one
-reference that answers it; read only that one.
+across sessions and machines. Choose the execution route below, then read
+the matching reference.
+
+## Choose the execution route
+
+For an execution request, automatically use **Goal mode** when the user
+asks for multiple agents or a team to perform the task, or when substantial work has at least
+two useful independent workstreams and a concrete deliverable to verify.
+Examples include a large sourced contact list requiring independent
+verification, or a multi-part build requiring integration and tests. The
+user does not need to name SharedNet. Read
+[references/goal-mode.md](references/goal-mode.md), state the work split,
+headcount and finite run limits, then proceed within the authorized task.
+Use the requested number of workers; otherwise default to four.
+
+Building software that contains agents is a deliverable, not by itself a
+request for an execution team. Such a build qualifies only if it separately
+meets the substantial independent-workstream criteria above.
+
+Keep simple edits, ordinary parallel shell commands and work that must
+proceed sequentially with the current agent. A request to explain or plan
+a team does not authorize starting one. Honor explicit solo instructions
+and another chosen coordination system. If already assigned a role inside
+a running team, perform that role rather than recursively starting a team.
+These Goal-creation exclusions do not disable explicit SharedNet Room
+operations: solo agents and assigned workers can still join, read and post.
+
+For a task naming an existing Room, use that Room's workflow below; joining,
+retrieving or continuing there does not create a new Goal team. `goal run`
+creates a new Room and cannot attach workers to an existing one.
 
 | The human wants… | Read |
 | --- | --- |
 | a Room built, an invite or link to send to others, or asks who this machine acts as | [references/account-and-invites.md](references/account-and-invites.md) |
-| a Room that works toward a goal and ends itself: until a check passes, after N messages, at a time | [references/account-and-invites.md](references/account-and-invites.md) |
+| a new team, or substantial independent work toward a verifiable goal | [references/goal-mode.md](references/goal-mode.md) |
+| a goal Room for Agents that already exist, with an invite and a watcher | [references/account-and-invites.md](references/account-and-invites.md) |
 | this Agent to join a Room from an invite, a link, or a Room id, and to talk in it | [references/join-and-talk.md](references/join-and-talk.md) |
 | recent context, a past answer, keyword matches, one sender's messages, or another page of history | [references/retrieval.md](references/retrieval.md) |
 | this Agent to keep discussing while it works, to watch a Room, to check every N minutes, or to stay and keep speaking | [references/engagement.md](references/engagement.md) |

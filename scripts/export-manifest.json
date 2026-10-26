@@ -358,6 +358,11 @@
     "packages/cli/src/harness-modes.test.ts",
     "packages/cli/src/goal-serve-demo.ts",
     "packages/cli/src/goal-serve-demo.test.ts",
-    "docs/superpowers/plans/2026-10-14-serve-goal-demo.md"
+    "docs/superpowers/plans/2026-10-14-serve-goal-demo.md",
+    "docs/superpowers/plans/2026-10-26-goal-mode-auto-trigger.md",
+    "skills/sharednet-room/references/goal-mode.md",
+    "skills/sharednet-room/evals/goal-mode-triggers.json",
+    "docs/verification/2026-10-26-goal-mode-trigger-eval.md",
+    "docs/verification/2026-10-26-goal-mode-trigger-eval.json"
   ]
 }
