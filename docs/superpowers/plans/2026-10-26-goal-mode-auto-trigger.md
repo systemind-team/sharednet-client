@@ -41,8 +41,9 @@
 
 ### Task 3: Measure, review and ship
 
-- [ ] Run the same frozen cases/settings against the candidate, including at least five fresh repetitions for key trigger conditions; report false positives and errors separately.
-- [ ] Inspect routing pressure samples and all disputed/flagged decisions; document the test's actual scope.
-- [ ] Run skill validation, export audit, types, tests, package smoke and secret scan/CI.
+- [x] Run the same frozen cases/settings against the candidate, including at least five fresh repetitions for key trigger conditions; report false positives and errors separately.
+- [x] Inspect routing pressure samples and all disputed/flagged decisions; document the test's actual scope.
+- [x] Run skill validation, export audit, types, tests, package smoke and secret scan/CI.
 - [x] Obtain independent whole-change review and address material findings.
-- [ ] Commit, push, open a PR, require green CI, merge and verify the default-branch skill bytes.
+- [x] Commit, push and open PR #66; implementation CI passed on Node 22.18/24/26 and secrets.
+- [ ] Require final evidence-head CI, merge and verify default-branch skill bytes (release gate).
