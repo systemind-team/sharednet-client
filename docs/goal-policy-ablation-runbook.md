@@ -160,6 +160,19 @@ sha256sum "$CLI_TARBALL" > "$CELL/cli-tarball.sha256"
 mkdir -p "$CELL/cli"
 tar -xzf "$CLI_TARBALL" -C "$CELL/cli" --strip-components=1
 node "$SHAREDNET_BIN" --version > "$CELL/cli-version.txt"
+
+# Bind every arm to one explicit owner Instance. A machine can have several
+# usable local Instances, in which case implicit selection is intentionally
+# rejected. Keep the full session response in memory because it may contain a
+# credential; record only the non-secret Instance id.
+session_json=$(node "$SHAREDNET_BIN" session start --runtime custom --new --json \
+  2> "$CELL/private-session-start.log")
+SESSION_ID=$(printf '%s' "$session_json" | \
+  python3 -c 'import json,re,sys; value=json.load(sys.stdin)["session_id"]; assert re.fullmatch(r"i_[A-Za-z0-9_-]+", value); print(value)')
+unset session_json
+export SESSION_ID
+printf '%s\n' "$SESSION_ID" > "$CELL/session-id.txt"
+chmod 0600 "$CELL/private-session-start.log" "$CELL/session-id.txt"
 (cd "$FIXTURE/workspace" && \
   find . -type f -print0 | sort -z | xargs -0 sha256sum) \
   > "$CELL/fixture-files.sha256"
@@ -292,6 +305,7 @@ cat > "$CELL/commands/all-first.sh" <<'SH'
 #!/bin/sh
 set -eu
 node "$SHAREDNET_BIN" goal run "$WORK_ROOT/$TASK_ID/r$REPEAT/all-first/TASK.md" \
+  --session "$SESSION_ID" \
   --type board \
   --workspace "$WORK_ROOT/$TASK_ID/r$REPEAT/all-first" \
   --out "$RUN_ROOT/$TASK_ID/r$REPEAT/all-first" \
@@ -322,6 +336,7 @@ cat > "$CELL/commands/random-first.sh" <<'SH'
 #!/bin/sh
 set -eu
 node "$SHAREDNET_BIN" goal run "$WORK_ROOT/$TASK_ID/r$REPEAT/random-first/TASK.md" \
+  --session "$SESSION_ID" \
   --type board \
   --workspace "$WORK_ROOT/$TASK_ID/r$REPEAT/random-first" \
   --out "$RUN_ROOT/$TASK_ID/r$REPEAT/random-first" \
@@ -353,6 +368,7 @@ cat > "$CELL/commands/all-all.sh" <<'SH'
 #!/bin/sh
 set -eu
 node "$SHAREDNET_BIN" goal run "$WORK_ROOT/$TASK_ID/r$REPEAT/all-all/TASK.md" \
+  --session "$SESSION_ID" \
   --type board \
   --workspace "$WORK_ROOT/$TASK_ID/r$REPEAT/all-all" \
   --out "$RUN_ROOT/$TASK_ID/r$REPEAT/all-all" \
@@ -383,6 +399,7 @@ cat > "$CELL/commands/random-all.sh" <<'SH'
 #!/bin/sh
 set -eu
 node "$SHAREDNET_BIN" goal run "$WORK_ROOT/$TASK_ID/r$REPEAT/random-all/TASK.md" \
+  --session "$SESSION_ID" \
   --type board \
   --workspace "$WORK_ROOT/$TASK_ID/r$REPEAT/random-all" \
   --out "$RUN_ROOT/$TASK_ID/r$REPEAT/random-all" \
@@ -426,6 +443,7 @@ cp "$CELL/arm-order.txt" "$OUT/protocol/arm-order.txt"
 cp "$CELL/client-commit.txt" "$OUT/protocol/client-commit.txt"
 cp "$CELL/cli-tarball.sha256" "$OUT/protocol/cli-tarball.sha256"
 cp "$CELL/cli-version.txt" "$OUT/protocol/cli-version.txt"
+cp "$CELL/session-id.txt" "$OUT/protocol/session-id.txt"
 cp "$CELL/image-inspect.json" "$OUT/protocol/image-inspect.json"
 cp "$CELL/worker-control-evidence.txt" \
   "$OUT/protocol/worker-control-evidence.txt"
