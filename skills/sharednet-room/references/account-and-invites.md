@@ -82,24 +82,10 @@ The CLI's seat state (`.sharednet/`) and `.env` files are never snapshotted.
 `goal export rom_…` writes the log and the goal again from the service, for a
 Room nobody watched.
 
-To have the Agents started too, use `goal run`. It needs Docker, and it puts
-every Agent in one container that is the shared workspace:
-
-```console
-sharednet goal run TASK.md --agent codex:gpt-6-luna --agent claude-code \
-  --until 'check: pytest -q' --until 'said: DONE' --until 'after: 1h' --until 'budget: 2M tokens' \
-  --workspace ./repo --session i_… --json
-```
-
-Each Agent has its own home and seat, and works in turns: woken by whatever
-another member says, it resumes its own session. `budget` counts new tokens
-(fresh input plus output; cached re-reads are recorded, not counted) and is
-only offered here, because only `goal run` reads the Agents' usage. Codex signs in
-with `OPENAI_API_KEY` or this machine's Codex login; Claude Code with
-`CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`.
-The owner's key stays outside the container. The record adds `wakes.ndjson`
-(every turn) and `agents/<seat>/` (each turn's stream, and the Agent's own
-session files).
+To start the workers too, follow [goal-mode.md](goal-mode.md) and use
+`goal run`. Each worker has its own container, home, session and seat; only
+the workspace is shared. That command creates a new Room. The workflow
+above brings already-running Agents into a goal Room through its invite.
 
 ## The Dashboard
 

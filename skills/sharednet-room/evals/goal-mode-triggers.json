@@ -1,0 +1,187 @@
+{
+  "kind": "frozen goal-mode discovery and execution-routing scenarios",
+  "repetitions_per_case": 5,
+  "fixture_sha256": "6ef9d975386a54b203073fc63dcfe548ee51b4b7524aab222957506c8de5041f",
+  "routes": {
+    "goal": "new Goal collaboration for execution",
+    "existing": "operation in an existing Room",
+    "none": "no Goal launch; ordinary task or explanation"
+  },
+  "cases": [
+    {
+      "id": "p01",
+      "category": "explicit_multi",
+      "prompt": "Please use multiple coding agents to implement the API, UI, and tests for our new search page. Coordinate their work and deliver a passing feature.",
+      "expect_sharednet": true,
+      "expect_route": "goal"
+    },
+    {
+      "id": "p02",
+      "category": "explicit_multi",
+      "prompt": "请让多个 coding agents 并行完成结算功能：支付接口、订单页面和集成测试，协调分工直到验收通过。",
+      "expect_sharednet": true,
+      "expect_route": "goal"
+    },
+    {
+      "id": "p03",
+      "category": "implicit_large",
+      "prompt": "Build a complete customer support portal: authentication, ticket API, database migration, admin dashboard, email notifications, and integration tests. Split the independent work and keep going until the end-to-end checks pass.",
+      "expect_sharednet": true,
+      "expect_route": "goal"
+    },
+    {
+      "id": "p04",
+      "category": "implicit_large",
+      "prompt": "把我们的旧商城迁移到新架构，完成数据库迁移、后端商品接口、前端商品列表、支付回调和端到端测试。各模块能独立推进，请一次性推进到验收通过。",
+      "expect_sharednet": true,
+      "expect_route": "goal"
+    },
+    {
+      "id": "p05",
+      "category": "implicit_large",
+      "prompt": "Ship a production-ready analytics dashboard with a Python ingestion service, PostgreSQL schema, React charts, access controls, export jobs, and end-to-end coverage. Work on the independent parts concurrently and integrate the result.",
+      "expect_sharednet": true,
+      "expect_route": "goal"
+    },
+    {
+      "id": "p06",
+      "category": "implicit_large",
+      "prompt": "请完整交付一个项目管理系统，包含账号权限、任务API、看板UI、通知服务和自动化测试；独立模块并行推进，整合后跑通验收。",
+      "expect_sharednet": true,
+      "expect_route": "goal"
+    },
+    {
+      "id": "p07",
+      "category": "explicit_sharednet",
+      "prompt": "Use SharedNet goal mode to coordinate agents building this release and stop once all checks pass.",
+      "expect_sharednet": true,
+      "expect_route": "goal"
+    },
+    {
+      "id": "p08",
+      "category": "explicit_sharednet",
+      "prompt": "用 SharedNet 建一个目标驱动 Room，邀请其他 agent 一起把发布任务做完，测试通过就结束。",
+      "expect_sharednet": true,
+      "expect_route": "goal"
+    },
+    {
+      "id": "p09",
+      "category": "existing_room",
+      "prompt": "Join SharedNet Room rom_SYNTHETIC using my invite and read the latest discussion. Do not create another Room.",
+      "expect_sharednet": true,
+      "expect_route": "existing"
+    },
+    {
+      "id": "p10",
+      "category": "existing_room",
+      "prompt": "请查看现有 Room rom_SYNTHETIC 最近的消息，找到上一轮评审结论，不要新建房间。",
+      "expect_sharednet": true,
+      "expect_route": "existing"
+    },
+    {
+      "id": "n01",
+      "category": "simple",
+      "prompt": "Fix the typo in README: replace instalation with installation.",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n02",
+      "category": "simple",
+      "prompt": "请把按钮文字“保 存”改成“保存”。",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n03",
+      "category": "single_agent",
+      "prompt": "Implement the API, UI, and tests for this feature yourself. Use a single agent only; do not delegate or start any agent coordination service.",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n04",
+      "category": "single_agent",
+      "prompt": "请独自完成这个完整系统的数据库、API、UI和测试。只用当前这一个 agent，不要启动其他 agent 或协作服务。",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n05",
+      "category": "other_framework",
+      "prompt": "Use LangGraph only to build a multi-agent research workflow; do not introduce another coordination platform.",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n06",
+      "category": "other_framework",
+      "prompt": "我们已经选定 CrewAI。请只用 CrewAI 实现多个智能体协作，不要另起协作平台。",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n07",
+      "category": "conceptual",
+      "prompt": "Explain the advantages and disadvantages of multi-agent software development.",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n08",
+      "category": "conceptual",
+      "prompt": "什么情况下适合多个 agent 并行工作？先解释原理，不要创建任何东西。",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n09",
+      "category": "simple_parallel",
+      "prompt": "Run the linter and unit tests in parallel, then tell me whether they pass.",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n10",
+      "category": "physical_room",
+      "prompt": "Help me choose a paint color for the living room.",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n11",
+      "category": "nested_worker",
+      "prompt": "You are an assigned worker in an existing team. Your only task is to implement the backend API for the parent agent. Do not create a new team or coordination room; report your patch to the parent.",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "n12",
+      "category": "nested_worker",
+      "prompt": "你是已有团队里分配到的子 agent。只负责数据库迁移，完成后汇报给主 agent；不要创建新的团队或协作房间。",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    },
+    {
+      "id": "p11",
+      "category": "implicit_research",
+      "prompt": "Find 5000 real KOCs for an AI coding collaboration product, with publicly sourced business contacts, individual fit reasons, deduplication and independent verification. Deliver a CSV.",
+      "expect_sharednet": true,
+      "expect_route": "goal"
+    },
+    {
+      "id": "p12",
+      "category": "implicit_research",
+      "prompt": "为一个 AI 编程协作产品找出 5000 位真实 KOC，整理其公开的商务联系方式、每个人的匹配理由，去重并独立核验，最终交付 CSV。",
+      "expect_sharednet": true,
+      "expect_route": "goal"
+    },
+    {
+      "id": "n13",
+      "category": "sequential_complex",
+      "prompt": "Give one rigorous, detailed proof of the spectral theorem for compact self-adjoint operators. Build each lemma on the preceding one and explain each logical dependency. This is a single connected explanation, not a software implementation.",
+      "expect_sharednet": false,
+      "expect_route": "none"
+    }
+  ]
+}

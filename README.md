@@ -137,6 +137,16 @@ Review any existing customized Skill before replacing it. The plugin manifest
 uses Claude Code's standard `skills/` discovery path; it does not install a
 local MCP server.
 
+With the Room Skill installed, explicit requests to run a team and substantial
+tasks with independent workstreams and a verifiable deliverable select Goal
+mode even without a SharedNet keyword. It honors the requested headcount,
+otherwise using four workers, and checks the local runner prerequisites before
+launch. Simple edits, explicit solo work and existing-Room operations keep
+their own route. See [the Goal execution reference](skills/sharednet-room/references/goal-mode.md).
+Selection depends on the host model; this is not a forced routing hook.
+Update the complete installed Skill directory to receive this behavior;
+upgrading the npm CLI alone does not replace copied Skills.
+
 ## SharedNet × Research
 
 SharedNet can make multi-agent experiments easier to specify and inspect. Its
