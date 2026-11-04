@@ -340,6 +340,91 @@ describe("reach: forming a group from the account CLI", () => {
     expect(refused.requests).toEqual([]);
   });
 
+  it.each([
+    [["--initiation-policy", "broadcast"], "--initiation-policy", "all or random-single"],
+    [["--termination-policy", "majority"], "--termination-policy", "first or all-agents"],
+    [["--initiation-policy", "random-single", "--policy-seed", "-1"], "--policy-seed", "uint32"],
+    [["--initiation-policy", "random-single", "--policy-seed", "1.5"], "--policy-seed", "uint32"],
+    [["--initiation-policy", "random-single", "--policy-seed", "4294967296"], "--policy-seed", "uint32"],
+  ])("refuses an invalid goal policy before reading the goal or making a request: %j", async (flags, optionName, expected) => {
+    const refused = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", ...flags,
+    ]);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr.join(" ")).toContain(optionName);
+    expect(refused.stderr.join(" ")).toContain(expected);
+    expect(refused.requests).toEqual([]);
+  });
+
+  it("requires a uint32 seed for random-single initiation before reading the goal", async () => {
+    const refused = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h",
+      "--initiation-policy", "random-single",
+    ]);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr.join(" ")).toContain("random-single");
+    expect(refused.stderr.join(" ")).toContain("--policy-seed");
+    expect(refused.requests).toEqual([]);
+  });
+
+  it("refuses a policy seed when initiation uses the default all policy", async () => {
+    const refused = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--policy-seed", "7",
+    ]);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr.join(" ")).toContain("--policy-seed");
+    expect(refused.stderr.join(" ")).toContain("random-single");
+    expect(refused.requests).toEqual([]);
+  });
+
+  it("requires a said end condition when every Agent must confirm completion", async () => {
+    const refused = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h",
+      "--termination-policy", "all-agents",
+    ]);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr.join(" ")).toContain("all-agents");
+    expect(refused.stderr.join(" ")).toContain("said");
+    expect(refused.requests).toEqual([]);
+  });
+
+  it.each(["message", "mention"])("rejects an all-Agent %s end condition because it bypasses quorum", async (bypass) => {
+    const refused = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--until", "said /^DONE$/", "--until", bypass, "--until", "after: 1h",
+      "--termination-policy", "all-agents",
+    ]);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr.join(" ")).toContain("bypass");
+    expect(refused.requests).toEqual([]);
+  });
+
+  it("accepts the strongest policy combination through argument validation", async () => {
+    const accepted = await harness([
+      "goal", "run", "missing.md", "--agent", "codex", "--until", "said /^DONE$/", "--until", "after: 1h",
+      "--initiation-policy", "random-single", "--termination-policy", "all-agents", "--policy-seed", "7",
+    ]);
+    expect(accepted.exitCode).toBe(2);
+    expect(accepted.stderr.join(" ")).toContain("missing.md");
+    expect(accepted.stderr.join(" ")).not.toContain("--initiation-policy");
+    expect(accepted.stderr.join(" ")).not.toContain("--termination-policy");
+    expect(accepted.stderr.join(" ")).not.toContain("--policy-seed");
+    expect(accepted.requests).toEqual([]);
+  });
+
+  it.each([
+    ["random-single initiation", ["--initiation-policy", "random-single", "--policy-seed", "7"]],
+    ["all-agents termination", ["--termination-policy", "all-agents"]],
+  ])("does not let %s drift from a frozen harness profile", async (_label, flags) => {
+    const refused = await harness([
+      "goal", "run", "missing.md", "--agent", "codex:gpt-test", "--until", "said DONE", "--until", "after: 1h",
+      "--harness-mode", "research/baseline@1", ...flags,
+    ]);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr.join(" ")).toContain("--harness-mode");
+    expect(refused.stderr.join(" ")).toContain("policy");
+    expect(refused.requests).toEqual([]);
+  });
+
   it("validates canonical harness modes before reading the goal or making a request", async () => {
     const malformed = await harness([
       "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "research/baseline",

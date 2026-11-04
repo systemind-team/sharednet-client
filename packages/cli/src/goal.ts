@@ -134,6 +134,8 @@ export interface GoalWatchDependencies {
   spend?: () => number;
 }
 
+export type TerminationPolicy = "first" | "all-agents";
+
 export interface GoalWatchOptions {
   roomId: string;
   /** Where the Agents work; checks run here and its snapshots are taken from here. */
@@ -149,6 +151,10 @@ export interface GoalWatchOptions {
   ignoreThrough?: number;
   /** Read the Room's state at least this often, to notice an end the service or the owner made. */
   roomCheckMs?: number;
+  /** `first` preserves the original first-valid-claim behavior. */
+  terminationPolicy?: TerminationPolicy;
+  /** Exact Agent member ids that must each make a valid completion claim. */
+  agentMemberIds?: readonly string[];
 }
 
 /** The wait the runner sits in, bounded the way the service bounds every wait. */
@@ -294,6 +300,20 @@ export async function goalWatch(
   });
   const checks = triggers.filter((trigger): trigger is Extract<Trigger, { kind: "check" }> => trigger.kind === "check");
   const said = triggers.filter((trigger): trigger is Extract<Trigger, { kind: "said" }> => trigger.kind === "said");
+  const terminationPolicy = options.terminationPolicy ?? "first";
+  const requiredAgentIds = terminationPolicy === "all-agents"
+    ? [...new Set((options.agentMemberIds ?? []).filter(Boolean))]
+    : [];
+  const requiredAgents = new Set(requiredAgentIds);
+  if (terminationPolicy === "all-agents" && requiredAgentIds.length === 0) {
+    throw localError("invalid_arguments", "The all-agents termination policy needs at least one exact Agent member id.");
+  }
+  if (terminationPolicy === "all-agents" && said.length === 0) {
+    throw localError("invalid_arguments", "The all-agents termination policy needs at least one said trigger.");
+  }
+  if (terminationPolicy === "all-agents" && triggers.some((trigger) => trigger.kind === "message" || trigger.kind === "mention")) {
+    throw localError("invalid_arguments", "The all-agents termination policy does not accept message or mention end conditions because they bypass the completion quorum.");
+  }
   // The person a `mention` addresses is the goal's speaker; the runner's own lines never count as the Agents'.
   const goalSpeaker = (view.memberships ?? []).find((member) => member.runtime_kind === "human") ?? null;
   const runnerSeats = new Set((view.memberships ?? []).filter((member) => member.runtime_kind === "runner").map((member) => member.member_id ?? ""));
@@ -301,6 +321,7 @@ export async function goalWatch(
   await mkdir(options.out, { recursive: true });
   const roomLog = join(options.out, "room.ndjson");
   const checkLog = join(options.out, "checks.ndjson");
+  const policyLog = join(options.out, "policy.ndjson");
   // The Room's log is read again from its start; checks a stopped runner already ran are history and stay.
   await writeFile(roomLog, "");
   const earlierChecks = await readFile(checkLog, "utf8").then((text) => text.split("\n").filter(Boolean).length, () => null);
@@ -317,6 +338,13 @@ export async function goalWatch(
   for (const check of checks) checkState.set(check.label, { passing: false, ranAt: null });
   let end: { trigger: string; detail: string | null } | null = null;
   let endedByService: GoalShape["ended_by"] = goal.ended_by;
+  const confirmations = new Map<string, { sequence: number; trigger: string; content: string }>();
+  let completionResetCount = 0;
+
+  const recordPolicy = (event: Record<string, unknown>) => appendFile(
+    policyLog,
+    `${JSON.stringify({ at: dependencies.now().toISOString(), ...event })}\n`,
+  );
 
   const takeSnapshot = async (label: string) => {
     if (!snapshot) return;
@@ -393,13 +421,14 @@ export async function goalWatch(
         if (used >= trigger.tokens) end = { trigger: trigger.label, detail: `${used} tokens` };
       }
     }
-    // A check that has started to pass ends it; checked on its schedule.
+    // A check that has started to pass ends the legacy policy. With all-agents,
+    // scheduled checks are observations; only a fresh check at quorum can end it.
     for (const check of checks) {
       if (end) break;
       const state = checkState.get(check.label)!;
       if (state.ranAt !== null && now - state.ranAt < options.checkEveryMs) continue;
       const result = await evaluate(check, "schedule");
-      if (result.startedPassing) end = { trigger: check.label, detail: result.output.trim() || null };
+      if (terminationPolicy === "first" && result.startedPassing) end = { trigger: check.label, detail: result.output.trim() || null };
     }
     if (end) break;
 
@@ -434,6 +463,8 @@ export async function goalWatch(
     throwIfAborted();
 
     let claim: MessageShape | null = null;
+    let quorumClaim: MessageShape | null = null;
+    let quorumTrigger: Extract<Trigger, { kind: "said" }> | null = null;
     for (const item of items.sort((left, right) => left.sequence - right.sequence)) {
       if (!Number.isSafeInteger(item.sequence) || item.sequence <= cursor) continue;
       cursor = item.sequence;
@@ -441,7 +472,12 @@ export async function goalWatch(
       await appendFile(roomLog, `${JSON.stringify(item)}\n`);
       if (item.sequence <= triggerStart) continue;
       const sender = item.sender_instance_id ?? item.sender?.member_id ?? "";
-      if (runnerSeats.has(sender)) continue;
+      if (runnerSeats.has(sender)) {
+        if (terminationPolicy === "all-agents" && said.some((trigger) => saidIn(item.content, trigger))) {
+          await recordPolicy({ type: "completion_ignored", member_id: sender || null, sequence: item.sequence, reason: "runner" });
+        }
+        continue;
+      }
       lastMessageAt = dependencies.now().getTime();
       if (end) continue;
       if (triggers.some((trigger) => trigger.kind === "message")) end = { trigger: "message", detail: item.content.slice(0, 500) };
@@ -451,14 +487,40 @@ export async function goalWatch(
         mentions(item.content, { memberId: goalSpeaker.member_id ?? "", name: goalSpeaker.name ?? null })
       ) {
         end = { trigger: "mention", detail: item.content.slice(0, 500) };
-      } else if (said.some((trigger) => saidIn(item.content, trigger)) && claim === null) {
-        claim = item;
+      } else {
+        const completion = said.find((trigger) => saidIn(item.content, trigger));
+        if (!completion) continue;
+        if (terminationPolicy === "first") {
+          if (claim === null) claim = item;
+          continue;
+        }
+        if (!requiredAgents.has(sender)) {
+          await recordPolicy({ type: "completion_ignored", member_id: sender || null, sequence: item.sequence, reason: "not-required-agent" });
+          continue;
+        }
+        if (confirmations.has(sender)) {
+          await recordPolicy({ type: "completion_duplicate_ignored", member_id: sender, sequence: item.sequence, trigger: completion.label });
+          continue;
+        }
+        confirmations.set(sender, { sequence: item.sequence, trigger: completion.label, content: item.content });
+        await recordPolicy({
+          type: "completion_confirmed",
+          member_id: sender,
+          sequence: item.sequence,
+          trigger: completion.label,
+          confirmed: confirmations.size,
+          required: requiredAgentIds.length,
+        });
+        if (confirmations.size === requiredAgentIds.length && quorumClaim === null) {
+          quorumClaim = item;
+          quorumTrigger = completion;
+        }
       }
     }
     if (items.length > 0) await takeSnapshot(`seq ${cursor}`);
 
-    // A claim of being done: the check decides when there is one, and a failing check is said back.
-    if (!end && claim) {
+    // A legacy claim of being done: the check decides when there is one, and a failing check is said back.
+    if (terminationPolicy === "first" && !end && claim) {
       const claimed = said.find((trigger) => saidIn(claim!.content, trigger))!;
       if (checks.length === 0) {
         end = { trigger: claimed.label, detail: claim.content.slice(0, 500) };
@@ -472,6 +534,37 @@ export async function goalWatch(
           await feedback(
             `#${claim.sequence} says done, but \`${check.command}\` still fails (exit ${result.exitCode}):\n\n${tail(result.output).trim() || "(no output)"}`,
           );
+        }
+      }
+    }
+    // Under all-agents, every exact roster member must confirm. A verifier is
+    // run only at quorum. If all verifiers fail, the complete roster confirms again.
+    if (terminationPolicy === "all-agents" && !end && quorumClaim && quorumTrigger) {
+      await recordPolicy({
+        type: "completion_quorum",
+        sequence: quorumClaim.sequence,
+        trigger: quorumTrigger.label,
+        member_ids: requiredAgentIds,
+      });
+      if (checks.length === 0) {
+        end = { trigger: quorumTrigger.label, detail: quorumClaim.content.slice(0, 500) };
+      } else {
+        let passed = false;
+        for (const check of checks) {
+          const result = await evaluate(check, "claim");
+          if (result.passing) {
+            end = { trigger: check.label, detail: result.output.trim() || null };
+            passed = true;
+            break;
+          }
+          await feedback(
+            `All ${requiredAgentIds.length} Agents say done, but \`${check.command}\` still fails (exit ${result.exitCode}):\n\n${tail(result.output).trim() || "(no output)"}`,
+          );
+        }
+        if (!passed) {
+          confirmations.clear();
+          completionResetCount += 1;
+          await recordPolicy({ type: "completion_reset_after_check_failure", sequence: quorumClaim.sequence, reset_count: completionResetCount });
         }
       }
     }
@@ -525,6 +618,10 @@ export async function goalWatch(
         room_id: options.roomId,
         goal: { message_id: goal.message_id, sequence: goal.sequence, until: goal.until, started_at: goal.started_at },
         ended_by: endedBy,
+        termination_policy: terminationPolicy,
+        completion_required_agent_member_ids: requiredAgentIds,
+        completion_confirmed_agent_member_ids: [...confirmations.keys()],
+        completion_reset_count: completionResetCount,
         runner: { started_at: runnerStartedAt, ended_at: dependencies.now().toISOString(), workspace: resolve(options.workspace) },
         totals: { messages, checks: checkCount, snapshots, ...(spend ? { tokens: spend() } : {}) },
         ...(budget.length > 0 ? { not_measured: budget.map((label) => `${label}: goal watch did not start the Agents, so it cannot read their spend; goal run can`) } : {}),
