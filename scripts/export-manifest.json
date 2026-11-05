@@ -723,6 +723,10 @@
     "packages/cli/src/local.test.ts",
     "packages/cli/src/protocol/envelope-schema.ts",
     "packages/cli/src/protocol/envelope-schema.test.ts",
-    "docs/local-server.md"
+    "docs/local-server.md",
+    "docs/assets/drac-room-dark.svg",
+    "docs/assets/drac-room-light.svg",
+    "docs/papers/drac-communication-failure.md",
+    "docs/research.md"
   ]
 }
