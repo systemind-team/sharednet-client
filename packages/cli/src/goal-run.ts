@@ -581,7 +581,11 @@ export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string |
       ...(model.contextWindow === undefined ? [] : ["-c", `model_context_window=${model.contextWindow}`]),
       ...(model.compactAt === undefined ? [] : ["-c", `model_auto_compact_token_limit=${model.compactAt}`]),
     ];
-    const flags = ["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", search, ...base, ...tuning, ...(seat.model ? ["-m", seat.model] : [])];
+    // No sub-agents: a seat is one Agent. Codex's spawn_agent starts threads the Room never sees, on
+    // Codex's default model rather than the seat's, so a run would no longer be the agents it names.
+    // v2 is off by default; it is turned off here too, so a Codex that turns it on keeps no sub-agents.
+    const solo = ["-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false"];
+    const flags = ["--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", search, ...solo, ...base, ...tuning, ...(seat.model ? ["-m", seat.model] : [])];
     return sessionId === null ? [...limit, "codex", "exec", ...flags, prompt] : [...limit, "codex", "exec", "resume", ...flags, sessionId, prompt];
   }
   return [

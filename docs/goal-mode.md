@@ -170,6 +170,9 @@ runner makes `/home/agents` for that user if the image has none.
 - **They talk with `sharednet say` and `sharednet read`.** Their own final text is not posted.
   Codex agents have live web search and Claude Code agents have their built-in tools, unless
   the run says `--web-search off`.
+  Codex agents run without sub-agents (`features.multi_agent` and `features.multi_agent_v2`
+  off), because `spawn_agent` starts threads the Room never sees, on Codex's default model
+  rather than the seat's.
 - **The end.** When the goal ends, the Room is closed, the containers are stopped, each agent's
   home is copied out of its container into the record without its tokens, and every container
   is removed (with `--isolate`, also the gateway and the internal network).

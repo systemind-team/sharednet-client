@@ -108,7 +108,7 @@ describe("a turn", () => {
   it("starts a harness with nothing asked of a person, and resumes the same session on the next wake", () => {
     const codex = { name: "codex-1", driver: "codex" as const, model: "gpt-6-luna" };
     expect(turnCommand(codex, "the goal", null)).toEqual([
-      "timeout", "1200", "codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", 'web_search="live"', "-m", "gpt-6-luna", "the goal",
+      "timeout", "1200", "codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", 'web_search="live"', "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-m", "gpt-6-luna", "the goal",
     ]);
     expect(turnCommand(codex, "new lines", "thread-1").slice(2, 5)).toEqual(["codex", "exec", "resume"]);
     expect(turnCommand(codex, "new lines", "thread-1").slice(-2)).toEqual(["thread-1", "new lines"]);
@@ -150,6 +150,27 @@ describe("a turn", () => {
     const openai = turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/v1", custom: false }).join(" ");
     expect(openai).toContain('-c openai_base_url="http://gateway:8080/v1"');
     expect(openai).not.toContain("model_provider");
+  });
+
+  it("gives a Codex seat no sub-agents, on a first turn and a resumed one, whatever its model API", () => {
+    const [codex] = parseAgents(["codex:qwen/qwen3.5-9b"]);
+    const turns = [
+      turnCommand(codex!, "the goal", null),
+      turnCommand(codex!, "new lines", "thread-1"),
+      turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/api/v1", custom: true }, { reasoningEffort: "medium" }),
+      turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/v1", custom: false }),
+    ];
+    for (const turn of turns) {
+      for (const feature of ["features.multi_agent=false", "features.multi_agent_v2=false"]) {
+        const at = turn.indexOf(feature);
+        expect(at).toBeGreaterThan(-1);
+        expect(turn[at - 1]).toBe("-c");
+        // A flag, not the prompt: it stands before the session id and the prompt at the end.
+        expect(at).toBeLessThan(turn.length - 2);
+      }
+    }
+    const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
+    expect(turnCommand(claude, "the goal", null).join(" ")).not.toContain("multi_agent");
   });
 
   it("takes web search away from every Agent when it is off, for a benchmark that forbids the internet", () => {
