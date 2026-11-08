@@ -9,7 +9,7 @@ import { dirname, join, relative } from "node:path";
 
 import type { ApiClient } from "./api-client.ts";
 import { localError } from "./errors.ts";
-import { goalWatch, type GoalWatchResult } from "./goal.ts";
+import { goalWatch, type GoalWatchResult, type TerminationPolicy } from "./goal.ts";
 import { assertGoalRunHarnessAgentCount, type GoalRunHarnessResolution } from "./harness-modes.ts";
 import { mentions } from "./triggers.ts";
 
@@ -338,6 +338,15 @@ export interface WakeShape {
 }
 
 export type MessageRouting = "broadcast" | "mentions";
+export type InitiationPolicy = "all" | "random-single";
+
+/** Select one reproducible starter from the ordered roster. */
+export function selectPolicyStarter<T extends AgentSpec>(seats: readonly T[], seed: number): T {
+  if (seats.length === 0) throw localError("invalid_arguments", "A random-single initiation policy needs at least one Agent.");
+  const roster = seats.map(({ name, driver, model }) => ({ name, driver, model }));
+  const digest = createHash("sha256").update(`${seed}\0${JSON.stringify(roster)}`).digest("hex");
+  return seats[Number.parseInt(digest.slice(0, 8), 16) % seats.length]!;
+}
 /** Routing chooses wake recipients, not board visibility. Unknown-only handles broadcast. */
 export function routeWake(wake: WakeShape, seat: { name: string }, seats: Array<{ name: string; member_id?: string | null }>, mode: MessageRouting): WakeShape {
   if (mode === "broadcast") return wake;
@@ -354,7 +363,7 @@ export function withoutTaskActs(wake: WakeShape): WakeShape {
 }
 
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
-export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting }): string {
+export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; initiationPolicy?: InitiationPolicy; terminationPolicy?: TerminationPolicy; starter?: string | null }): string {
   const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
   const single = input.seats.length === 1;
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
@@ -368,8 +377,12 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
     input.goal.trim(),
     "</goal>",
     "",
-    `The Room ends when the first of these happens: ${input.until.join("; ")}.`,
-    ...(claims.length > 0 ? [`Say ${claims.join(" or ")} in the Room only when you believe the goal is met: saying it runs the check.`] : []),
+    input.terminationPolicy === "all-agents"
+      ? `The Room has these end conditions: ${input.until.join("; ")}. A hard bound can end it at once. Completion requires a matching claim from every Agent and then a passing check, when configured.`
+      : `The Room ends when the first of these happens: ${input.until.join("; ")}.`,
+    ...(claims.length > 0 ? [input.terminationPolicy === "all-agents"
+      ? `Each Agent must say ${claims.join(" or ")} in the Room only when the goal is met. If the check fails at quorum, every Agent must confirm again after repair.`
+      : `Say ${claims.join(" or ")} in the Room only when you believe the goal is met: saying it runs the check.`] : []),
     "",
     single
       ? `You work in this directory (${CONTAINER_WORKSPACE}) in your own container. Use the SharedNet Room to record concise progress and the final completion claim:`
@@ -381,6 +394,12 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
       "Messages mentioning known teammates wake only those teammates. No mention, @all, or unknown-only names broadcast. Explicit board reads still show all messages. Use exact teammate names from the roster.",
       "Do not run `sharednet wait` or `sharednet watch`: end your turn when waiting; the runner supplies messages routed to you.",
     ] : ["Do not run `sharednet wait` or `sharednet watch`: when your turn ends, you are woken with whatever is said next."]),
+    ...(input.initiationPolicy === "random-single" && input.starter === input.seat.name && !single ? [
+      "You are the selected starter. The other Agents are idle until a Room message wakes them. Delegate work with an exact @name mention.",
+    ] : []),
+    ...(input.initiationPolicy === "random-single" && input.starter !== input.seat.name ? [
+      "The initiation policy kept you idle until this Room message woke you. Continue from the shared goal and the new message.",
+    ] : []),
     "Lines from `runner` are the goal's machinery, such as a check's result, not a person.",
     single
       ? "Work through the goal and end your turn when there is nothing more to do now."
@@ -548,6 +567,12 @@ export interface GoalRunInput {
   mentionGate?: boolean;
   taskGate?: boolean;
   messageRouting?: MessageRouting;
+  /** Which seats receive an opening turn. The default preserves the original all-seat start. */
+  initiationPolicy?: InitiationPolicy;
+  /** Which completion claims can end the run. The default preserves the first valid claim. */
+  terminationPolicy?: TerminationPolicy;
+  /** A recorded uint32 used only by random-single initiation. */
+  policySeed?: number;
   /** A canonical treatment selected by --harness-mode. Omission preserves legacy ad-hoc flags. */
   harnessMode?: GoalRunHarnessResolution;
   /** Tests and artifact builders may supply provenance; source runs discover repository and package identity. */
@@ -584,6 +609,26 @@ export async function runGoal(
   const messageRouting = input.messageRouting ?? (input.mentionGate ? "mentions" : "broadcast");
   const mentionGate = input.mentionGate ?? false;
   const taskGate = input.taskGate ?? false;
+  const initiationPolicy = input.initiationPolicy ?? "all";
+  const terminationPolicy = input.terminationPolicy ?? "first";
+  if (initiationPolicy === "random-single" && input.policySeed === undefined) {
+    throw localError("invalid_arguments", "The random-single initiation policy needs --policy-seed with a uint32 value.");
+  }
+  if (initiationPolicy === "all" && input.policySeed !== undefined) {
+    throw localError("invalid_arguments", "--policy-seed is only valid with --initiation-policy random-single.");
+  }
+  if (input.policySeed !== undefined && (!Number.isInteger(input.policySeed) || input.policySeed < 0 || input.policySeed > 0xffff_ffff)) {
+    throw localError("invalid_arguments", "--policy-seed must be a uint32 value.");
+  }
+  if (terminationPolicy === "all-agents" && !input.until.some((trigger) => trigger.startsWith("said "))) {
+    throw localError("invalid_arguments", "The all-agents termination policy needs at least one said end condition.");
+  }
+  if (terminationPolicy === "all-agents" && input.until.some((trigger) => trigger === "message" || trigger === "mention")) {
+    throw localError("invalid_arguments", "The all-agents termination policy does not accept message or mention end conditions because they bypass the completion quorum.");
+  }
+  if (input.harnessMode && (initiationPolicy !== "all" || terminationPolicy !== "first" || input.policySeed !== undefined)) {
+    throw localError("invalid_arguments", "A frozen harness mode fixes its policy; do not add initiation or termination policy controls.");
+  }
   if (
     input.harnessMode
     && (input.roomType !== input.harnessMode.profile.room_type
@@ -606,6 +651,12 @@ export async function runGoal(
   await mkdir(input.out, { recursive: true });
   const wakeLog = join(input.out, "wakes.ndjson");
   await writeFile(wakeLog, "");
+  const policyLog = join(input.out, "policy.ndjson");
+  await writeFile(policyLog, "");
+  const recordPolicy = (event: Record<string, unknown>) => appendFile(
+    policyLog,
+    `${JSON.stringify({ at: dependencies.now().toISOString(), ...event })}\n`,
+  );
 
   /** An Agent's container: the shared workspace, this CLI, and a Codex seat's login; idle until a turn runs in it. */
   const startContainer = (seat: SeatRecord) => docker([
@@ -750,6 +801,19 @@ export async function runGoal(
       throw error;
     }
 
+    const starter = initiationPolicy === "random-single"
+      ? selectPolicyStarter(records, input.policySeed!)
+      : null;
+    if (starter) {
+      await recordPolicy({
+        type: "starter_selected",
+        initiation_policy: initiationPolicy,
+        policy_seed: input.policySeed,
+        starter: starter.name,
+        member_id: starter.member_id,
+      });
+    }
+
     const runTurn = async (seat: SeatRecord, prompt: string, wake: WakeShape | null) => {
       if (input.roomType === "compiled") {
         // The CLI inside the seat's container holds its own credential; the owner cannot render its obligations.
@@ -810,36 +874,48 @@ export async function runGoal(
       return failed;
     };
 
-    // Every seat starts once. Subsequent wakes follow the configured routing policy.
+    // The initiation policy chooses which seats start. A dormant seat receives
+    // the full goal context together with the first Room message that wakes it.
     const seatLoop = async (seat: SeatRecord) => {
-      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting });
-      openingPromptHashes[seat.name] = sha256(prompt);
+      const opening = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, initiationPolicy, terminationPolicy, starter: starter?.name ?? null });
+      openingPromptHashes[seat.name] = sha256(opening);
+      let prompt = opening;
       let wake: WakeShape | null = null;
       let failedInARow = 0;
+      let firstTurn = true;
+      const startsImmediately = initiationPolicy === "all" || starter?.name === seat.name;
       while (!ended) {
+        if (firstTurn && startsImmediately) {
+          await recordPolicy({ type: "agent_started", initiation_policy: initiationPolicy, seat: seat.name, member_id: seat.member_id, reason: "initial" });
+        } else {
+          while (!ended) {
+            const waited = await exec(seat, ["sharednet", "wait", "--on", "message", "--on", "closed", "--settle", "2s", "--ack", "manual", "--json"]);
+            if (ended || waited.code !== 0) return;
+            let raw: WakeShape;
+            try { raw = JSON.parse(waited.stdout) as WakeShape; } catch { return; }
+            if (raw.fired.includes("closed")) return;
+            wake = routeWake(raw, seat, records, messageRouting);
+            if (input.taskGate) wake = withoutTaskActs(wake);
+            const delivered = wake.messages.map(message => message.sequence);
+            if (messageRouting === "mentions" || input.taskGate) await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
+            if (delivered.length > 0 || (messageRouting === "broadcast" && !input.taskGate)) break;
+            if (raw.wake_id) await exec(seat, ["sharednet", "ack", raw.wake_id, "--json"]);
+          }
+          if (ended || !wake) return;
+          prompt = firstTurn ? `${opening}\n\n${wakePrompt(wake)}` : wakePrompt(wake);
+          if (firstTurn) {
+            await recordPolicy({ type: "agent_started", initiation_policy: initiationPolicy, seat: seat.name, member_id: seat.member_id, reason: "wake", wake_id: wake.wake_id, through: wake.through });
+          }
+        }
         const failed = await runTurn(seat, prompt, wake);
         if (wake?.wake_id) await exec(seat, ["sharednet", "ack", wake.wake_id, "--json"]);
+        firstTurn = false;
         failedInARow = failed ? failedInARow + 1 : 0;
         if (ended) break;
         if (failedInARow >= FAILED_TURNS_LIMIT) {
           log(`goal: ${seat.name} failed ${FAILED_TURNS_LIMIT} turns in a row and takes no more; see agents/${seat.name}/\n`);
           break;
         }
-        while (!ended) {
-          const waited = await exec(seat, ["sharednet", "wait", "--on", "message", "--on", "closed", "--settle", "2s", "--ack", "manual", "--json"]);
-          if (ended || waited.code !== 0) return;
-          let raw: WakeShape;
-          try { raw = JSON.parse(waited.stdout) as WakeShape; } catch { return; }
-          if (raw.fired.includes("closed")) return;
-          wake = routeWake(raw, seat, records, messageRouting);
-          if (input.taskGate) wake = withoutTaskActs(wake);
-          const delivered = wake.messages.map(message => message.sequence);
-          if (messageRouting === "mentions" || input.taskGate) await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
-          if (delivered.length > 0 || (messageRouting === "broadcast" && !input.taskGate)) break;
-          if (raw.wake_id) await exec(seat, ["sharednet", "ack", raw.wake_id, "--json"]);
-        }
-        if (ended || !wake) return;
-        prompt = wakePrompt(wake);
       }
     };
     const seats = records.map((seat) =>
@@ -852,7 +928,15 @@ export async function runGoal(
       client,
       memberToken,
       apiKey,
-      { roomId: input.roomId, workspace: plan.workspace, out: input.out, checkEveryMs: input.checkEveryMs, quietChecks: input.quietChecks },
+      {
+        roomId: input.roomId,
+        workspace: plan.workspace,
+        out: input.out,
+        checkEveryMs: input.checkEveryMs,
+        quietChecks: input.quietChecks,
+        terminationPolicy,
+        agentMemberIds: records.flatMap((seat) => seat.member_id ? [seat.member_id] : []),
+      },
       {
         now: dependencies.now,
         ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
@@ -890,7 +974,7 @@ export async function runGoal(
       command: "goal run",
       room_type: input.roomType ?? "board",
       delivery: "runner-owned-turn-loop",
-      initial_wake: "all-seats",
+      initial_wake: initiationPolicy === "all" ? "all-seats" : "random-single",
       mention_gate: mentionGate,
       task_gate: taskGate,
       message_routing: messageRouting,
@@ -901,6 +985,11 @@ export async function runGoal(
       `${JSON.stringify(
         {
           ...episode,
+          initiation_policy: initiationPolicy,
+          termination_policy: terminationPolicy,
+          policy_seed: input.policySeed ?? null,
+          starter: starter?.name ?? null,
+          starter_member_id: starter?.member_id ?? null,
           image: plan.image,
           web_search: input.webSearch ?? "live",
           turn_limit_s: turnLimitSeconds,
