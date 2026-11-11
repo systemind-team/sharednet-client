@@ -104,7 +104,49 @@ experiment that must not intervene.
 `web_search="disabled"`, Claude Code without its `WebSearch` and `WebFetch` tools), for a
 benchmark such as ProgramBench that forbids the internet during inference. `episode.json`
 records the setting. It does not cut the network: the agents still reach their model provider,
-the Room, and package registries.
+the Room, and package registries. `--isolate` cuts it.
+
+`--isolate` puts every container on an internal Docker network with no way out but a gateway
+the runner starts (`nginx:1.27-alpine`, pulled once). The gateway forwards to SharedNet and to
+each driver's model API, and nothing else is reachable: no package registry, no web page, no
+source repository. It also holds the model keys: an agent's container gets a placeholder where
+its harness wants `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`, and the
+gateway signs each request with the real one, so no agent can read a key or leave one in its
+trace. Codex agents need `OPENAI_API_KEY` for this; a Codex login cannot be lent to the
+gateway. `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` on your machine changes where the gateway
+sends a driver's requests. An isolated run has no web search, since a harness's own search runs
+on the model provider's side, past any gateway. The gateway's access log, one line per request
+with the address of the container it came from, goes into the record, and `episode.json` maps
+each seat to its address.
+
+Codex agents can use a model API other than OpenAI's: set `OPENAI_BASE_URL` to that API's base
+URL with its path, such as `https://openrouter.ai/api/v1`, put that API's key in `OPENAI_API_KEY`,
+and name its model with the agent, as in `--agent codex:qwen/qwen3.8-27b`. Any host other than
+`api.openai.com` is given to Codex as a provider of its own (`goal_api`), over the Responses API on
+plain HTTP: Codex's built-in OpenAI provider cannot be redefined, and talks to OpenAI over a
+WebSocket other APIs may not offer. The API must serve the Responses API. With `--isolate` the
+gateway still holds the key. Codex knows nothing of another provider's models, so it runs them with
+fallback metadata (it says so in each turn's stream). `episode.json` records the API as `model_api`.
+
+`--reasoning-effort medium` (one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`) sets how
+hard the Codex agents' model reasons on each call; Codex passes it to the API as `reasoning.effort`.
+Left out, the model reasons as its API's default has it, and for some models served through a
+router that is as long as the call may run, which makes every step slow. Claude Code agents are not
+affected. `episode.json` records it as `reasoning_effort`.
+
+`--context-window 262144` and `--compact-at 150000` tell Codex its model's context window
+(`model_context_window`) and when to compact the history (`model_auto_compact_token_limit`). Codex
+knows both for OpenAI's models; for another provider's it knows neither, never compacts, and a long
+turn fails once its history outgrows what the API accepts. Set the window to what the API serves,
+which a router may make smaller than the model's own, and compact well before it: an API may also
+hold back room for the reply out of the same window. `episode.json` records them as
+`context_window` and `compact_at`.
+
+`--image <image>` runs the agents and the checks in an image of your own, for example a
+benchmark's task image with the harness added. It needs `node` (22.18 or newer) on `PATH`, the
+harness of each driver you use (`codex`, `claude`), `sh` and `git`. `--agent-user <user>` names the
+user the agents and the checks run as in it (default `node`, the default image's user). The
+runner makes `/home/agents` for that user if the image has none.
 
 `--turn-limit 45m` stops a single turn after 45 minutes instead of the default 20 (at least
 `1m`). An experiment that wants only the Room's own end to stop an agent sets it to its
@@ -130,7 +172,7 @@ the Room, and package registries.
   the run says `--web-search off`.
 - **The end.** When the goal ends, the Room is closed, the containers are stopped, each agent's
   home is copied out of its container into the record without its tokens, and every container
-  is removed.
+  is removed (with `--isolate`, also the gateway and the internal network).
 
 ## Serve-backed runtime modes
 
@@ -180,6 +222,7 @@ sensitive even though credential files are excluded.
 | `workspace.git` | the workspace each time it changed, tagged with the Room sequence it follows (`git --git-dir=runs/rom_…/workspace.git log`); `.env*` and `.sharednet/` are never included |
 | `agents/<seat>/turn-NNN.jsonl` | each turn's raw stream from the harness |
 | `agents/<seat>/home/` | the agent's own session files: Codex in `.codex/sessions/`, Claude Code in `.claude/projects/` |
+| `gateway/` | with `--isolate`: the gateway's access logs, `sharednet.log` and one per model API, each request with the container address it came from |
 
 ## Other ways to use it
 
@@ -193,8 +236,8 @@ sensitive even though credential files are excluded.
 ## Safety and cost
 
 - Inside its container, an agent's own sandbox and approval prompts are off: the container is
-  the sandbox. They can read and write your whole workspace and reach the network. **Point
-  `--workspace` at a copy** if the original must not change.
+  the sandbox. They can read and write your whole workspace and, unless the run is isolated,
+  reach the network. **Point `--workspace` at a copy** if the original must not change.
 - Agents use your Codex and Claude plans or keys. Set a `budget` and an `after`.
 - Ctrl-C, SIGTERM and SIGHUP stop and remove every container of a real-serve demo and
   leave the Room open. Close it from the Dashboard.
@@ -216,7 +259,7 @@ sensitive even though credential files are excluded.
 
 ## Known limits
 
-- Claude Code agents are covered by tests but have not yet run in a live goal.
+- Claude Code agents are covered by tests but have not yet run in a live goal, isolated or not.
 - `goal run` has been run on macOS with Docker Desktop; Linux is untested.
 - A budget is judged when turns end, so it can be passed by up to one turn per agent. The
   record's final numbers come from each agent's own session files, and are exact.

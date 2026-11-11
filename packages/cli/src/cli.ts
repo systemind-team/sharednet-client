@@ -10,7 +10,7 @@ import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner, type GuestDependencies } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
-import { cliPackage, discoverCodeProvenance, dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner } from "./goal-run.ts";
+import { REASONING_EFFORTS, cliPackage, discoverCodeProvenance, dockerRunner, isolationNames, parseAgents, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner, type ReasoningEffort } from "./goal-run.ts";
 import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, type ServeKickoff } from "./goal-serve-demo.ts";
 import { assertGoalRunHarnessAgentCount, getHarnessModeSpec, resolveGoalRunHarnessMode, resolveRuntimeHarnessMode, type RuntimeHarnessResolution } from "./harness-modes.ts";
 import { parseDuration } from "./triggers.ts";
@@ -131,14 +131,18 @@ const optionValueNames = new Set([
   "image",
   "web-search",
   "turn-limit",
+  "agent-user",
   "message-routing",
   "harness-mode",
   "kickoff",
   "type",
   "host",
   "port",
+  "reasoning-effort",
+  "context-window",
+  "compact-at",
 ]);
-const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate"]);
+const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate"]);
 
 /** Room mode is fixed at creation. Omission retains the service default. */
 function roomType(parsed: ParsedArguments): "board" | "compiled" | undefined {
@@ -599,7 +603,7 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "harness-mode"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
   if (namedMode !== undefined && ["mention-gate", "task-gate", "message-routing"].some((name) => parsed.options.has(name))) {
@@ -625,7 +629,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
@@ -641,13 +645,37 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
       throw localError("dirty_harness_source", "A frozen --harness-mode cannot run from a dirty sharednet-client checkout; commit or stash the CLI changes first.");
     }
   }
-  const webSearch = option(parsed, "web-search") ?? "live";
+  const isolate = parsed.options.get("isolate") === true;
+  // An isolated run has no web: a harness's own search runs on its model provider's side, past any gateway.
+  const webSearch = option(parsed, "web-search") ?? (isolate ? "off" : "live");
   if (webSearch !== "live" && webSearch !== "off") {
     throw localError("invalid_arguments", "--web-search is live or off.");
+  }
+  if (isolate && webSearch === "live") {
+    throw localError("invalid_arguments", "--isolate keeps the Agents off the web, and a harness's own web search would reach it from the model provider's side: leave --web-search off.");
   }
   const turnLimitMs = parsed.options.has("turn-limit") ? parseDuration(option(parsed, "turn-limit"), "--turn-limit") : undefined;
   if (turnLimitMs !== undefined && turnLimitMs < 60_000) {
     throw localError("invalid_arguments", "--turn-limit is at least 1m.");
+  }
+  const reasoningEffort = option(parsed, "reasoning-effort");
+  if (reasoningEffort !== undefined && !(REASONING_EFFORTS as readonly string[]).includes(reasoningEffort)) {
+    throw localError("invalid_arguments", `--reasoning-effort is one of ${REASONING_EFFORTS.join(", ")}.`);
+  }
+  const tokens = (name: string): number | undefined => {
+    const raw = option(parsed, name);
+    if (raw === undefined) return undefined;
+    if (!/^[1-9]\d{0,8}$/.test(raw)) throw localError("invalid_arguments", `--${name} is a number of tokens, such as 262144.`);
+    return Number(raw);
+  };
+  const contextWindow = tokens("context-window");
+  const compactAt = tokens("compact-at");
+  if (contextWindow !== undefined && compactAt !== undefined && compactAt >= contextWindow) {
+    throw localError("invalid_arguments", "--compact-at is fewer tokens than --context-window: the history is compacted before it fills the window.");
+  }
+  const tuned = [["--reasoning-effort", reasoningEffort], ["--context-window", contextWindow], ["--compact-at", compactAt]].filter(([, value]) => value !== undefined);
+  if (tuned.length > 0 && !agents.some((agent) => agent.driver === "codex")) {
+    throw localError("invalid_arguments", `${tuned.map(([name]) => name).join(", ")} tell Codex about its model; this run has no codex agent.`);
   }
   const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
   const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime(), { budget: true });
@@ -666,6 +694,8 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     {
       agents,
       image: option(parsed, "image") ?? null,
+      agentUser: option(parsed, "agent-user") ?? null,
+      isolate,
       workspace,
       env: dependencies.env,
       home: dependencies.env.HOME ?? homedir(),
@@ -695,7 +725,8 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     dependencies.stderr(`goal: ${roomId} is open; the record goes to ${out}\n`);
     // Ctrl-C ends the run without leaving Agents at work in containers nobody watches.
     const interrupt = () => {
-      spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents)]);
+      spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents), ...(plan.isolation ? [isolationNames(roomId).gateway] : [])]);
+      if (plan.isolation) spawnSync("docker", ["network", "rm", isolationNames(roomId).network]);
       dependencies.stderr(`goal: stopped; the Agents' containers are gone and ${roomId} is still open\n`);
       process.exit(130);
     };
@@ -724,6 +755,11 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           ...(codeProvenance ? { codeProvenance } : {}),
           webSearch,
           ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
+          codexModel: {
+            ...(reasoningEffort === undefined ? {} : { reasoningEffort: reasoningEffort as ReasoningEffort }),
+            ...(contextWindow === undefined ? {} : { contextWindow }),
+            ...(compactAt === undefined ? {} : { compactAt }),
+          },
         },
         { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
       );
