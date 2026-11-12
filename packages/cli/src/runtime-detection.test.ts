@@ -38,14 +38,14 @@ describe("driver detection", () => {
     });
   });
 
-  it("recognises Codex, treats the thread id as lineage only, and names exec as the entrypoint", () => {
+  it("recognises the executing Codex thread and names exec as the entrypoint", () => {
     expect(
       detectRuntime(
         { CODEX_SESSION_ID: "session-a", CODEX_THREAD_ID: "thread", CODEX_CI: "1" },
         noParent,
       ),
-    ).toEqual({ kind: "codex", anchor: "session-a", version: null, entrypoint: "exec", source: "detected" });
-    expect(detectRuntime({ CODEX_THREAD_ID: "thread" }, noParent).kind).toBe("custom");
+    ).toEqual({ kind: "codex", anchor: "thread", version: null, entrypoint: "exec", source: "detected" });
+    expect(detectRuntime({ CODEX_THREAD_ID: "thread" }, noParent)).toMatchObject({ kind: "codex", anchor: "thread" });
   });
 
   it("recognises the other documented drivers by their variable prefixes", () => {

@@ -622,9 +622,9 @@ export async function writeProjectRoomState(
 
 /**
  * The seat this call acts as. In order: `--as` or SHAREDNET_SEAT; the seat
- * tied to this session; the only seat there is. Two seats and no way to
- * tell them apart is refused rather than guessed, since guessing is how one
- * session ends up speaking as another.
+ * tied to this session; the only seat if its binding does not conflict with
+ * this session. A known different binding is refused even for one seat,
+ * since guessing is how one session ends up speaking as another.
  */
 export async function selectProjectSeat(
   cwd: string,
@@ -653,10 +653,12 @@ export async function selectProjectSeat(
     const mine = ids.filter((id) => room.seats[id]!.anchor_key === choice.anchorKey);
     if (mine.length === 1) return view(mine[0]!);
   }
-  if (ids.length === 1) return view(ids[0]!);
+  if (ids.length === 1 && (!choice.anchorKey || room.seats[ids[0]!]!.anchor_key === null)) {
+    return view(ids[0]!);
+  }
   if (ids.length === 0) return null;
   throw localError(
     "seat_selection_required",
-    `This directory holds ${ids.length} seats in ${room.room_id} and none is this session's; say which with --as <member_id> or SHAREDNET_SEAT: ${ids.join(", ")}`,
+    `This directory holds ${ids.length} seats in ${room.room_id} but none uniquely matches this session; join as this session, or select explicitly with --as <member_id> or SHAREDNET_SEAT: ${ids.join(", ")}`,
   );
 }

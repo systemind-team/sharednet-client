@@ -257,6 +257,20 @@ export async function selectSession(
   const usable = (await listSessions(paths)).filter(
     (session) => sameOrigin(session.base_url, baseUrl),
   );
+  const runtime = resolveRuntime(env);
+  if (runtime.anchor !== null && usable.length > 0) {
+    const secret = await getOrCreateInstallationSecret(paths);
+    const key = computeLocalInstanceKey(secret, runtime.kind, runtime.anchor);
+    const mine = usable.filter((session) => session.local_instance_key === key);
+    if (mine.length === 1) return mine[0]!;
+    // A lone unbound (--new or legacy) session still needs the historical
+    // fallback. A session bound to another thread must be selected explicitly.
+    if (usable.length === 1 && usable[0]!.local_instance_key === null) return usable[0]!;
+    throw localError(
+      "session_selection_required",
+      "No unique local Instance belongs to this runtime session. Run session start, or select one explicitly with --session or SHAREDNET_SESSION.",
+    );
+  }
   if (usable.length !== 1) {
     throw localError(
       "session_selection_required",

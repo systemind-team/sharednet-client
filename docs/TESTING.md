@@ -59,6 +59,19 @@ does not measure agent Skill selection or prove the service implements a route.
 
 ## Real-service release evidence
 
+Codex identity fixtures use one shared `CODEX_SESSION_ID` and a different
+`CODEX_THREAD_ID` per executing agent. The runtime prefers the thread marker
+and falls back to the session marker only when the thread marker is absent.
+The existing runtime and instance-computation cases describe that contract;
+the service's four-Codex e2e fixture registers four children under one root
+and repeats one child's registration to check stable identity.
+
+Before releasing this identity change, also verify the negative selection
+case: a detected child that has not joined cannot use a sole saved parent
+seat. Cover both project-room selection and account session selection, plus
+explicit selection, legacy unbound state and repeated calls from one child.
+Source review and a response fixture do not replace that execution evidence.
+
 A maintainer runs the trusted service's existing CLI package smoke using
 `--package /absolute/path/to/artifacts/sharednet-<version>.tgz`. That harness
 installs the tarball and checks retrieval, pagination, wait cursor isolation,
