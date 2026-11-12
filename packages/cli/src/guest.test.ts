@@ -2334,13 +2334,13 @@ describe("sharednet say and wait", () => {
     it("saves progress privately without any Room request and replaces the previous checkpoint", async () => {
       const space = await workspace();
       await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
-      const saved = await run(["wake", "checkpoint", "Completed test; next inspect CI", "--json"], space, []);
+      const saved = await run(["wake", "checkpoint", "Completed test; next inspect CI", "--json"], space, [], CODEX);
       expect(saved.exitCode).toBe(0);
       expect(saved.requests).toHaveLength(0);
       const path = JSON.parse(saved.stdout).checkpoint_path;
       expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ room_id: ROOM_ID, member_id: MEMBER_ID, progress: "Completed test; next inspect CI" });
       expect((await stat(path)).mode & 0o777).toBe(0o600);
-      await run(["wake", "checkpoint", "CI green; next review", "--json"], space, []);
+      await run(["wake", "checkpoint", "CI green; next review", "--json"], space, [], CODEX);
       expect(JSON.parse(await readFile(path, "utf8")).progress).toBe("CI green; next review");
     });
 
@@ -2351,7 +2351,7 @@ describe("sharednet say and wait", () => {
       const runTurn: TurnRunner = async (spec) => {
         turns.push(spec);
         if (turns.length === 1) {
-          expect((await run(["wake", "limit", "90m", "--json"], space, [])).exitCode).toBe(0);
+          expect((await run(["wake", "limit", "90m", "--json"], space, [], CODEX)).exitCode).toBe(0);
         }
         return turns.length === 1
           ? { exitCode: 143, stdout: "", stderr: "", timedOut: true }
@@ -2716,8 +2716,8 @@ describe("sharednet say and wait", () => {
         },
         sleep: async () => {
           slept += 1;
-          if (slept === 1) expect((await run(["wake", "off", "--json"], space, [])).exitCode).toBe(0);
-          if (slept === 2) expect((await run(["wake", "set", "command", "--command", "/opt/bots/replacement", "--json"], space, [])).exitCode).toBe(0);
+          if (slept === 1) expect((await run(["wake", "off", "--json"], space, [], CODEX)).exitCode).toBe(0);
+          if (slept === 2) expect((await run(["wake", "set", "command", "--command", "/opt/bots/replacement", "--json"], space, [], CODEX)).exitCode).toBe(0);
         },
       });
 
@@ -2782,7 +2782,7 @@ describe("sharednet say and wait", () => {
       const result = await run(["serve", "--json"], space, [
         {
           ...page([addressed(2, "@codex answer after being enabled")]),
-          entered: () => { void run(["wake", "off", "--json"], space, []).then(() => finishOff()); },
+          entered: () => { void run(["wake", "off", "--json"], space, [], CODEX).then(() => finishOff()); },
           wait: offWritten,
         },
         page([addressed(2, "@codex answer after being enabled")]),
@@ -2796,7 +2796,7 @@ describe("sharednet say and wait", () => {
           parked += 1;
           expect(turns).toHaveLength(0);
           expect(service.acked_through).toBe(1);
-          expect((await run(["wake", "set", "command", "--command", "/opt/bots/replacement", "--json"], space, [])).exitCode).toBe(0);
+          expect((await run(["wake", "set", "command", "--command", "/opt/bots/replacement", "--json"], space, [], CODEX)).exitCode).toBe(0);
         },
       });
 
@@ -2812,8 +2812,8 @@ describe("sharednet say and wait", () => {
       expect((await run(["join", PASTED_INVITE, "--no-wake"], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
       expect(JSON.parse((await run(["wake", "--json"], space, [])).stdout)).toMatchObject({ member_id: MEMBER_ID, wake: null });
 
-      // From inside the Codex session being set, its thread and home are taken from it.
-      const codex = await run(["wake", "set", "codex", "--command", "/launchers/codex-room-bypass.sh", "--json"], space, [], CODEX);
+      // Intentionally reconfigure the Claude-owned seat from Codex: select it explicitly.
+      const codex = await run(["wake", "set", "codex", "--as", MEMBER_ID, "--command", "/launchers/codex-room-bypass.sh", "--json"], space, [], CODEX);
       expect(JSON.parse(codex.stdout).wake).toEqual({
         driver: "codex", session: "019a-codex-thread", cwd: space.project, command: "/launchers/codex-room-bypass.sh", codex_home: "/codex-home",
       });
