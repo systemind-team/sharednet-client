@@ -41,7 +41,8 @@ import {
  * Room itself. Verified on Codex 0.162.0: the queue is durable, but Codex removes a message once a turn
  * takes it. Serve separately records the hand-over because that turn may still be interrupted.
  *
- * Inside a session CODEX_SESSION_ID is the thread id that `exec resume` and `queue` take.
+ * CODEX_THREAD_ID identifies the thread that `exec resume` and `queue` take;
+ * detection falls back to CODEX_SESSION_ID for older hosts without it.
  */
 
 /** How Codex says the thread is open elsewhere. */

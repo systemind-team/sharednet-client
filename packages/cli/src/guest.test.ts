@@ -2334,13 +2334,13 @@ describe("sharednet say and wait", () => {
     it("saves progress privately without any Room request and replaces the previous checkpoint", async () => {
       const space = await workspace();
       await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
-      const saved = await run(["wake", "checkpoint", "Completed test; next inspect CI", "--json"], space, []);
+      const saved = await run(["wake", "checkpoint", "Completed test; next inspect CI", "--json"], space, [], CODEX);
       expect(saved.exitCode).toBe(0);
       expect(saved.requests).toHaveLength(0);
       const path = JSON.parse(saved.stdout).checkpoint_path;
       expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ room_id: ROOM_ID, member_id: MEMBER_ID, progress: "Completed test; next inspect CI" });
       expect((await stat(path)).mode & 0o777).toBe(0o600);
-      await run(["wake", "checkpoint", "CI green; next review", "--json"], space, []);
+      await run(["wake", "checkpoint", "CI green; next review", "--json"], space, [], CODEX);
       expect(JSON.parse(await readFile(path, "utf8")).progress).toBe("CI green; next review");
     });
 
@@ -2351,7 +2351,7 @@ describe("sharednet say and wait", () => {
       const runTurn: TurnRunner = async (spec) => {
         turns.push(spec);
         if (turns.length === 1) {
-          expect((await run(["wake", "limit", "90m", "--json"], space, [])).exitCode).toBe(0);
+          expect((await run(["wake", "limit", "90m", "--json"], space, [], CODEX)).exitCode).toBe(0);
         }
         return turns.length === 1
           ? { exitCode: 143, stdout: "", stderr: "", timedOut: true }
@@ -2716,8 +2716,8 @@ describe("sharednet say and wait", () => {
         },
         sleep: async () => {
           slept += 1;
-          if (slept === 1) expect((await run(["wake", "off", "--json"], space, [])).exitCode).toBe(0);
-          if (slept === 2) expect((await run(["wake", "set", "command", "--command", "/opt/bots/replacement", "--json"], space, [])).exitCode).toBe(0);
+          if (slept === 1) expect((await run(["wake", "off", "--json"], space, [], CODEX)).exitCode).toBe(0);
+          if (slept === 2) expect((await run(["wake", "set", "command", "--command", "/opt/bots/replacement", "--json"], space, [], CODEX)).exitCode).toBe(0);
         },
       });
 
@@ -2782,7 +2782,7 @@ describe("sharednet say and wait", () => {
       const result = await run(["serve", "--json"], space, [
         {
           ...page([addressed(2, "@codex answer after being enabled")]),
-          entered: () => { void run(["wake", "off", "--json"], space, []).then(() => finishOff()); },
+          entered: () => { void run(["wake", "off", "--json"], space, [], CODEX).then(() => finishOff()); },
           wait: offWritten,
         },
         page([addressed(2, "@codex answer after being enabled")]),
@@ -2796,7 +2796,7 @@ describe("sharednet say and wait", () => {
           parked += 1;
           expect(turns).toHaveLength(0);
           expect(service.acked_through).toBe(1);
-          expect((await run(["wake", "set", "command", "--command", "/opt/bots/replacement", "--json"], space, [])).exitCode).toBe(0);
+          expect((await run(["wake", "set", "command", "--command", "/opt/bots/replacement", "--json"], space, [], CODEX)).exitCode).toBe(0);
         },
       });
 
@@ -2812,8 +2812,8 @@ describe("sharednet say and wait", () => {
       expect((await run(["join", PASTED_INVITE, "--no-wake"], space, [joined([message(1, "Welcome")])])).exitCode).toBe(0);
       expect(JSON.parse((await run(["wake", "--json"], space, [])).stdout)).toMatchObject({ member_id: MEMBER_ID, wake: null });
 
-      // From inside the Codex session being set, its thread and home are taken from it.
-      const codex = await run(["wake", "set", "codex", "--command", "/launchers/codex-room-bypass.sh", "--json"], space, [], CODEX);
+      // Intentionally reconfigure the Claude-owned seat from Codex: select it explicitly.
+      const codex = await run(["wake", "set", "codex", "--as", MEMBER_ID, "--command", "/launchers/codex-room-bypass.sh", "--json"], space, [], CODEX);
       expect(JSON.parse(codex.stdout).wake).toEqual({
         driver: "codex", session: "019a-codex-thread", cwd: space.project, command: "/launchers/codex-room-bypass.sh", codex_home: "/codex-home",
       });
@@ -4269,6 +4269,44 @@ describe("sharednet say and wait", () => {
     expect(nobody.exitCode).not.toBe(0);
     expect(nobody.requests).toHaveLength(0);
     expect(JSON.parse(nobody.stderr).error.code).toBe("account_required");
+  });
+
+  it("refuses a Codex child borrowing its sole parent seat, then selects the child's own joined seat", async () => {
+    const space = await workspace();
+    const parent = { CLAUDE_SESSION_ID: "", CODEX_SESSION_ID: "shared-root", CODEX_THREAD_ID: "shared-root" };
+    const child = { ...parent, CODEX_THREAD_ID: "child-thread" };
+    const parentJoin = await run(["join", PASTED_INVITE, "--no-wake", "--json"], space, [joined()], parent);
+    expect(parentJoin.exitCode).toBe(0);
+    const denied = await run(["say", "from child", "--json"], space, [], child);
+    expect(denied.exitCode).toBe(2);
+    expect(denied.requests).toEqual([]);
+    expect(JSON.parse(denied.stderr).error.code).toBe("seat_selection_required");
+
+    const explicit = await run(["say", "deliberately as parent", "--json"], space, [
+      { status: 201, body: { message: message(1, "deliberately as parent") } },
+    ], { ...child, SHAREDNET_SEAT: MEMBER_ID });
+    expect(explicit.exitCode).toBe(0);
+    expect(header(explicit.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+
+    const childId = "i_Child00001";
+    const childToken = `sni_${"C".repeat(43)}`;
+    const childResponse = joined();
+    childResponse.body.membership.member_id = childId;
+    childResponse.body.member_token = childToken;
+    const childJoin = await run(["join", PASTED_INVITE, "--no-wake", "--json"], space, [childResponse], child);
+    expect(childJoin.exitCode).toBe(0);
+    for (const sequence of [2, 3]) {
+      const said = await run(["say", "from child", "--json"], space, [
+        { status: 201, body: { message: message(sequence, "from child") } },
+      ], child);
+      expect(said.exitCode).toBe(0);
+      expect(header(said.requests[0]!, "authorization")).toBe(`Bearer ${childToken}`);
+    }
+    const parentSays = await run(["say", "still parent", "--json"], space, [
+      { status: 201, body: { message: message(4, "still parent") } },
+    ], parent);
+    expect(parentSays.exitCode).toBe(0);
+    expect(header(parentSays.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
   });
 
   it("keeps two sessions in one directory as two seats: each says and waits as its own, and a stranger must say which", async () => {

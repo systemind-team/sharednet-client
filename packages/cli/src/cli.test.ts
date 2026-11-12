@@ -41,7 +41,7 @@ async function harness(
     SHAREDNET_BASE_URL: "http://127.0.0.1:3001",
     SHAREDNET_API_KEY: "snk_never-send-in-json",
     CODEX_SESSION_ID: "provider-session-must-remain-local",
-    CODEX_THREAD_ID: "lineage-only",
+    CODEX_THREAD_ID: "provider-thread-must-remain-local",
     ...environment,
   };
 
@@ -143,7 +143,7 @@ describe("sharednet CLI vertical slice", () => {
     ]);
     const registration = JSON.stringify(result.requests[0]?.init.body);
     expect(registration).not.toContain("provider-session-must-remain-local");
-    expect(registration).not.toContain("lineage-only");
+    expect(registration).not.toContain("provider-thread-must-remain-local");
     expect(registration).not.toContain("snk_never-send-in-json");
     const body = sentBody(result.requests[0]!);
     const packageManifest = JSON.parse(
@@ -170,7 +170,7 @@ describe("sharednet CLI vertical slice", () => {
       const run = await harness(
         ["session", "start", "--json"],
         [registered(`i_${index + 1}`)],
-        { ...sharedEnv, CODEX_SESSION_ID: anchor },
+        { ...sharedEnv, CODEX_THREAD_ID: anchor },
       );
       sessions.push(JSON.parse(run.stdout[0]!).session_id);
     }
