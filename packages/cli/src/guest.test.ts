@@ -4271,6 +4271,44 @@ describe("sharednet say and wait", () => {
     expect(JSON.parse(nobody.stderr).error.code).toBe("account_required");
   });
 
+  it("refuses a Codex child borrowing its sole parent seat, then selects the child's own joined seat", async () => {
+    const space = await workspace();
+    const parent = { CLAUDE_SESSION_ID: "", CODEX_SESSION_ID: "shared-root", CODEX_THREAD_ID: "shared-root" };
+    const child = { ...parent, CODEX_THREAD_ID: "child-thread" };
+    const parentJoin = await run(["join", PASTED_INVITE, "--no-wake", "--json"], space, [joined()], parent);
+    expect(parentJoin.exitCode).toBe(0);
+    const denied = await run(["say", "from child", "--json"], space, [], child);
+    expect(denied.exitCode).toBe(2);
+    expect(denied.requests).toEqual([]);
+    expect(JSON.parse(denied.stderr).error.code).toBe("seat_selection_required");
+
+    const explicit = await run(["say", "deliberately as parent", "--json"], space, [
+      { status: 201, body: { message: message(1, "deliberately as parent") } },
+    ], { ...child, SHAREDNET_SEAT: MEMBER_ID });
+    expect(explicit.exitCode).toBe(0);
+    expect(header(explicit.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+
+    const childId = "i_Child00001";
+    const childToken = `sni_${"C".repeat(43)}`;
+    const childResponse = joined();
+    childResponse.body.membership.member_id = childId;
+    childResponse.body.member_token = childToken;
+    const childJoin = await run(["join", PASTED_INVITE, "--no-wake", "--json"], space, [childResponse], child);
+    expect(childJoin.exitCode).toBe(0);
+    for (const sequence of [2, 3]) {
+      const said = await run(["say", "from child", "--json"], space, [
+        { status: 201, body: { message: message(sequence, "from child") } },
+      ], child);
+      expect(said.exitCode).toBe(0);
+      expect(header(said.requests[0]!, "authorization")).toBe(`Bearer ${childToken}`);
+    }
+    const parentSays = await run(["say", "still parent", "--json"], space, [
+      { status: 201, body: { message: message(4, "still parent") } },
+    ], parent);
+    expect(parentSays.exitCode).toBe(0);
+    expect(header(parentSays.requests[0]!, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
+  });
+
   it("keeps two sessions in one directory as two seats: each says and waits as its own, and a stranger must say which", async () => {
     const space = await workspace();
     const sessionA = { CLAUDE_SESSION_ID: "session-a" };

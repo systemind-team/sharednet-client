@@ -66,15 +66,23 @@ The existing runtime and instance-computation cases describe that contract;
 the service's four-Codex e2e fixture registers four children under one root
 and repeats one child's registration to check stable identity.
 
-Before releasing this identity change, also verify the negative selection
-case: a detected child that has not joined cannot use a sole saved parent
-seat. Cover both project-room selection and account session selection, plus
-explicit selection, legacy unbound state and repeated calls from one child.
-Source review and a response fixture do not replace that execution evidence.
+`storage.test.ts` covers both account and project-room selection: an unjoined
+child cannot use the sole parent seat, each child repeatedly selects its own
+seat, ambiguous matches fail, explicit selection still checks account origin,
+and unbound/undetected singletons remain compatible. `guest.test.ts` exercises
+the CLI refusal before a network request and the child's own seat after join.
+Runtime/HMAC cases cover blank-marker fallback, root identity continuity and
+per-call stability; wake capture must select the child thread too.
+
+The service's real-HTTP scenario additionally checks that re-registering one
+child invalidates its old token while leaving a sibling's token usable. The
+client's response fixtures do not replace that service execution evidence.
 
 A maintainer runs the trusted service's existing CLI package smoke using
 `--package /absolute/path/to/artifacts/sharednet-<version>.tgz`. That harness
-installs the tarball and checks retrieval, pagination, wait cursor isolation,
+installs the tarball and checks parent/child identity isolation, stable child
+registration and refusal to borrow the sole parent before registering. It
+also checks retrieval, pagination, wait cursor isolation,
 and a Unicode-named binary upload/download through a real HTTP handler.
 
 Record service source commit, client source commit, tarball SHA-256 and command

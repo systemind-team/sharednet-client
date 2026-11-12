@@ -48,6 +48,19 @@ describe("driver detection", () => {
     expect(detectRuntime({ CODEX_THREAD_ID: "thread" }, noParent)).toMatchObject({ kind: "codex", anchor: "thread" });
   });
 
+  it.each([undefined, "", " \t "])("falls back to the root session when the thread marker is %j", (thread) => {
+    expect(detectRuntime({ CODEX_SESSION_ID: "legacy-session", CODEX_THREAD_ID: thread }, noParent))
+      .toMatchObject({ kind: "codex", anchor: "legacy-session" });
+  });
+
+  it("trims the executing thread and ignores changing per-call identifiers", () => {
+    const env = { CODEX_SESSION_ID: "root-session", CODEX_THREAD_ID: " child-thread " };
+    for (const call of ["call-one", "call-two"]) {
+      expect(detectRuntime({ ...env, CODEX_TOOL_CALL_ID: call }, noParent))
+        .toMatchObject({ kind: "codex", anchor: "child-thread" });
+    }
+  });
+
   it("recognises the other documented drivers by their variable prefixes", () => {
     expect(detectRuntime({ OPENCODE_SESSION_ID: "s1" }, noParent)).toMatchObject({ kind: "opencode", anchor: "s1" });
     expect(detectRuntime({ OPENHANDS_CONVERSATION_ID: "c1" }, noParent)).toMatchObject({ kind: "openhands", anchor: "c1" });

@@ -55,4 +55,16 @@ describe("Instance Computation", () => {
     expect(new Set(keys)).toHaveLength(4);
     expect(computeLocalInstanceKey(secret, "codex", "a")).toBe(keys[0]);
   });
+
+  it("keeps a root's existing HMAC and gives its children distinct stable HMACs", () => {
+    const secret = Buffer.alloc(32, 17).toString("base64url");
+    const key = (thread: string, call: string) => {
+      const detected = detectRuntimeSession({ CODEX_SESSION_ID: "root", CODEX_THREAD_ID: thread, CODEX_TOOL_CALL_ID: call });
+      expect(detected).not.toBeNull();
+      return computeLocalInstanceKey(secret, detected!.runtimeKind, detected!.anchor);
+    };
+    expect(key("root", "call-a")).toBe(computeLocalInstanceKey(secret, "codex", "root"));
+    expect(new Set([key("root", "call-a"), key("child-a", "call-b"), key("child-b", "call-c")]).size).toBe(3);
+    expect(key("child-a", "call-d")).toBe(key("child-a", "call-b"));
+  });
 });
