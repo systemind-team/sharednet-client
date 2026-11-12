@@ -1,0 +1,54 @@
+{
+  "format": "sharednet-experiment-protocol-v1",
+  "protocol_id": "sharednet-qwen35-9b-dynamic-v1",
+  "state": "draft",
+  "frozen_at": null,
+  "design": {
+    "model_family": "Qwen3.5-9B",
+    "model_provider": "OpenRouter",
+    "model_api_base_url": "https://openrouter.ai/api/v1",
+    "native_subagents_enabled": false,
+    "team_size": 4,
+    "organization": "dynamic",
+    "learning_seats": 1,
+    "partner_policy": "three-frozen-partners",
+    "arms": ["base", "selective-sft", "selective-sft-rl"],
+    "primary_benchmark": "ProgramBench",
+    "frontier_science": "evaluation-only"
+  },
+  "development_pilot_plan": {
+    "scope": "Development tasks only; not the final A/B/C experimental budget",
+    "wall_clock_minutes": 60,
+    "team_fresh_token_threshold": 10000000,
+    "budget_stop_rule": "Stop on the first budget bound reached; record observed usage and overshoot",
+    "fresh_token_definition": "Uncached input plus output across all four seats",
+    "turn_policy_candidate": "cooperative-v1; requires an integrated-build pilot before selection"
+  },
+  "unresolved_decisions": [
+    "Integrated runner commit, package, Codex version and image digests; capability evidence for open-model isolation and disabled native subagents",
+    "Exact OpenRouter model ID/revision, backend routing/fallback settings, seat identities, frozen partners, tokenizer and serialization",
+    "Task inventory, grouped splits, difficulty source and exclusion of previously inspected pilot tasks",
+    "Common turn policy after piloting cooperative-v1; preserve opening and wake templates and use the same selected policy across A/B/C",
+    "Routing, gates, initiation, termination, verifier feedback and idle policy; integrate and verify Chengrui's consensus/remind branch or the selected alternative",
+    "Final experimental team and per-turn budgets after 60-minute/10M-fresh-token development pilots; verify timeout wake acknowledgements, accounting and overshoot; sampling, context and compaction settings",
+    "Worker resources, tool/network permissions and reference-query allowance",
+    "Evaluator snapshots, score definitions, repeats, seeds, run order and exclusions",
+    "Selective-SFT selection/audit rules, training recipe and development-only checkpoint selection",
+    "RL recipe, rewards, penalties, training budget and development-only checkpoint selection",
+    "AWS acceptance pilots on the exact integrated build, clean-copy compile.sh check and human approval of the complete artifact inventory"
+  ],
+  "artifacts": {
+    "runner_build": { "path": null, "sha256": null },
+    "models_and_seats": { "path": null, "sha256": null },
+    "prompts": { "path": null, "sha256": null },
+    "tasks_and_splits": { "path": null, "sha256": null },
+    "launch_and_controls": { "path": null, "sha256": null },
+    "evaluation": { "path": null, "sha256": null },
+    "sft_recipe": { "path": null, "sha256": null },
+    "rl_recipe": { "path": null, "sha256": null },
+    "annotation_and_audit": { "path": null, "sha256": null },
+    "replication_and_exclusions": { "path": null, "sha256": null },
+    "pilot_acceptance": { "path": null, "sha256": null },
+    "approval": { "path": null, "sha256": null }
+  }
+}

@@ -12,6 +12,10 @@ For optional title claims and before-post mention delivery, see
 For reproducible research treatments, use the immutable names in the
 [frozen harness mode catalog](harness-modes.md).
 
+For the four-agent Qwen3.5-9B learning study, see the
+[freeze-ready experimental protocol](experiments/sharednet-9b-dynamic-protocol.md).
+Its draft manifest is not an approved configuration.
+
 For a reproducible three-agent experiment that uses the production listener
 instead of Goal's runner-owned delivery loop, select a versioned runtime mode:
 

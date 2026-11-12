@@ -730,6 +730,10 @@
     "docs/research.md",
     "packages/cli/src/reply-outbox.ts",
     "packages/cli/src/reply-outbox.test.ts",
-    "docs/superpowers/plans/2026-11-10-durable-native-reply.md"
+    "docs/superpowers/plans/2026-11-10-durable-native-reply.md",
+    "docs/experiments/sharednet-9b-dynamic-protocol.md",
+    "docs/experiments/sharednet-9b-dynamic.template.json",
+    "scripts/check-experiment-protocol.mjs",
+    "scripts/check-experiment-protocol.test.mjs"
   ]
 }
