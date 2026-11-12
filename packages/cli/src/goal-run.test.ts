@@ -14,11 +14,15 @@ import { resolveGoalRunHarnessMode } from "./harness-modes.ts";
 import {
   AGENT_DOCKERFILE,
   DEFAULT_IMAGE,
+  GATEWAY_IMAGE,
   TurnReader,
+  codexApi,
   codexSessionUsage,
   containerName,
   discoverCodeProvenance,
   freshTokens,
+  gatewayTemplate,
+  isolationNames,
   loopbackPort,
   openingPrompt,
   parseAgents,
@@ -104,6 +108,12 @@ describe("--agent", () => {
     }
   });
 
+  it("takes a model name with a router's variant after a colon of its own", () => {
+    expect(parseAgents(["codex:qwen/qwen3.8-27b:nitro"])).toEqual([{ name: "codex-1", driver: "codex", model: "qwen/qwen3.8-27b:nitro" }]);
+    expect(() => parseAgents(["codex::nitro"])).toThrow();
+    expect(() => parseAgents(["codex:qwen 3"])).toThrow();
+  });
+
   it("starts up to fifty, so a team can be scaled past eight", () => {
     const seats = parseAgents(Array.from({ length: 50 }, (_, index) => (index % 2 === 0 ? "codex" : "claude-code")));
     expect(seats).toHaveLength(50);
@@ -117,7 +127,7 @@ describe("a turn", () => {
   it("starts a harness with nothing asked of a person, and resumes the same session on the next wake", () => {
     const codex = { name: "codex-1", driver: "codex" as const, model: "gpt-6-luna" };
     expect(turnCommand(codex, "the goal", null)).toEqual([
-      "timeout", "1200", "codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", 'web_search="live"', "-m", "gpt-6-luna", "the goal",
+      "timeout", "1200", "codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", 'web_search="live"', "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-m", "gpt-6-luna", "the goal",
     ]);
     expect(turnCommand(codex, "new lines", "thread-1").slice(2, 5)).toEqual(["codex", "exec", "resume"]);
     expect(turnCommand(codex, "new lines", "thread-1").slice(-2)).toEqual(["thread-1", "new lines"]);
@@ -132,6 +142,54 @@ describe("a turn", () => {
     expect(turnCommand(codex, "the goal", null, "live", 2700).slice(0, 3)).toEqual(["timeout", "2700", "codex"]);
     const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
     expect(turnCommand(claude, "new lines", "session-1", "live", 2700).slice(0, 3)).toEqual(["timeout", "2700", "claude"]);
+  });
+
+  it("gives Codex a provider of its own for a model API other than OpenAI's, over HTTP", () => {
+    const [codex] = parseAgents(["codex:qwen/qwen3.8-27b"]);
+    expect(codexApi(undefined)).toEqual({ origin: "https://api.openai.com", path: "/v1", custom: false });
+    expect(codexApi("https://openrouter.ai/api/v1/")).toEqual({ origin: "https://openrouter.ai", path: "/api/v1", custom: true });
+    expect(codexApi("https://api.openai.com")).toEqual({ origin: "https://api.openai.com", path: "/v1", custom: false });
+    expect(() => codexApi("ftp://openrouter.ai")).toThrow();
+    const turn = turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/api/v1", custom: true }).join(" ");
+    expect(turn).toContain('-c model_provider="goal_api"');
+    expect(turn).toContain('-c model_providers.goal_api.base_url="http://gateway:8080/api/v1"');
+    expect(turn).toContain('-c model_providers.goal_api.env_key="OPENAI_API_KEY"');
+    expect(turn).toContain('-c model_providers.goal_api.wire_api="responses"');
+    expect(turn).toContain("-c model_providers.goal_api.supports_websockets=false");
+    expect(turn).toContain("-m qwen/qwen3.8-27b");
+    expect(turn).not.toContain("openai_base_url");
+    // How hard the model reasons is set only when the run says so.
+    const tuned = turnCommand(codex!, "the goal", null, "off", 1200, null, { reasoningEffort: "medium", contextWindow: 262144, compactAt: 150000 }).join(" ");
+    expect(tuned).toContain('-c model_reasoning_effort="medium"');
+    expect(tuned).toContain("-c model_context_window=262144");
+    expect(tuned).toContain("-c model_auto_compact_token_limit=150000");
+    expect(turn).not.toContain("model_reasoning_effort");
+    expect(turn).not.toContain("model_context_window");
+    // OpenAI's own API keeps Codex's built-in provider, at the gateway when the run is isolated.
+    const openai = turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/v1", custom: false }).join(" ");
+    expect(openai).toContain('-c openai_base_url="http://gateway:8080/v1"');
+    expect(openai).not.toContain("model_provider");
+  });
+
+  it("gives a Codex seat no sub-agents, on a first turn and a resumed one, whatever its model API", () => {
+    const [codex] = parseAgents(["codex:qwen/qwen3.5-9b"]);
+    const turns = [
+      turnCommand(codex!, "the goal", null),
+      turnCommand(codex!, "new lines", "thread-1"),
+      turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/api/v1", custom: true }, { reasoningEffort: "medium" }),
+      turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/v1", custom: false }),
+    ];
+    for (const turn of turns) {
+      for (const feature of ["features.multi_agent=false", "features.multi_agent_v2=false"]) {
+        const at = turn.indexOf(feature);
+        expect(at).toBeGreaterThan(-1);
+        expect(turn[at - 1]).toBe("-c");
+        // A flag, not the prompt: it stands before the session id and the prompt at the end.
+        expect(at).toBeLessThan(turn.length - 2);
+      }
+    }
+    const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
+    expect(turnCommand(claude, "the goal", null).join(" ")).not.toContain("multi_agent");
   });
 
   it("takes web search away from every Agent when it is off, for a benchmark that forbids the internet", () => {
@@ -708,6 +766,202 @@ describe("runGoal", () => {
         "codex-2": expect.stringMatching(/^[0-9a-f]{64}$/),
       });
     }
+  });
+});
+
+describe("an isolated run", () => {
+  it("is prepared only with a key the gateway can sign with, and its gateway image", async () => {
+    const home = await temporary();
+    await mkdir(join(home, "cli", "src"), { recursive: true });
+    await writeFile(join(home, "cli", "package.json"), "{}");
+    await mkdir(join(home, ".codex"), { recursive: true });
+    await writeFile(join(home, ".codex", "auth.json"), "{}");
+    const base = { agents: parseAgents(["codex"]), image: null, workspace: home, home, entry: join(home, "cli", "src", "main.ts") };
+    const ready = fakeDocker(() => ({ code: 0 }));
+    // A Codex login lives in the container that uses it; the gateway can only sign with a key.
+    await expect(prepareRun({ ...base, env: {}, isolate: true }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "agent_auth_missing" });
+
+    // The gateway's image is pulled when it is not here; the model origins follow this machine's own settings.
+    const missing = fakeDocker((call) => ({ code: call.args[0] === "image" && call.args.includes(GATEWAY_IMAGE) ? 1 : 0 }));
+    const plan = await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-test", OPENAI_BASE_URL: "https://llm.example.test/v1" }, isolate: true, agentUser: "agent" }, missing.docker, () => undefined);
+    expect(missing.calls.some((call) => call.args.join(" ") === `pull ${GATEWAY_IMAGE}`)).toBe(true);
+    expect(plan).toMatchObject({ agentUser: "agent", isolation: { openai: "https://llm.example.test", anthropic: "https://api.anthropic.com" }, codexAuth: { kind: "api-key" } });
+    // Another model API: its key in OPENAI_API_KEY, its path kept; a Codex login signs in to OpenAI alone.
+    const routed = await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-or-test", OPENAI_BASE_URL: "https://openrouter.ai/api/v1" }, isolate: true }, ready.docker, () => undefined);
+    expect(routed).toMatchObject({ isolation: { openai: "https://openrouter.ai" }, codexApi: { origin: "https://openrouter.ai", path: "/api/v1", custom: true } });
+    await expect(prepareRun({ ...base, env: { OPENAI_BASE_URL: "https://openrouter.ai/api/v1" } }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "agent_auth_missing" });
+    // Not isolated, nothing changes: the default user and no gateway.
+    expect(await prepareRun({ ...base, env: {} }, ready.docker, () => undefined)).toMatchObject({ agentUser: "node", isolation: null });
+  });
+
+  it("has a gateway that names the keys it signs with and holds none of them", () => {
+    const template = gatewayTemplate({
+      sharednet: "https://www.sharednet.ai",
+      isolation: { openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" },
+      codex: true,
+      claudeAuth: "ANTHROPIC_API_KEY",
+    });
+    expect(template).toContain("listen 8081;");
+    expect(template).toContain("proxy_pass https://www.sharednet.ai;");
+    expect(template).toContain('proxy_set_header Authorization "Bearer ${OPENAI_API_KEY}";');
+    expect(template).toContain('proxy_set_header x-api-key "${ANTHROPIC_API_KEY}";');
+    expect(gatewayTemplate({ sharednet: "https://www.sharednet.ai", isolation: { openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" }, codex: false, claudeAuth: "CLAUDE_CODE_OAUTH_TOKEN" }))
+      .toContain('proxy_set_header Authorization "Bearer ${CLAUDE_CODE_OAUTH_TOKEN}";');
+  });
+
+  it.each([
+    ["OpenAI", undefined],
+    ["another model API", "https://openrouter.ai/api/v1"],
+  ] as const)("puts every container on an internal network behind the gateway, and keeps every key out, for %s", async (_name, baseUrl) => {
+    const out = await temporary();
+    const workspace = await temporary();
+    const api = codexApi(baseUrl);
+    const plan: RunPlan = {
+      image: "programbench-agent:1",
+      agentUser: "agent",
+      isolation: { openai: api.origin, anthropic: "https://api.anthropic.com" },
+      ...(api.custom ? { codexApi: api } : {}),
+      agents: parseAgents(["codex:gpt-6-luna"]),
+      workspace,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "api-key" },
+      claudeAuth: null,
+    };
+    const names = isolationNames(ROOM);
+    const { docker, calls } = fakeDocker((call, command) => {
+      if (call.args[0] === "inspect") return { stdout: "10.9.0.3\n" };
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_RunnerSeat1" }) };
+      if (command[2] === "codex") {
+        return { lines: [JSON.stringify({ type: "thread.started", thread_id: "thread-1" }), JSON.stringify({ type: "turn.completed", usage: { input_tokens: 2_000, cached_input_tokens: 0, output_tokens: 100 } })] };
+      }
+      if (command[0] === "sharednet" && command[1] === "wait") return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [{ kind: "closed" }], messages: [] }) };
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["budget 1k tokens", "after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) return { room: { id: ROOM, state: "open", goal }, memberships: [] };
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: "2026-10-05T12:01:00.000Z" } } } };
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    await runGoal(
+      client,
+      "sni_owner-seat",
+      OWNER_KEY,
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, webSearch: "off", ...(api.custom ? { codexModel: { reasoningEffort: "medium" as const, contextWindow: 262144, compactAt: 150000 } } : {}) },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
+    );
+
+    // The internal network first, then its gateway, which joins it as `gateway` and is the only container with a way out.
+    expect(calls[0]!.args).toEqual(["network", "create", "--internal", names.network]);
+    const gateway = calls.find((call) => call.args[0] === "run" && call.args.includes(names.gateway))!;
+    expect(gateway.args).not.toContain("--network");
+    expect(gateway.args).toContain(GATEWAY_IMAGE);
+    expect(gateway.args.join(" ")).toContain("-e GATEWAY_TEMPLATE -e OPENAI_API_KEY");
+    expect(gateway.env.GATEWAY_TEMPLATE).toContain(`proxy_pass ${api.origin};`);
+    expect(calls.some((call) => call.args.join(" ") === `network connect --alias gateway ${names.network} ${names.gateway}`)).toBe(true);
+    // Every other container is on the internal network, and none of them can reach this machine.
+    const runs = calls.filter((call) => call.args[0] === "run" && !call.args.includes(names.gateway));
+    expect(runs.map((call) => call.args[call.args.indexOf("--name") + 1])).toEqual([containerName(ROOM), containerName(ROOM, "codex-1")]);
+    expect(runs.every((call) => call.args.join(" ").includes(`--network ${names.network}`))).toBe(true);
+    expect(runs.every((call) => !call.args.includes("host.docker.internal:host-gateway"))).toBe(true);
+    // The Agents run as the image's user, and reach SharedNet on their own loopback, forwarded to the gateway.
+    const seatCalls = calls.filter((call) => call.args[0] === "exec" && call.args.includes(containerName(ROOM, "codex-1")) && !call.args.includes("root"));
+    expect(seatCalls.every((call) => call.args[call.args.indexOf("--user") + 1] === "agent")).toBe(true);
+    const forwarder = calls.find((call) => call.args[0] === "exec" && call.args.includes("--detach"))!;
+    expect(forwarder.args.slice(-2)).toEqual(["8081", "gateway"]);
+    const turn = calls.find((call) => call.args.includes("codex"))!;
+    expect(turn.args).toContain("SHAREDNET_BASE_URL=http://127.0.0.1:8081");
+    // Codex is pointed at the gateway by its config (it reads no OPENAI_BASE_URL), and holds a placeholder for the key.
+    // Another API is a provider of Codex's own at the gateway, with that API's path.
+    expect(turn.args.join(" ")).toContain(api.custom ? '-c model_providers.goal_api.base_url="http://gateway:8080/api/v1"' : '-c openai_base_url="http://gateway:8080/v1"');
+    expect(turn.args.join(" ").includes('-c model_reasoning_effort="medium"')).toBe(api.custom);
+    expect(turn.args.join(" ").includes("-c model_auto_compact_token_limit=150000")).toBe(api.custom);
+    expect(turn.args.find((arg) => arg.startsWith("OPENAI_API_KEY="))).toBe("OPENAI_API_KEY=sk-isolated-the-gateway-holds-the-key");
+    // The home of an image that has none is made as root, for the Agents' user.
+    expect(calls.some((call) => call.args.join(" ").includes("--user root") && call.args.join(" ").endsWith("mkdir -p /home/agents && chown agent /home/agents"))).toBe(true);
+
+    // The owner's key never reaches Docker; the invite travels by the client's environment, as before.
+    expect(calls.find((call) => call.args.includes("join"))!.env).toMatchObject({ SHAREDNET_INVITE_TOKEN: INVITE });
+    expect(calls.every((call) => !JSON.stringify(call).includes(OWNER_KEY))).toBe(true);
+
+    // The gateway's log goes into the record; the gateway and the network go with the containers.
+    expect(calls.filter((call) => call.args[0] === "cp" && call.args[1]!.startsWith(names.gateway)).map((call) => [call.args[1], call.args[2]])).toEqual([
+      [`${names.gateway}:/var/log/nginx/sharednet.log`, join(out, "gateway", "sharednet.log")],
+      [`${names.gateway}:/var/log/nginx/openai.log`, join(out, "gateway", "openai.log")],
+    ]);
+    expect(calls.some((call) => call.args.join(" ") === `logs ${names.gateway}`)).toBe(true);
+    expect(calls.slice(-3).map((call) => call.args.join(" "))).toEqual([
+      ["rm", "--force", ...runContainers(ROOM, plan.agents)].join(" "),
+      `rm --force ${names.gateway}`,
+      `network rm ${names.network}`,
+    ]);
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ isolated: true, agent_user: "agent", addresses: { "codex-1": "10.9.0.3" }, web_search: "off", model_api: baseUrl ?? "https://api.openai.com/v1", reasoning_effort: api.custom ? "medium" : null, context_window: api.custom ? 262144 : null, compact_at: api.custom ? 150000 : null });
+  });
+});
+
+describe("an image of your own", () => {
+  it("is prepared for a user that can be named, and the default image keeps its own", async () => {
+    const home = await temporary();
+    await mkdir(join(home, "cli", "src"), { recursive: true });
+    await writeFile(join(home, "cli", "package.json"), "{}");
+    const base = { agents: parseAgents(["codex"]), image: "programbench-agent:1", workspace: home, home, entry: join(home, "cli", "src", "main.ts"), env: { OPENAI_API_KEY: "sk-test" } };
+    const ready = fakeDocker(() => ({ code: 0 }));
+    await expect(prepareRun({ ...base, agentUser: "bad user" }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "invalid_arguments" });
+    expect(await prepareRun({ ...base, agentUser: "agent" }, ready.docker, () => undefined)).toMatchObject({ image: "programbench-agent:1", agentUser: "agent" });
+    expect(await prepareRun({ ...base, agentUser: "1000:1000" }, ready.docker, () => undefined)).toMatchObject({ agentUser: "1000:1000" });
+    expect(await prepareRun({ ...base, image: null }, ready.docker, () => undefined)).toMatchObject({ image: DEFAULT_IMAGE, agentUser: "node" });
+  });
+
+  it("runs the Agents as the image's user, and makes their homes for that user", async () => {
+    const out = await temporary();
+    const workspace = await temporary();
+    const plan: RunPlan = {
+      image: "programbench-agent:1",
+      agentUser: "agent",
+      agents: parseAgents(["codex"]),
+      workspace,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: { kind: "api-key" },
+      claudeAuth: null,
+    };
+    const { docker, calls } = fakeDocker((_call, command) => {
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_CodexOne01" }) };
+      if (command[2] === "codex") return { lines: [JSON.stringify({ type: "thread.started", thread_id: "thread-1" }), JSON.stringify({ type: "turn.completed", usage: { input_tokens: 2_000, cached_input_tokens: 0, output_tokens: 100 } })] };
+      if (command[0] === "sharednet" && command[1] === "wait") return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [{ kind: "closed" }], messages: [] }) };
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["budget 1k tokens", "after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) return { room: { id: ROOM, state: "open", goal }, memberships: [] };
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: "2026-10-05T12:01:00.000Z" } } } };
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    await runGoal(
+      client,
+      "sni_owner-seat",
+      OWNER_KEY,
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
+    );
+
+    // The image's own user runs everything an Agent or a check runs; only setting the container up runs as root.
+    const execs = calls.filter((call) => call.args[0] === "exec");
+    const users = new Set(execs.map((call) => call.args[call.args.indexOf("--user") + 1]));
+    expect(users).toEqual(new Set(["agent", "root"]));
+    expect(execs.filter((call) => call.args.includes("codex")).every((call) => call.args[call.args.indexOf("--user") + 1] === "agent")).toBe(true);
+    // The image has no home for the Agents, so one is made as root, for that user, before the seat is set up.
+    const homes = execs.findIndex((call) => call.args.join(" ").endsWith("mkdir -p /home/agents && chown agent /home/agents"));
+    expect(homes).toBeGreaterThan(-1);
+    expect(execs[homes]!.args[execs[homes]!.args.indexOf("--user") + 1]).toBe("root");
+    expect(homes).toBeLessThan(execs.findIndex((call) => call.args.includes("join")));
+    expect(calls.filter((call) => call.args[0] === "run").every((call) => call.args.includes("programbench-agent:1"))).toBe(true);
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ image: "programbench-agent:1", agent_user: "agent" });
   });
 });
 
