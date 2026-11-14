@@ -354,6 +354,23 @@ describe("reach: forming a group from the account CLI", () => {
     expect(refused.requests).toEqual([]);
   });
 
+  it("admits the large-team flags only with research mode and a deadline no longer than seven days", async () => {
+    const args = ["goal", "run", "no-such-goal-file.md", ...Array.from({ length: 100 }, () => ["--agent", "codex"]).flat()];
+    for (const [extra, refusal] of [
+      [["--until", "after: 7d"], "at most 50 Agents"],
+      [["--turn-concurrency", "12", "--until", "after: 7d"], "requires --research"],
+      [["--research", "--turn-concurrency", "13", "--until", "after: 7d"], "whole number from 1 to 12"],
+      [["--research", "--until", "budget: 5M tokens"], "requires one --until after"],
+      [["--research", "--until", "after: 8d"], "requires one --until after"],
+      [["--research", "--until", "after: 7d", "--check-every", "8d"], "names a file that could not be read"],
+    ] as const) {
+      const result = await harness([...args, ...extra, "--json"]);
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr.join(" ")).toContain(refusal);
+      expect(result.requests).toEqual([]);
+    }
+  });
+
   it("validates canonical harness modes before reading the goal or making a request", async () => {
     const malformed = await harness([
       "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "research/baseline",

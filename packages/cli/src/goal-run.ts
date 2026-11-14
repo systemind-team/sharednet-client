@@ -36,13 +36,18 @@ export interface AgentSpec {
 
 const DRIVERS: readonly Driver[] = ["codex", "claude-code"];
 const MAX_AGENTS = 50;
+const MAX_RESEARCH_AGENTS = 100;
+const RESEARCH_DOCKER_CONCURRENCY = 4;
+export const RESEARCH_TURN_CONCURRENCY = 12;
+export const MAX_RESEARCH_DURATION_MS = 7 * 24 * 60 * 60_000;
 
 /** `--agent codex`, `--agent codex:gpt-6-luna`, `--agent claude-code:claude-sonnet-5-5`; repeat it for more seats. */
-export function parseAgents(raws: readonly string[]): AgentSpec[] {
+export function parseAgents(raws: readonly string[], { research = false }: { research?: boolean } = {}): AgentSpec[] {
   if (raws.length === 0) {
     throw localError("invalid_arguments", "goal run needs at least one --agent: codex or claude-code, with :<model> to choose the model.");
   }
-  if (raws.length > MAX_AGENTS) throw localError("invalid_arguments", `goal run starts at most ${MAX_AGENTS} Agents.`);
+  const max = research ? MAX_RESEARCH_AGENTS : MAX_AGENTS;
+  if (raws.length > max) throw localError("invalid_arguments", `goal run starts at most ${max} Agents.`);
   const counts = new Map<Driver, number>();
   return raws.map((raw) => {
     const separator = raw.indexOf(":");
@@ -554,6 +559,8 @@ export interface GoalRunInput {
   mentionGate?: boolean;
   taskGate?: boolean;
   messageRouting?: MessageRouting;
+  /** The separate seat ceiling and bounded Docker and model concurrency for ad hoc research. */
+  research?: { turnConcurrency: number };
   /** A canonical treatment selected by --harness-mode. Omission preserves legacy ad-hoc flags. */
   harnessMode?: GoalRunHarnessResolution;
   /** Tests and artifact builders may supply provenance; source runs discover repository and package identity. */
@@ -565,11 +572,37 @@ export interface GoalRunDependencies {
   now: () => Date;
   sleep?: (ms: number) => Promise<void>;
   stderr?: (line: string) => void;
+  signal?: AbortSignal;
 }
 
 export interface GoalRunResult extends GoalWatchResult {
   agents: SeatRecord[];
   tokens: number;
+}
+
+/** Wait for every operation already started before propagating an error to teardown. */
+async function inBatches<T>(items: readonly T[], width: number, work: (item: T) => Promise<unknown>): Promise<void> {
+  for (let index = 0; index < items.length; index += width) {
+    const settled = await Promise.allSettled(items.slice(index, index + width).map(work));
+    const failed = settled.find(result => result.status === "rejected");
+    if (failed) throw failed.reason;
+  }
+}
+
+/** FIFO slots are held only while a turn runs, never while its seat waits for the Room. */
+function turnSlots(capacity: number) {
+  let available = capacity;
+  const waiting: Array<() => void> = [];
+  return async (work: () => Promise<boolean>): Promise<boolean> => {
+    if (available > 0) available--;
+    else await new Promise<void>(resolve => waiting.push(resolve));
+    try { return await work(); }
+    finally {
+      const next = waiting.shift();
+      if (next) next();
+      else available++;
+    }
+  };
 }
 
 /** Creates nothing outside its containers and the record; the Room and its goal already exist. */
@@ -585,6 +618,26 @@ export async function runGoal(
   const sleep = dependencies.sleep ?? ((ms: number) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)));
   const checks = containerName(input.roomId);
   const containers = runContainers(input.roomId, plan.agents);
+  const research = input.research;
+  if (research && (!Number.isSafeInteger(research.turnConcurrency) || research.turnConcurrency < 1 || research.turnConcurrency > RESEARCH_TURN_CONCURRENCY)) {
+    throw localError("invalid_arguments", `Research turn concurrency must be from 1 to ${RESEARCH_TURN_CONCURRENCY}.`);
+  }
+  const dockerConcurrency = research ? RESEARCH_DOCKER_CONCURRENCY : 1;
+  const withTurnSlot = research ? turnSlots(research.turnConcurrency) : null;
+  const clean = async (stop: boolean) => {
+    if (!research) {
+      await docker(stop ? ["stop", "--time", "5", ...containers] : ["rm", "--force", ...containers]);
+      return;
+    }
+    const force = (container: string) => docker(["rm", "--force", container]).catch(() => undefined);
+    await inBatches(containers, dockerConcurrency, async (container) => {
+      if (stop) {
+        const result = await docker(["stop", "--time", "1", container]).catch(() => null);
+        if (result?.code === 0) return;
+      }
+      await force(container);
+    });
+  };
   const turnLimitSeconds = Math.round((input.turnLimitMs ?? TURN_LIMIT_SECONDS * 1000) / 1000);
   const base = input.baseUrl;
   const messageRouting = input.messageRouting ?? (input.mentionGate ? "mentions" : "broadcast");
@@ -678,6 +731,7 @@ export async function runGoal(
 
   /** The checks' container, then each Agent's container and seat; a start that fails closes the Room it opened. */
   const setUp = async () => {
+    dependencies.signal?.throwIfAborted();
     const checker = await startChecks();
     if (checker.code !== 0) throw localError("container_failed", `The checks' container did not start: ${checker.stderr.trim()}`);
     const port = loopbackPort(base);
@@ -686,9 +740,11 @@ export async function runGoal(
     const wrapper = `#!/bin/sh\nexec node ${entry.endsWith(".ts") ? "--experimental-strip-types --no-warnings " : ""}${entry} "$@"\n`;
 
     // Every seat: its own container, its own home, its own sign-in, its own seat in the Room.
-    for (const seat of records) {
+    await inBatches(records, dockerConcurrency, async (seat) => {
+      dependencies.signal?.throwIfAborted();
       const container = containerName(input.roomId, seat.name);
       const started = await startContainer(seat);
+      dependencies.signal?.throwIfAborted();
       if (started.code !== 0) throw localError("container_failed", `${seat.name}'s container did not start: ${started.stderr.trim()}`);
       if (port !== null) {
         await docker(["exec", "--detach", "--user", AGENT_USER, container, "node", "-e", FORWARDER, String(port)]);
@@ -741,7 +797,8 @@ export async function runGoal(
         const made = await exec(seat, ["mkdir", "-p", paths.root]);
         if (made.code !== 0) throw localError("container_failed", "Could not create local task state.");
       }
-    }
+    });
+    dependencies.signal?.throwIfAborted();
     log(`goal: ${records.map((seat) => `${seat.name} (${seat.member_id})`).join(", ")} joined ${input.roomId}\n`);
   };
 
@@ -823,7 +880,10 @@ export async function runGoal(
       let wake: WakeShape | null = null;
       let failedInARow = 0;
       while (!ended) {
-        const failed = await runTurn(seat, prompt, wake);
+        const failed = withTurnSlot
+          ? await withTurnSlot(() => ended || dependencies.signal?.aborted ? Promise.resolve(false) : runTurn(seat, prompt, wake))
+          : await runTurn(seat, prompt, wake);
+        if (research && (ended || dependencies.signal?.aborted)) break;
         if (wake?.wake_id) await exec(seat, ["sharednet", "ack", wake.wake_id, "--json"]);
         failedInARow = failed ? failedInARow + 1 : 0;
         if (ended) break;
@@ -864,6 +924,7 @@ export async function runGoal(
         now: dependencies.now,
         ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
         stderr: log,
+        ...(dependencies.signal ? { signal: dependencies.signal } : {}),
         // A check runs in its own container, on the shared workspace: what one Agent installed for itself does not count.
         check: async (command) => {
           const result = await exec(null, ["sh", "-c", command]);
@@ -874,11 +935,11 @@ export async function runGoal(
     );
     ended = true;
     // Stopping the containers ends every turn and every wait still running.
-    await docker(["stop", "--time", "5", ...containers]);
+    await clean(true);
     await Promise.all(seats);
 
     // Each Agent's own trace is its home: Codex keeps sessions in ~/.codex, Claude Code in ~/.claude.
-    for (const seat of records) {
+    await inBatches(records, dockerConcurrency, async (seat) => {
       const target = join(input.out, "agents", seat.name, "home");
       await mkdir(dirname(target), { recursive: true });
       await rm(target, { recursive: true, force: true });
@@ -890,7 +951,7 @@ export async function runGoal(
         const usage = await sessionFileUsage(join(target, ".codex", "sessions"), seat.session_id);
         if (usage) account(seat, usage, true);
       }
-    }
+    });
     const episodePath = join(input.out, "episode.json");
     const episode = JSON.parse(await readFile(episodePath, "utf8")) as Record<string, unknown>;
     const adHocProfile = {
@@ -911,6 +972,7 @@ export async function runGoal(
           image: plan.image,
           web_search: input.webSearch ?? "live",
           turn_limit_s: turnLimitSeconds,
+          ...(research ? { turn_concurrency: research.turnConcurrency } : {}),
           mention_gate: input.mentionGate ?? false,
           task_gate: input.taskGate ?? false,
           message_routing: messageRouting,
@@ -945,7 +1007,7 @@ export async function runGoal(
     return { ...watched, agents: records, tokens: spend() };
   } finally {
     ended = true;
-    await docker(["rm", "--force", ...containers]);
+    await clean(false);
   }
 }
 

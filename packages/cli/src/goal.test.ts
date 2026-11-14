@@ -118,6 +118,28 @@ function clock(start = Date.parse("2026-10-05T12:00:00.000Z"), step = 5_000) {
 }
 
 describe("goal watch", () => {
+  it("checks on the first day and on DONE, with the scheduled repeat beyond a week-long Room", async () => {
+    const out = await temporary();
+    const { client } = fakeRoom({
+      until: ["check make test", "said DONE", "after 7d"],
+      pages: [[], [], [{ sequence: 2, content: "DONE", sender: AGENT }]],
+    });
+    const checks: number[] = [];
+    const start = Date.parse("2026-10-05T12:00:00.000Z");
+    const now = clock(start, 6 * 3_600_000);
+    const result = await goalWatch(client, "sni_member", "snk_owner", {
+      roomId: ROOM, workspace: out, out, checkEveryMs: 8 * 24 * 3_600_000, quietChecks: true,
+    }, {
+      now, sleep: async () => undefined, snapshot: null,
+      check: async () => { checks.push(now().getTime()); return { exitCode: checks.length === 1 ? 1 : 0, output: "" }; },
+    });
+    expect(result.ended_by).toMatchObject({ trigger: "check make test" });
+    expect(checks).toHaveLength(2);
+    expect(checks[1]! - checks[0]!).toBeGreaterThan(24 * 3_600_000);
+    const events = (await readFile(join(out, "checks.ndjson"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    expect(events.map(event => event.cause)).toEqual(["schedule", "claim"]);
+  });
+
   it("ends the Room with the check that starts to pass, and writes the record", async () => {
     const out = await temporary();
     const { client, calls } = fakeRoom({

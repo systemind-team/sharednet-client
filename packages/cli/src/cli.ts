@@ -10,7 +10,7 @@ import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner, type GuestDependencies } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
-import { cliPackage, discoverCodeProvenance, dockerRunner, parseAgents, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner } from "./goal-run.ts";
+import { cliPackage, discoverCodeProvenance, dockerRunner, MAX_RESEARCH_DURATION_MS, parseAgents, prepareRun, RESEARCH_TURN_CONCURRENCY, runContainers, runGoal, type CodeProvenance, type DockerRunner } from "./goal-run.ts";
 import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, type ServeKickoff } from "./goal-serve-demo.ts";
 import { assertGoalRunHarnessAgentCount, getHarnessModeSpec, resolveGoalRunHarnessMode, resolveRuntimeHarnessMode, type RuntimeHarnessResolution } from "./harness-modes.ts";
 import { parseDuration } from "./triggers.ts";
@@ -131,6 +131,7 @@ const optionValueNames = new Set([
   "image",
   "web-search",
   "turn-limit",
+  "turn-concurrency",
   "message-routing",
   "harness-mode",
   "kickoff",
@@ -138,7 +139,7 @@ const optionValueNames = new Set([
   "host",
   "port",
 ]);
-const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate"]);
+const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "research"]);
 
 /** Room mode is fixed at creation. Omission retains the service default. */
 function roomType(parsed: ParsedArguments): "board" | "compiled" | undefined {
@@ -599,9 +600,16 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "harness-mode"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "research", "turn-concurrency"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
+  const research = parsed.options.get("research") === true;
+  const concurrency = option(parsed, "turn-concurrency");
+  if (concurrency !== undefined && !research) throw localError("invalid_arguments", "--turn-concurrency requires --research.");
+  if (research && (namedMode !== undefined || requestedType === "compiled")) throw localError("invalid_arguments", "--research is for an ad hoc board Room without a frozen --harness-mode.");
+  if (concurrency !== undefined && (!/^[1-9]\d*$/.test(concurrency) || Number(concurrency) > RESEARCH_TURN_CONCURRENCY)) {
+    throw localError("invalid_arguments", `--turn-concurrency must be a whole number from 1 to ${RESEARCH_TURN_CONCURRENCY}.`);
+  }
   if (namedMode !== undefined && ["mention-gate", "task-gate", "message-routing"].some((name) => parsed.options.has(name))) {
     throw localError("invalid_arguments", "--harness-mode fixes the gate and routing controls; do not combine it with --mention-gate, --task-gate, or --message-routing.");
   }
@@ -625,10 +633,10 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--research [--turn-concurrency 12]] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
     );
   }
-  const agents = parseAgents(parsed.repeated.get("agent") ?? []);
+  const agents = parseAgents(parsed.repeated.get("agent") ?? [], { research });
   if (harnessMode && agents.some((agent) => agent.model === null)) {
     throw localError("harness_model_required", "A frozen --harness-mode requires every --agent to pin its model, for example --agent codex:<model>.");
   }
@@ -649,8 +657,13 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (turnLimitMs !== undefined && turnLimitMs < 60_000) {
     throw localError("invalid_arguments", "--turn-limit is at least 1m.");
   }
+  const rawUntil = parsed.repeated.get("until") ?? [];
+  const parsedResearchUntil = research ? parseUntilList(rawUntil, dependencies.now().getTime(), { budget: true }) : null;
+  if (parsedResearchUntil && !parsedResearchUntil.triggers.some(trigger => trigger.kind === "after" && trigger.ms <= MAX_RESEARCH_DURATION_MS)) {
+    throw localError("invalid_arguments", "--research requires one --until after no longer than 7d.");
+  }
   const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
-  const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime(), { budget: true });
+  const until = parsedResearchUntil ?? parseUntilList(rawUntil, dependencies.now().getTime(), { budget: true });
   const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
   if (!(await stat(workspace).then((entry) => entry.isDirectory(), () => false))) {
     throw localError("invalid_arguments", `--workspace ${workspace} is not a directory.`);
@@ -694,12 +707,20 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     const out = requestedOut === undefined ? join(outputRoot, roomId) : outputRoot;
     dependencies.stderr(`goal: ${roomId} is open; the record goes to ${out}\n`);
     // Ctrl-C ends the run without leaving Agents at work in containers nobody watches.
+    const stopResearch = research ? new AbortController() : null;
     const interrupt = () => {
+      if (stopResearch) {
+        stopResearch.abort(localError("goal_interrupted", "Goal run was interrupted."));
+        return;
+      }
       spawnSync("docker", ["rm", "--force", ...runContainers(roomId, plan.agents)]);
       dependencies.stderr(`goal: stopped; the Agents' containers are gone and ${roomId} is still open\n`);
       process.exit(130);
     };
-    if (!dependencies.docker) process.once("SIGINT", interrupt);
+    if (!dependencies.docker) {
+      process.on("SIGINT", interrupt);
+      if (stopResearch) process.on("SIGTERM", interrupt);
+    }
     try {
       return await runGoal(
         client,
@@ -722,13 +743,15 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           ...(messageRouting ? { messageRouting } : {}),
           ...(harnessMode ? { harnessMode } : {}),
           ...(codeProvenance ? { codeProvenance } : {}),
+          ...(research ? { research: { turnConcurrency: Number(concurrency ?? RESEARCH_TURN_CONCURRENCY) } } : {}),
           webSearch,
           ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
         },
-        { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
+        { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr, ...(stopResearch ? { signal: stopResearch.signal } : {}) },
       );
     } finally {
       process.off("SIGINT", interrupt);
+      if (stopResearch) process.off("SIGTERM", interrupt);
     }
   });
 }
