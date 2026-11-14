@@ -111,6 +111,15 @@ describe("--agent", () => {
     expect(seats.at(-1)).toEqual({ name: "claude-code-25", driver: "claude-code", model: null });
     expect(new Set(seats.map((seat) => seat.name)).size).toBe(50);
   });
+
+  it("accepts up to one hundred seats in research mode only", () => {
+    const hundred = Array.from({ length: 100 }, () => "codex");
+    expect(() => parseAgents(hundred)).toThrow(/50 Agents/);
+    const seats = parseAgents(hundred, { research: true });
+    expect(seats).toHaveLength(100);
+    expect(seats.at(-1)?.name).toBe("codex-100");
+    expect(() => parseAgents([...hundred, "codex"], { research: true })).toThrow(/100 Agents/);
+  });
 });
 
 describe("a turn", () => {
@@ -769,6 +778,137 @@ describe("a check", () => {
     const checker = calls.find((call) => call.args[0] === "run" && call.args.includes(containerName(ROOM)))!;
     expect(checker.args).toEqual(["run", "--detach", "--name", containerName(ROOM), "--volume", `${workspace}:/workspace`, DEFAULT_IMAGE, "sleep", "infinity"]);
     expect(calls.at(-1)!.args).toEqual(["rm", "--force", containerName(ROOM, "claude-code-1"), containerName(ROOM)]);
+  });
+});
+
+describe("a research run", () => {
+  it("gives every seat a turn within the run's concurrency ceiling and then drains bounded trace copies", async () => {
+    const out = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE, agents: parseAgents(Array(8).fill("codex")), workspace: out,
+      cli: { root: "/opt/cli", entry: "src/main.ts" }, codexAuth: { kind: "api-key" }, claudeAuth: null,
+    };
+    const next = () => new Promise<void>(resolve => setImmediate(resolve));
+    const turn = { active: 0, peak: 0, done: 0 };
+    const copy = { active: 0, peak: 0, done: 0 };
+    const closeCalls: string[][] = [];
+    const first = new Map<typeof turn, () => void>();
+    const barriers = new Map([turn, copy].map(counter => [counter, new Promise<void>(resolve => first.set(counter, resolve))]));
+    const docker: DockerRunner = async (args) => {
+      let stdout = "";
+      let code = 0;
+      const work = async (counter: typeof turn, width: number) => {
+        counter.peak = Math.max(counter.peak, ++counter.active);
+        if (counter.active >= width) first.get(counter)!();
+        await barriers.get(counter);
+        await next();
+        counter.done++;
+        counter.active--;
+      };
+      if (args[0] === "stop" || args[0] === "rm") closeCalls.push([...args]);
+      if (args[0] === "stop" && args.at(-1) === containerName(ROOM, "codex-1")) code = 1;
+      if (args.includes("join")) stdout = JSON.stringify({ member_id: `i_${args[args.lastIndexOf("--name") + 1]}` });
+      if (args.includes("wait")) stdout = JSON.stringify({ fired: ["closed"] });
+      if (args.includes("timeout")) await work(turn, 2);
+      if (args[0] === "cp") await work(copy, 4);
+      if (args.at(-1) === "test -f done") code = turn.done === 8 ? 0 : 1;
+      return { code, stdout, stderr: "" };
+    };
+    const now = "2026-10-05T12:00:00.000Z";
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["check test -f done", "said DONE", "after 1h"], started_at: now, ended_by: null };
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "POST" && path.endsWith("/close")) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: now } } } };
+        if (path.includes("/wait?")) {
+          await next();
+          return { items: turn.done === 8 ? [{ sequence: 2, content: "DONE", sender: { member_id: "i_codex-1" } }] : [] };
+        }
+        return { room: { id: ROOM, state: "open", goal }, memberships: [] };
+      },
+    } as unknown as ApiClient;
+    const result = await runGoal(client, "sni_owner-seat", OWNER_KEY, {
+      plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until,
+      baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, research: { turnConcurrency: 2 },
+    }, { docker, now: () => new Date(now) });
+    expect(result.agents.every(seat => seat.turns === 1)).toBe(true);
+    expect(turn).toEqual({ peak: 2, active: 0, done: 8 });
+    expect(copy).toEqual({ peak: 4, active: 0, done: 8 });
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).turn_concurrency).toBe(2);
+    const earlyForce = closeCalls.findIndex(args => args[0] === "rm" && args.at(-1) === containerName(ROOM, "codex-1"));
+    expect(earlyForce).toBeGreaterThan(-1);
+    expect(earlyForce).toBeLessThan(closeCalls.findIndex(args => args[0] === "stop" && args.at(-1) === containerName(ROOM, "codex-8")));
+  });
+
+  it("drains only the in-flight research seat starts on a failed join before removing containers", async () => {
+    const out = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE, agents: parseAgents(Array(8).fill("codex")), workspace: out,
+      cli: { root: "/opt/cli", entry: "src/main.ts" }, codexAuth: { kind: "api-key" }, claudeAuth: null,
+    };
+    const started = new Set<string>();
+    const joined = new Set<string>();
+    const removed = new Set<string>();
+    let peakStarts = 0;
+    let starts = 0;
+    const docker: DockerRunner = async (args) => {
+      if (args[0] === "run") {
+        const container = args[args.indexOf("--name") + 1]!;
+        if (container !== containerName(ROOM)) {
+          started.add(container);
+          peakStarts = Math.max(peakStarts, ++starts);
+          await new Promise<void>(resolve => setImmediate(resolve));
+          starts--;
+        }
+      }
+      if (args.includes("join")) {
+        const name = args[args.lastIndexOf("--name") + 1]!;
+        if (name === "codex-1") return { code: 4, stdout: "", stderr: "join unavailable" };
+        await new Promise<void>(resolve => setImmediate(resolve));
+        joined.add(name);
+        return { code: 0, stdout: JSON.stringify({ member_id: `i_${name}` }), stderr: "" };
+      }
+      if (args[0] === "rm") {
+        expect(joined.size).toBe(3);
+        for (const container of args.slice(2)) removed.add(container);
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const client = { request: async () => ({}) } as unknown as ApiClient;
+    await expect(runGoal(client, "sni_owner-seat", OWNER_KEY, {
+      plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: ["after 1h"],
+      baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: false, research: { turnConcurrency: 2 },
+    }, { docker, now: () => new Date() })).rejects.toMatchObject({ code: "join_failed" });
+    expect(peakStarts).toBe(4);
+    expect(started.size).toBe(4);
+    expect([...started].every(name => removed.has(name))).toBe(true);
+  });
+
+  it("interrupts a research startup without discarding still-starting containers", async () => {
+    const out = await temporary();
+    const stop = new AbortController();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE, agents: parseAgents(Array(8).fill("codex")), workspace: out,
+      cli: { root: "/opt/cli", entry: "src/main.ts" }, codexAuth: { kind: "api-key" }, claudeAuth: null,
+    };
+    const started = new Set<string>();
+    const docker: DockerRunner = async (args) => {
+      if (args[0] === "run") {
+        const name = args[args.indexOf("--name") + 1]!;
+        if (name !== containerName(ROOM)) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          started.add(name);
+          stop.abort(new Error("research interrupted"));
+        }
+      }
+      if (args[0] === "rm") started.delete(args.at(-1)!);
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const client = { request: async () => ({}) } as unknown as ApiClient;
+    await expect(runGoal(client, "sni_owner-seat", OWNER_KEY, {
+      plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: ["after 1h"],
+      baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: false, research: { turnConcurrency: 2 },
+    }, { docker, now: () => new Date(), signal: stop.signal })).rejects.toThrow("research interrupted");
+    expect(started.size).toBe(0);
   });
 });
 
