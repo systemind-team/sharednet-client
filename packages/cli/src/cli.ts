@@ -132,6 +132,7 @@ const optionValueNames = new Set([
   "web-search",
   "turn-limit",
   "agent-user",
+  "turn-policy",
   "message-routing",
   "harness-mode",
   "kickoff",
@@ -603,9 +604,12 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "check-every", "quiet-checks", "web-search", "turn-limit", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
+  const turnPolicy = option(parsed, "turn-policy") ?? "legacy";
+  if (turnPolicy !== "legacy" && turnPolicy !== "cooperative-v1") throw localError("invalid_arguments", "--turn-policy is legacy or cooperative-v1.");
+  if (namedMode !== undefined && turnPolicy !== "legacy") throw localError("invalid_arguments", "--turn-policy cooperative-v1 cannot override a frozen --harness-mode.");
   if (namedMode !== undefined && ["mention-gate", "task-gate", "message-routing"].some((name) => parsed.options.has(name))) {
     throw localError("invalid_arguments", "--harness-mode fixes the gate and routing controls; do not combine it with --mention-gate, --task-gate, or --message-routing.");
   }
@@ -619,20 +623,21 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   const harnessMode = namedMode === undefined ? undefined : resolveGoalRunHarnessMode(namedMode);
   const type = harnessMode ? "board" : requestedType;
   const manualMessageRouting = option(parsed, "message-routing");
-  if (manualMessageRouting !== undefined && manualMessageRouting !== "broadcast" && manualMessageRouting !== "mentions") throw localError("invalid_arguments", "--message-routing must be broadcast or mentions.");
+  if (manualMessageRouting !== undefined && manualMessageRouting !== "broadcast" && manualMessageRouting !== "mentions" && manualMessageRouting !== "mentions-only") throw localError("invalid_arguments", "--message-routing must be broadcast, mentions or mentions-only.");
   const mentionGate = harnessMode?.profile.mention_gate ?? (parsed.options.get("mention-gate") === true);
   const taskGate = harnessMode?.profile.task_gate ?? (parsed.options.get("task-gate") === true);
   const messageRouting = harnessMode?.profile.message_routing ?? manualMessageRouting;
-  if (type === "compiled" && (mentionGate || taskGate || messageRouting === "mentions")) {
+  if (type === "compiled" && (mentionGate || taskGate || (messageRouting !== undefined && messageRouting !== "broadcast"))) {
     throw localError("invalid_arguments", "The mention/task gates are for plain board Rooms.");
   }
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
+  if (turnPolicy === "cooperative-v1" && (agents.length < 2 || type === "compiled")) throw localError("invalid_arguments", "--turn-policy cooperative-v1 requires a multi-agent board Room.");
   if (harnessMode && agents.some((agent) => agent.model === null)) {
     throw localError("harness_model_required", "A frozen --harness-mode requires every --agent to pin its model, for example --agent codex:<model>.");
   }
@@ -750,6 +755,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           quietChecks: parsed.options.get("quiet-checks") === true,
           mentionGate,
           taskGate,
+          turnPolicy,
           ...(messageRouting ? { messageRouting } : {}),
           ...(harnessMode ? { harnessMode } : {}),
           ...(codeProvenance ? { codeProvenance } : {}),

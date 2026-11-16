@@ -18,3 +18,12 @@ regexes = [
   '''const key="[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";''',
   '''"nothing secret here, i_RedactIns1 and p_RedactPr01 stay"''',
 ]
+
+# This one published UUID is a fixed synthetic outbox fixture, never a credential.
+# Restrict the exception to its exact line and test file; other keys stay scanned.
+[[allowlists]]
+description = "Fixed synthetic reply-outbox UUID fixture"
+condition = "AND"
+paths = ['''^packages/cli/src/reply-outbox\.test\.ts$''']
+regexTarget = "line"
+regexes = ['''^\s*idempotency_key: "a4a3ee44-bba2-4e5b-b9ed-596dfe048352",\s*$''']

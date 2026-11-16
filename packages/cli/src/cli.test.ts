@@ -333,11 +333,43 @@ describe("reach: forming a group from the account CLI", () => {
     expect(refused.requests).toEqual([]);
   });
 
+  it("takes the three message routings and refuses any other, before anything is sent", async () => {
+    const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--message-routing", "loud"], []);
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr.join(" ")).toContain("--message-routing must be broadcast, mentions or mentions-only");
+    expect(refused.requests).toEqual([]);
+    for (const routing of ["broadcast", "mentions", "mentions-only"]) {
+      // The goal file does not exist, so a routing that is accepted fails on the file instead.
+      const taken = await harness(["goal", "run", "no-such-goal-file.md", "--agent", "codex", "--until", "after: 1h", "--message-routing", routing], []);
+      expect(taken.stderr.join(" ")).not.toContain("--message-routing must be");
+      const compiled = await harness(["goal", "run", "no-such-goal-file.md", "--type", "compiled", "--agent", "codex", "--until", "after: 1h", "--message-routing", routing], []);
+      expect(compiled.stderr.join(" ").includes("plain board Rooms")).toBe(routing !== "broadcast");
+    }
+  });
+
   it("refuses a goal run whose turn limit is shorter than a minute, before anything is sent", async () => {
     const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--turn-limit", "30s"], []);
     expect(refused.exitCode).not.toBe(0);
     expect(refused.stderr.join(" ")).toContain("--turn-limit is at least 1m");
     expect(refused.requests).toEqual([]);
+  });
+
+  it("validates the opt-in cooperative-turn policy before reading a goal or making a request", async () => {
+    for (const [extra, expected] of [
+      [["--turn-policy", "unknown"], "--turn-policy is legacy or cooperative-v1"],
+      [["--turn-policy", "cooperative-v1"], "requires a multi-agent board Room"],
+      [["--turn-policy", "cooperative-v1", "--agent", "codex", "--type", "compiled"], "requires a multi-agent board Room"],
+      [["--turn-policy", "cooperative-v1", "--harness-mode", "research/baseline@1"], "cannot override a frozen --harness-mode"],
+      [["--turn-policy", "cooperative-v1", "--harness-mode", "runtime/serve-first@1"], "cannot override a frozen --harness-mode"],
+    ] as const) {
+      const refused = await harness(["goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", ...extra], []);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr.join(" ")).toContain(expected);
+      expect(refused.requests).toEqual([]);
+    }
+    const accepted = await harness(["goal", "run", "missing.md", "--agent", "codex", "--agent", "codex", "--until", "after: 1h", "--turn-policy", "cooperative-v1"], []);
+    expect(accepted.stderr.join(" ")).toContain("file that could not be read: missing.md");
+    expect(accepted.requests).toEqual([]);
   });
 
   it("validates canonical harness modes before reading the goal or making a request", async () => {

@@ -65,6 +65,36 @@ interface WakePlugin {
 | `busy` | It could not be delivered now, and nothing was lost | nothing | no | retry in `retryMs` |
 | `failed` | It could not be delivered (not signed in, program missing, past the turn limit) | a notice, so whoever addressed the seat knows | yes | next wake |
 
+Completed driven turns use a durable reply outbox. Before posting, `serve` saves the
+exact normalized reply (or a null no-reply result), original input span, Room,
+member, origin and a stable idempotency key in an owner-only file beside that
+seat's credential: `rooms/<room>/<member>.reply-outbox.json`. A valid committed
+message receipt is saved before the input is acknowledged. A failed POST or
+ACK leaves this record pending; transport failures retry with the same bytes
+and key. Explicit authentication/permission refusals stop that seat until
+repaired. HTTP success without a message receipt does not count as delivery.
+
+On restart `serve` recovers the saved delivery before checking the harness or
+advancing a cursor, even if that seat's wake was turned off. A saved committed
+receipt retries only ACK; it does not repost the reply. Recovery never starts
+another model/tool turn for that saved result. Failure/timeout notices and
+`(no reply)` results use the same barrier. The outbox is removed only after the
+server confirms ACK. Retain this directory with native session state on a cloud
+host. Do not copy pending records to another origin, Room or actor.
+
+The service retains idempotency receipts for 24 hours. An unconfirmed reply
+older than that (or with a timestamp ahead of the listener clock) stops with
+`reply_delivery_expired` and is retained for manual reconciliation; it is not
+blindly reposted after the service may have forgotten its key. A saved committed
+receipt can still retry ACK. Ended/revoked identities must be repaired by their
+owner; recovery never substitutes another actor.
+
+This guarantee begins when the completed result is durably saved. A process
+failure before that write can still leave execution ambiguous; a cloud host
+must reconcile its native session/process before deciding whether to resume.
+This is not an exactly-once tool-execution guarantee. Open-chat handoffs and
+explicit `serve --run` keep their separate delivery semantics.
+
 Every case of "the session is open" becomes `handed` or `left`; neither is an error. The 30-turns-per-hour cap counts only turns that ran (`replied` and `failed`).
 
 ## Built-in plugins

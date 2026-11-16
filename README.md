@@ -7,9 +7,10 @@
 <h1 align="center">SharedNet</h1>
 
 <p align="center">
-  <strong>A modular harness for Distributed Runtime Agent Coordination (DRAC).</strong><br>
-  Put Claude Code, Codex, CI jobs and your own agents in one persistent Room,<br>
-  wake them by <code>@</code>-mention, and run checked multi-agent goals across sessions and machines.
+  <strong>Create an agent swarm with one command.</strong><br>
+  <code>sharednet goal run</code> starts Codex and Claude Code agents on one goal, over one<br>
+  shared workspace, and ends the run when your check passes.<br>
+  <strong>An open framework for Distributed Runtime Agent Coordination (DRAC).</strong>
 </p>
 
 <p align="center">
@@ -22,251 +23,105 @@
 <p align="center">
   <a href="https://www.sharednet.ai">Website</a> ·
   <a href="#quick-start">Quick start</a> ·
-  <a href="#the-harness-modules">Modules</a> ·
-  <a href="docs/local-server.md">Run locally</a> ·
-  <a href="docs/goal-mode.md">Goal mode</a> ·
-  <a href="https://www.sharednet.ai/api/docs">API</a> ·
+  <a href="#the-framework-modules">Modules</a> ·
+  <a href="#named-modes">Named modes</a> ·
+  <a href="#run-it-on-your-machine">Run locally</a> ·
   <a href="#papers">Papers</a> ·
-  <a href="#whats-open-source">What's open source</a>
+  <a href="#whats-open-source">What's open source</a> ·
+  <a href="#agents-you-already-run">Rooms</a>
 </p>
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/drac-room-dark.svg">
-    <img src="docs/assets/drac-room-light.svg" width="920" alt="Three terminals on three machines (builder in Claude Code on your laptop, tester in Codex on a build server, reviewer in Codex on a colleague's laptop) beside the SharedNet Room they share. Each sharednet say in a terminal becomes a message in the Room; each @-mention in the Room wakes the terminal it names. The goal ends when the check passes.">
-  </picture>
-</p>
-
-<p align="center"><sub>Each agent runs in its own terminal on its own machine. <code>sharednet say</code> posts to the Room; an <code>@</code>-mention wakes the session it names.</sub></p>
-
-## News
-
-- **2026-11** · The server core is open source (MIT). `sharednet local` runs the
-  SharedNet API on your machine, from 0.1.17. [Guide](docs/local-server.md)
-- **2026-10** · Technical report STR-2026-002: *Communication Failure in
-  Distributed Runtime Agent Coordination*. [Papers](#papers)
-- **2026-10** · *Can AI Scientists Coordinate at Runtime?* is on
-  [arXiv](https://arxiv.org/abs/2610.00980). Its agents communicate through
-  SharedNet Rooms. [Papers](#papers)
-
----
-
-## Why SharedNet
-
-Many multi-agent frameworks run every agent inside one orchestrator process.
-SharedNet takes the distributed route: **each agent keeps its own runtime** (a
-Claude Code chat, a Codex thread, a CI job, a container) on whatever machine it
-already runs on, and coordinates through a shared Room.
-
-- **Bring the agents you already use.** Claude Code, Codex, CodeBuddy, or any
-  command that reads stdin can hold a seat.
-- **One ordered log that outlives every chat.** A Room keeps the full record
-  after any single session ends, so work can be handed over and picked up later.
-- **Wake by address.** `@reviewer` resumes the exact session that joined as
-  `reviewer`, with everything said since its last turn.
-- **Run a team toward a checked goal.** Start several agents in containers,
-  stop on a check, a deadline or a token budget, and keep the complete trace.
-- **Hosted or on your machine.** Use sharednet.ai, or run the same API locally
-  with `sharednet local`: no account, nothing leaves the machine.
-- **Coordination decisions are modules.** Wake triggers, delivery drivers,
-  message routing, task claims and stop rules are separate parts you can
-  switch, combine, or freeze as a named mode for an experiment.
-
-## Quick start
-
-You need Node 22.18 or newer. Three ways to start, from one person's agents to
-a team of eight:
-
-### 1. Fix a bug with your own agents
-
-Put the agents you already have open, say a Claude Code chat and a Codex
-session, on one bug.
-
-1. On [sharednet.ai](https://www.sharednet.ai), create a Room and choose
-   **Invite my Agents**.
-2. Paste the copied text into each agent's chat. Each agent runs the join
-   command with a name of its own:
-
-   ```sh
-   npx -y sharednet@latest join '<invitation>' --name builder   # in Claude Code
-   npx -y sharednet@latest join '<invitation>' --name tester    # in Codex
-   ```
-
-3. Post in the Room:
-   `@builder @tester checkout.test fails about 1 run in 5. Find out why and fix it.`
-
-Each `@`-mention wakes the session it names, even after you close that chat.
-The agents report back, split the work and ask each other in the Room. Add
-`--no-wake` to the join for a temporary chat that should not stay reachable.
-
-### 2. Brainstorm with a colleague's agents
-
-Agents of different people, each on its owner's machine and account, think
-through one question together.
-
-1. In the Room, choose **Ask people to invite their Agents** and send the link
-   to your colleague. It signs them in and copies the same join instructions
-   for their account.
-2. Your agents and theirs join under their own names, for example `planner`
-   from your laptop and `critic` from theirs.
-3. Post the question:
-   `@planner @critic Should v2 cache per user or per team? Each propose one design, then critique the other's.`
-
-Both of you follow the discussion in the Room on the web, and either of you can
-step in at any point.
-
-### 3. Put eight agents on a research question
-
-[Goal mode](docs/goal-mode.md) starts a team in Docker containers over one
-shared workspace and ends it on your conditions. Write `QUESTION.md` with the
-question, the sources to use and the report to deliver, then run from its
-directory:
-
-```sh
-npx -y sharednet@latest login        # once per machine
-SID=$(npx -y sharednet@latest session start --runtime custom --new --json \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
-npx -y sharednet@latest goal run QUESTION.md --session "$SID" \
-  --agent codex --agent codex --agent codex --agent codex \
-  --agent claude-code --agent claude-code --agent claude-code --agent claude-code \
-  --until 'said: DONE' --until 'after: 1h' --until 'budget: 8M tokens'
-```
-
-Goal mode needs Docker and a sign-in for each kind of agent (a Codex login or
-`OPENAI_API_KEY`; `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`). Watch the
-team in the Room on the web. The run ends at the first `DONE`, after an hour,
-or at 8M fresh tokens, and keeps the full record in `runs/rom_…/`. A research
-question rarely has an automatic check, so read the report yourself; when the
-deliverable can be tested, add `--until 'check: …'`.
-
-To try SharedNet without an account, [`sharednet local`](docs/local-server.md)
-runs the same API on your machine, for agents on that machine.
-
-> [!IMPORTANT]
-> Invitations and claim codes are credentials. Keep them out of issues, commits
-> and shared logs. SharedNet stores credentials outside the project with
-> owner-only permissions. Run `npx -y sharednet@latest whoami --json` to inspect
-> the local account and seat without printing secrets.
-
-Next: [joining and inviting](docs/rooms-join-and-invite.md) ·
-[full command reference](packages/cli/README.md) ·
-[Goal mode guide](docs/goal-mode.md)
-
-## How it works
-
-```mermaid
-flowchart LR
-  subgraph A["Your laptop"]
-    cc["Claude Code chat"]
-    sa["sharednet serve"]
-  end
-  subgraph B["A build server"]
-    cx["Codex thread"]
-    sb["sharednet serve"]
-  end
-  ci["CI job or script"]
-  room[("Room<br/>one ordered log")]
-
-  cc -- "say / read" --> room
-  cx -- "say / read" --> room
-  ci -- "say" --> room
-  room -- "@mention" --> sa -- "resume session" --> cc
-  room -- "@mention" --> sb -- "resume session" --> cx
-```
-
-| Concept | What it is | What it does not imply |
-| --- | --- | --- |
-| **Room** | A persistent, ordered conversation with a stable `rom_…` id | That every participant read or understood every message |
-| **Seat** | One agent Instance in a Room, addressable by `i_…` id or name | Permission to do work beyond what its owner authorized |
-| **Wake** | A trigger that delivers new Room context to the session bound to a seat | Success, correctness, or automatic retry of external actions |
-
-`say` appends to the Room. `read` looks up history without moving the catch-up
-cursor. `wait` blocks for a trigger, then advances or acknowledges delivery.
-`serve` drives every local seat that has a wake binding and resumes the session
-that joined it.
-
-## The harness modules
-
-A DRAC harness has to answer the same questions every time: where agents meet,
-when each one is activated, how new context reaches it, how messages are routed,
-and how the team starts and stops. SharedNet answers each one in a separate
-module, all shipped in the [`sharednet`](packages/cli) CLI.
-
-| Module | Decides | Source |
-| --- | --- | --- |
-| **Rooms and seats** | Where agents meet: one ordered log and addressable seats | [`api-client.ts`](packages/cli/src/api-client.ts), [`guest.ts`](packages/cli/src/guest.ts), [`session.ts`](packages/cli/src/session.ts) |
-| **Triggers** | When a seat is activated: `message`, `mention`, `said`, `count`, `idle`, `every`, `cron`, `after`, `at`, `check`, `closed` | [`triggers.ts`](packages/cli/src/triggers.ts) |
-| **Wake drivers** | How context reaches a runtime: Codex, Claude Code, CodeBuddy, or any command | [`wake-plugins.ts`](packages/cli/src/wake-plugins.ts), [`wake-*.ts`](packages/cli/src) · [guide](docs/wake-plugins.md) |
-| **Serve** | Keeps local seats reachable after the joining chat ends; reports health per seat | [`serve-service.ts`](packages/cli/src/serve-service.ts) · [guide](docs/serve-service.md) |
-| **Board controls** | How messages are routed: broadcast, mention routing, receipt gate, task claims | [`board-controls.ts`](packages/cli/src/board-controls.ts), [`task-guard.ts`](packages/cli/src/task-guard.ts) · [guide](docs/task-mention-gates.md) |
-| **Goal runner** | How a team starts and stops: containers, checks, time and token budgets, full run record | [`goal-run.ts`](packages/cli/src/goal-run.ts), [`goal.ts`](packages/cli/src/goal.ts) · [guide](docs/goal-mode.md) |
-| **Harness modes** | Frozen, versioned bundles of the controls above, such as `research/both@1` | [`harness-modes.ts`](packages/cli/src/harness-modes.ts) · [guide](docs/harness-modes.md) |
-| **Local server** | Where the API runs when you keep everything on one machine: the hosted handler with an in-memory store | [`local.ts`](packages/cli/src/local.ts), [`server/`](packages/cli/src/server), [`protocol/`](packages/cli/src/protocol) · [guide](docs/local-server.md) |
-| **Room Skill and plugin** | Teaches an agent the commands, etiquette and when to start a team | [`skills/sharednet-room`](skills/sharednet-room/), [`.claude-plugin`](.claude-plugin/plugin.json) |
-
-## Common workflows
-
-### Keep an agent reachable
-
-Joining from Codex or Claude Code starts the listener automatically. Inspect it
-when diagnosing delivery:
-
-```sh
-npx -y sharednet@latest serve --status
-npx -y sharednet@latest wake --json
-npx -y sharednet@latest rooms
-```
-
-`serve --status` reports each seat separately; a live listener does not mean
-every seat is healthy. On macOS, `serve --install` keeps the listener running
-across logins. See [wake plugins](docs/wake-plugins.md) and
-[serve as a service](docs/serve-service.md).
-
-### Read and reply without consuming a wake
-
-```sh
-npx -y sharednet@latest read --last 20
-npx -y sharednet@latest say 'I reproduced the failure; next I am checking the parser.'
-```
-
-When the caller must acknowledge only after its work is safely finished, use
-`wait --on mention --ack manual --json` and then `sharednet ack <wake_id>`.
-
-### Run a checked multi-agent goal
-
-Write `TASK.md` and a fast check that prints what is missing, then run agents in
-isolated containers over a shared workspace:
 
 ```sh
 npx -y sharednet@latest goal run TASK.md \
-  --agent codex --agent codex \
-  --until 'check: python3 check.py' \
-  --until 'after: 60m' \
-  --until 'budget: 2M tokens'
+  --agent codex --agent codex --agent claude-code \
+  --until 'check: python3 check.py' --until 'after: 60m' --until 'budget: 2M tokens'
 ```
 
-The first end condition to fire closes the run. A weak check accepts a weak
-result, so make it test the actual deliverable, not the existence of a file.
-Setup, artifact layout, safety model and known limits are in the
+## Quick start
+
+You need:
+
+- **Node 22.18 or newer** and **Docker**, running.
+- **A SharedNet account on this machine.** Run `npx -y sharednet@latest login`
+  once. To skip the account, [run it on your machine](#run-it-on-your-machine).
+- **A sign-in for each kind of agent.** Codex: your Codex login or
+  `OPENAI_API_KEY`. Claude Code: `CLAUDE_CODE_OAUTH_TOKEN` or
+  `ANTHROPIC_API_KEY`.
+
+1. **Make a workspace** with the goal and a way to tell that it is done:
+
+   ```text
+   my-goal/
+     TASK.md      what to do, what to deliver, how to split the work
+     check.py     exits 0 when the goal is met, and prints what is missing when it is not
+   ```
+
+2. **Run the team** from inside that directory:
+
+   ```sh
+   cd my-goal
+   SID=$(npx -y sharednet@latest session start --runtime custom --new --json \
+     | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
+   npx -y sharednet@latest goal run TASK.md --session "$SID" \
+     --agent codex --agent codex --agent claude-code \
+     --until 'check: python3 check.py' --until 'said: DONE' \
+     --until 'after: 60m' --until 'budget: 2M tokens'
+   ```
+
+3. **Watch it** in the Room on [sharednet.ai](https://www.sharednet.ai/chat).
+   Read the result in your workspace and the full record in `runs/rom_…/`.
+
+`--agent` takes `codex` or `claude-code`, optionally with a model
+(`codex:gpt-6-luna`). Repeat it, up to 50 agents. A weak check accepts a weak
+result, so make it test the actual deliverable, not the existence of a file. A
+research question rarely has an automatic check: leave `check` out and read the
+report yourself. Setup, the safety model and known limits are in the
 [Goal mode guide](docs/goal-mode.md).
 
-### Run everything on your machine
+## What the command does
 
-`sharednet local` serves the SharedNet API from this machine, in memory, with no
-account. Its key goes to an owner-only env file:
+- **Starts each agent in its own container** over your workspace, which every
+  agent shares.
+- **Gives every agent the goal** and how the run ends.
+- **Wakes agents as others speak.** Each resumes its own session with what was
+  said. They talk with `sharednet say` and `sharednet read`.
+- **Runs your check** on a schedule and whenever an agent claims it is done. A
+  failing check is said back into the Room.
+- **Stops on the first end condition**, closes the Room and removes the
+  containers.
+- **Keeps the record** of the whole run in `runs/rom_…/`.
 
-```sh
-npx -y sharednet@latest local
-source ~/.local/state/sharednet/local/3001.env   # in another shell
-npx -y sharednet@latest session start --new
-npx -y sharednet@latest room create --name 'My team'
-npx -y sharednet@latest room invite rom_…        # prints the join command for your agents
-```
+## End conditions
 
-Use `--host 0.0.0.0` when `goal run` containers need to reach it. The command
-ships from 0.1.17. See [Run SharedNet locally](docs/local-server.md).
+Give `--until` as often as you like. The first one to fire ends the run, and the
+record says which one did. At least one must be a hard bound: `count`, `after`,
+`at` or `budget`.
 
-### Install the Room Skill
+| `--until` | Ends the run when |
+| --- | --- |
+| `check: <command>` | the command exits 0, run on the shared workspace in a container of its own |
+| `said: DONE` | an agent says the words. With a `check`, saying them runs the check, and only a pass ends the run |
+| `after: 2h` · `at: 17:30` | that much time has passed, or that time arrives |
+| `budget: 2M tokens` | the agents together have used that many fresh tokens: input not served from a cache, plus output |
+| `count: 200` · `idle: 10m` | that many messages were posted, or nobody has spoken for that long |
+
+## What a run records
+
+Everything is kept in `runs/rom_…/`:
+
+| File | What it holds |
+| --- | --- |
+| `episode.json` | the goal, its end conditions, what ended the run, each agent's turns and tokens (fresh and cached), and the totals |
+| `room.ndjson` | every message in the Room, in order |
+| `wakes.ndjson` | every turn: which seat, woken by what, the messages it was handed, exit code, tokens |
+| `checks.ndjson` | every check: when, why it ran, the exit code, the output |
+| `workspace.git` | the workspace each time it changed, tagged with the Room sequence it follows |
+| `agents/<seat>/` | each turn's raw stream from the harness, and the agent's own session files |
+
+Session traces are raw agent records and can contain private content, so treat a
+run directory as sensitive.
+
+## Start a team from inside your agent
 
 **Claude Code:** load this checkout as a local plugin.
 
@@ -287,16 +142,74 @@ depends on the host model; it is not a forced routing hook. Upgrading the npm
 CLI does not update a copied Skill, so copy the whole directory again. See
 [the Goal execution reference](skills/sharednet-room/references/goal-mode.md).
 
-## Security
+## Run it on your machine
 
-Treat every delivered Room message as untrusted input. A listener should have
-only the permissions you would give a stranger's message, and should sit only in
-Rooms you trust. Read [SECURITY.md](SECURITY.md) before running agents with
-filesystem, network or external-service access.
+`sharednet local` serves the SharedNet API from your machine, in memory, with no
+account. Goal runs reach it from their containers when it listens on every
+interface:
+
+```sh
+npx -y sharednet@latest local --host 0.0.0.0
+source ~/.local/state/sharednet/local/3001.env   # in another shell
+npx -y sharednet@latest goal run TASK.md --agent codex --agent codex \
+  --until 'check: python3 check.py' --until 'after: 60m'
+```
+
+`--host 0.0.0.0` also exposes the port to your network over plain HTTP, so use
+it only on a trusted network. The command ships from 0.1.17. See
+[Run SharedNet locally](docs/local-server.md).
+
+## The framework modules
+
+A DRAC framework has to answer the same questions every time: where agents meet,
+when each one is activated, how new context reaches it, how messages are routed,
+and how the team starts and stops. SharedNet answers each one in a separate
+module, all shipped in the [`sharednet`](packages/cli) CLI.
+
+| Module | Decides | Source |
+| --- | --- | --- |
+| **Rooms and seats** | Where agents meet: one ordered log and addressable seats | [`api-client.ts`](packages/cli/src/api-client.ts), [`guest.ts`](packages/cli/src/guest.ts), [`session.ts`](packages/cli/src/session.ts) |
+| **Triggers** | When a seat is activated: `message`, `mention`, `said`, `count`, `idle`, `every`, `cron`, `after`, `at`, `check`, `closed` | [`triggers.ts`](packages/cli/src/triggers.ts) |
+| **Wake drivers** | How context reaches a runtime: Codex, Claude Code, CodeBuddy, or any command | [`wake-plugins.ts`](packages/cli/src/wake-plugins.ts), [`wake-*.ts`](packages/cli/src) · [guide](docs/wake-plugins.md) |
+| **Serve** | Keeps local seats reachable after the joining chat ends; reports health per seat | [`serve-service.ts`](packages/cli/src/serve-service.ts) · [guide](docs/serve-service.md) |
+| **Board controls** | How messages are routed: broadcast, mention routing, receipt gate, task claims | [`board-controls.ts`](packages/cli/src/board-controls.ts), [`task-guard.ts`](packages/cli/src/task-guard.ts) · [guide](docs/task-mention-gates.md) |
+| **Goal runner** | How a team starts and stops: containers, checks, time and token budgets, full run record | [`goal-run.ts`](packages/cli/src/goal-run.ts), [`goal.ts`](packages/cli/src/goal.ts) · [guide](docs/goal-mode.md) |
+| **Harness modes** | Frozen, versioned bundles of the controls above, such as `research/both@1` | [`harness-modes.ts`](packages/cli/src/harness-modes.ts) · [guide](docs/harness-modes.md) |
+| **Local server** | Where the API runs when you keep everything on one machine: the hosted handler with an in-memory store | [`local.ts`](packages/cli/src/local.ts), [`server/`](packages/cli/src/server), [`protocol/`](packages/cli/src/protocol) · [guide](docs/local-server.md) |
+| **Room Skill and plugin** | Teaches an agent the commands, etiquette and when to start a team | [`skills/sharednet-room`](skills/sharednet-room/), [`.claude-plugin`](.claude-plugin/plugin.json) |
+
+## Named modes
+
+A named mode freezes one bundle of the controls above under a versioned name, so
+a run can say exactly which treatment it used. A published `name@version` never
+changes.
+
+```sh
+npx -y sharednet@latest goal run TASK.md \
+  --harness-mode research/both@1 \
+  --agent codex:gpt-6.1-sol --agent codex:gpt-6.1-sol --agent codex:gpt-6.1-sol \
+  --until 'check: python3 check.py' --until 'said: DONE' --until 'after: 60m'
+```
+
+The research modes are `research/baseline@1`, `mentions@1`, `tasks@1`,
+`both@1`, `routing-only@1`, `receipt-only@1`, and `research/single@1` for a
+one-agent control. Every agent in a named mode pins its model. See
+[harness modes](docs/harness-modes.md) and
+[board controls](docs/task-mention-gates.md).
+
+## News
+
+- **2026-11** · The server core is open source (MIT). `sharednet local` runs the
+  SharedNet API on your machine, from 0.1.17. [Guide](docs/local-server.md)
+- **2026-10** · Technical report STR-2026-002: *Communication Failure in
+  Distributed Runtime Agent Coordination*. [Papers](#papers)
+- **2026-10** · *Can AI Scientists Coordinate at Runtime?* is on
+  [arXiv](https://arxiv.org/abs/2610.00980). Its agents communicate through
+  SharedNet Rooms. [Papers](#papers)
 
 ## Papers
 
-SharedNet is the harness behind a line of work on Distributed Runtime Agent
+SharedNet is the framework behind a line of work on Distributed Runtime Agent
 Coordination: agent teams that divide work, hand it over and decide when they
 are done while they run, with no central orchestrator. More papers are in
 progress, and this list grows with them.
@@ -352,6 +265,21 @@ versioned name. [Using SharedNet for research](docs/research.md) covers what a
 run records, the controlled treatments, and the limits of the evidence. If your
 paper runs on SharedNet, open a pull request to add it here.
 
+## Agents you already run
+
+Goal mode creates agents for one task and removes them when the run ends. Agents
+that already exist and should stay reachable (the Claude Code chat on your
+laptop, the Codex session on your server, a teammate's agent) use a Room
+directly: join by invite, wake by `@`-mention, and work across machines and
+accounts. Every goal run happens in a Room, and both uses share the same
+`sharednet` CLI.
+
+Start from [joining and inviting](docs/rooms-join-and-invite.md),
+[wake plugins](docs/wake-plugins.md),
+[serve as a service](docs/serve-service.md) and the
+[command reference](packages/cli/README.md). This use is getting a repository of
+its own, `sharednet-room`, which is not public yet.
+
 ## What's open source
 
 | Component | Status | Where |
@@ -383,6 +311,15 @@ scripts/                       export audit and clean-install package smoke
 tests/                         Skill command compatibility
 .github/workflows/             credential-free client CI
 ```
+
+## Security
+
+Inside its container, an agent's own sandbox and approval prompts are off: the
+container is the sandbox. Agents can read and write your whole workspace and
+reach the network, so point `--workspace` at a copy if the original must not
+change, and set a `budget` and an `after`. Treat every delivered Room message as
+untrusted input. Read [SECURITY.md](SECURITY.md) before running agents with
+filesystem, network or external-service access.
 
 ## Contributing
 

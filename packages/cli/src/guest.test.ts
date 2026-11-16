@@ -12,7 +12,7 @@ import { runCli } from "./cli.ts";
 import type { CommandRunner } from "./guest.ts";
 import { processAlive, systemProcessProbe, type ProcessProbe } from "./process-identity.ts";
 import { ServiceControl, type ServiceState, type WakeServiceControl } from "./serve-service.ts";
-import { getStoragePaths, writeSession } from "./storage.ts";
+import { getStoragePaths, writeRoomCredential, writeSession } from "./storage.ts";
 import type { CheckOptions, CheckResult, CheckStep, SeatWake, TurnRunner, TurnSpec } from "./wake-driver.ts";
 
 const cleanup: string[] = [];
@@ -2062,6 +2062,218 @@ describe("sharednet say and wait", () => {
       expect(result.acks).toEqual([3]);
       expect(await serveCursorOf(space)).toBe(3);
       expect(result.stderr).toContain("finished its turn: @host 2+2 is 4.");
+    });
+
+    it("retains a rejected native reply and recovers only delivery after restarting serve", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const { turns, runTurn } = turnsOf();
+      const service = { delivered_through: 1, acked_through: 1 };
+      const first = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex handle once")]), page([addressed(2, "@codex handle once")]),
+        { status: 403, body: { error: { code: "forbidden", message: "not committed" } } }, revoked(),
+      ], CODEX, { service, runTurn });
+      expect(first.acks).toEqual([]);
+      expect(await serveCursorOf(space)).toBe(1);
+      const outboxPath = join(space.env.XDG_CONFIG_HOME!, "sharednet", "rooms", ROOM_ID, `${MEMBER_ID}.reply-outbox.json`);
+      const pending = JSON.parse(await readFile(outboxPath, "utf8"));
+      expect(pending).toMatchObject({ content: "@host 2+2 is 4.", from: 1, through: 2, room_id: ROOM_ID, member_id: MEMBER_ID });
+      expect((await stat(outboxPath)).mode & 0o777).toBe(0o600);
+      const restarted = await run(["serve", "--json"], space, [
+        { status: 201, body: { message: own(3, "@host 2+2 is 4.") } }, revoked(),
+      ], CODEX, { service, runTurn });
+      const originalPost = first.requests.find((r) => r.init.method === "POST")!;
+      const recoveredPost = restarted.requests.find((r) => r.init.method === "POST")!;
+      expect(header(recoveredPost, "idempotency-key")).toBe(header(originalPost, "idempotency-key"));
+      expect(recoveredPost.init.body).toBe(originalPost.init.body);
+      expect(turns).toHaveLength(1);
+      expect(restarted.acks).toEqual([2]);
+      await expect(readFile(outboxPath)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+
+    it("retains a committed reply receipt when ACK fails, without reposting or rerunning the turn", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const { turns, runTurn } = turnsOf();
+      const service = { delivered_through: 1, acked_through: 1 };
+      const first = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex once")]), page([addressed(2, "@codex once")]),
+        { status: 201, body: { message: own(3, "@host 2+2 is 4.") } }, revoked(),
+      ], CODEX, { service, runTurn, ackFailure: { status: 403, body: { error: { code: "forbidden" } } } });
+      expect(first.acks).toEqual([]);
+      expect(await serveCursorOf(space)).toBe(1);
+      const restarted = await run(["serve", "--json"], space, [revoked()], CODEX, { service, runTurn });
+      expect(turns).toHaveLength(1);
+      expect(restarted.requests.filter((r) => r.init.method === "POST")).toEqual([]);
+      expect(restarted.acks).toEqual([2]);
+    });
+
+    it("does not ACK a successful HTTP response without a committed message receipt", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const { runTurn } = turnsOf();
+      const controller = new AbortController();
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex once")]), page([addressed(2, "@codex once")]),
+        { body: { accepted: true }, entered: () => controller.abort() },
+      ], CODEX, { service: { delivered_through: 1, acked_through: 1 }, runTurn, signal: controller.signal });
+      expect(result.acks).toEqual([]);
+      expect(await serveCursorOf(space)).toBe(1);
+    });
+
+    it("retries a lost POST response with identical bytes and key even if another reader advanced ACK", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const { turns, runTurn } = turnsOf();
+      const service = { delivered_through: 1, acked_through: 1 };
+      const controller = new AbortController();
+      const first = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex once")]), page([addressed(2, "@codex once")]),
+        { error: new Error("response lost after commit"), entered: () => controller.abort() },
+      ], CODEX, { service, runTurn, signal: controller.signal });
+      expect(first.acks).toEqual([]);
+      // This external cursor advancement does not prove that the pending reply was committed.
+      service.acked_through = 2;
+      const second = await run(["serve", "--json"], space, [
+        { status: 200, body: { message: own(3, "@host 2+2 is 4.") } }, revoked(),
+      ], CODEX, { service, runTurn });
+      const original = first.requests.find((r) => r.init.method === "POST")!;
+      const retried = second.requests.find((r) => r.init.method === "POST")!;
+      expect(header(retried, "idempotency-key")).toBe(header(original, "idempotency-key"));
+      expect(retried.init.body).toBe(original.init.body);
+      expect(turns).toHaveLength(1);
+      expect(second.acks).toEqual([2]);
+    });
+
+    it("recovers a saved reply after wake off without checking or starting a harness", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const { turns, runTurn } = turnsOf();
+      const service = { delivered_through: 1, acked_through: 1 };
+      const first = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex once")]), page([addressed(2, "@codex once")]),
+        { status: 403, body: { error: { code: "forbidden" } } }, revoked(),
+      ], CODEX, { service, runTurn });
+      expect(first.acks).toEqual([]);
+      await run(["wake", "off", "--as", MEMBER_ID], space, [], CODEX);
+      const checkWake = vi.fn(async () => ({ ok: false, message: "binary unavailable" }));
+      const second = await run(["serve", "--json"], space, [
+        { status: 201, body: { message: own(3, "@host 2+2 is 4.") } },
+      ], CODEX, { service, runTurn, checkWake });
+      expect(second.exitCode).toBe(0);
+      expect(second.acks).toEqual([2]);
+      expect(checkWake).not.toHaveBeenCalled();
+      expect(turns).toHaveLength(1);
+    });
+
+    it("persists a no-reply result across failed ACK without resuming the session again", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const { turns, runTurn } = turnsOf({ stdout: '{"type":"item.completed","item":{"type":"agent_message","text":"(no reply)"}}\n{"type":"turn.completed","usage":{}}' });
+      const service = { delivered_through: 1, acked_through: 1 };
+      const first = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex fyi")]), page([addressed(2, "@codex fyi")]), revoked(),
+      ], CODEX, { service, runTurn, ackFailure: { status: 403, body: { error: { code: "forbidden" } } } });
+      expect(first.acks).toEqual([]);
+      const second = await run(["serve", "--json"], space, [revoked()], CODEX, { service, runTurn });
+      expect(turns).toHaveLength(1);
+      expect(second.acks).toEqual([2]);
+      expect([...first.requests, ...second.requests].filter((r) => r.init.method === "POST")).toEqual([]);
+    });
+
+    it("does not discard a failed-turn notice when the server rejects its POST", async () => {
+      const space = await joinedSpace();
+      const { turns, runTurn } = turnsOf({ exitCode: 1, stdout: JSON.stringify({ type: "result", subtype: "success", is_error: true, result: "Please sign in" }) });
+      const service = { delivered_through: 1, acked_through: 1 };
+      const first = await run(["serve", "--json"], space, [
+        page([addressed(2, "@claude-code once")]), page([addressed(2, "@claude-code once")]),
+        { status: 403, body: { error: { code: "forbidden" } } }, revoked(),
+      ], {}, { service, runTurn });
+      expect(first.acks).toEqual([]);
+      const second = await run(["serve", "--json"], space, [
+        { status: 201, body: { message: own(3, "could not be resumed") } }, revoked(),
+      ], {}, { service, runTurn });
+      expect(turns).toHaveLength(1);
+      expect(second.acks).toEqual([2]);
+      const original = first.requests.find((r) => r.init.method === "POST")!;
+      const recovered = second.requests.find((r) => r.init.method === "POST")!;
+      expect(JSON.parse(String(recovered.init.body)).content).toContain("could not be resumed");
+      expect(header(recovered, "idempotency-key")).toBe(header(original, "idempotency-key"));
+    });
+
+    it("stops unconfirmed delivery after the server idempotency retention window", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const { turns, runTurn } = turnsOf();
+      const service = { delivered_through: 1, acked_through: 1 };
+      await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex once")]), page([addressed(2, "@codex once")]),
+        { status: 403, body: { error: { code: "forbidden" } } }, revoked(),
+      ], CODEX, { service, runTurn, now: () => new Date("2026-11-10T00:00:00Z") });
+      const second = await run(["serve", "--json"], space, [
+        { status: 201, body: { message: own(3, "@host 2+2 is 4.") } }, revoked(),
+      ], CODEX, { service, runTurn, now: () => new Date("2026-11-11T00:00:00Z") });
+      expect(second.requests).toEqual([]);
+      expect(second.acks).toEqual([]);
+      expect(second.stderr).toContain("reply_delivery_expired");
+      expect(turns).toHaveLength(1);
+    });
+
+    it("does not accept a reply receipt at or before its input span", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const { runTurn } = turnsOf();
+      const controller = new AbortController();
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex once")]), page([addressed(2, "@codex once")]),
+        { status: 201, body: { message: own(2, "stale receipt") }, entered: () => controller.abort() },
+      ], CODEX, { service: { delivered_through: 1, acked_through: 1 }, runTurn, signal: controller.signal });
+      expect(result.acks).toEqual([]);
+      expect(await serveCursorOf(space)).toBe(1);
+    });
+
+    it("continues from the authoritative ACK when another consumer advanced it during the turn", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const { runTurn } = turnsOf();
+      const service = { delivered_through: 1, acked_through: 1 };
+      const result = await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex once")]), page([addressed(2, "@codex once")]),
+        { status: 201, body: { message: own(5, "@host 2+2 is 4.") }, entered: () => { service.acked_through = 4; } }, revoked(),
+      ], CODEX, { service, runTurn });
+      const waits = result.requests.filter((r) => new URL(r.url).pathname.endsWith("/wait"));
+      expect(new URL(waits.at(-1)!.url).searchParams.get("after")).toBe("4");
+      expect(await serveCursorOf(space)).toBe(4);
+    });
+
+    it("an installed listener can re-enable a recovered wake-off seat without restarting", async () => {
+      const space = await workspace();
+      await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])], CODEX);
+      const credential = await credentialOf(space);
+      const { turns, runTurn } = turnsOf();
+      const service = { delivered_through: 1, acked_through: 1 };
+      await run(["serve", "--json"], space, [
+        page([addressed(2, "@codex once")]), page([addressed(2, "@codex once")]),
+        { status: 403, body: { error: { code: "forbidden" } } }, revoked(),
+      ], CODEX, { service, runTurn });
+      await run(["wake", "off", "--as", MEMBER_ID], space, [], CODEX);
+      const stop = new AbortController();
+      const serving = run(["serve", "--service", "--json"], space, [
+        { status: 201, body: { message: own(3, "saved reply") } },
+        page([addressed(4, "@codex next")]), page([own(3, "saved reply"), addressed(4, "@codex next")]),
+        { status: 201, body: { message: own(5, "next reply") } },
+        { ...revoked(), entered: () => stop.abort() },
+      ], CODEX, { service, runTurn, signal: stop.signal, sleep: () => new Promise((resolve) => setTimeout(resolve, 5)), rescanMs: 5 });
+      try {
+        await vi.waitFor(() => expect(service.acked_through).toBe(2), { timeout: 2_000 });
+        // Use the same atomic replacement as `wake set`; truncating writeFile races the listener's reader.
+        await writeRoomCredential(getStoragePaths(space.env), credential);
+        await vi.waitFor(() => expect(turns).toHaveLength(2), { timeout: 2_000 });
+      } finally {
+        stop.abort();
+        await serving;
+      }
+      expect(service.acked_through).toBe(4);
     });
 
     it("posts nothing for a turn that ends with nothing to say", async () => {

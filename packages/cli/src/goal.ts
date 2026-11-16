@@ -145,6 +145,8 @@ export interface GoalWatchOptions {
   quietChecks: boolean;
   /** Prefix failing-check feedback with this seat, so a mention-driven listener receives it. */
   feedbackMention?: string;
+  /** Prefix failing-check feedback with whoever made the claim, for Rooms where only a mention wakes a seat. */
+  feedbackToClaimant?: boolean;
   /** Record messages through this sequence, but do not let runner setup machinery satisfy a trigger. */
   ignoreThrough?: number;
   /** Read the Room's state at least this often, to notice an end the service or the owner made. */
@@ -342,9 +344,10 @@ export async function goalWatch(
     return { passing, startedPassing, exitCode: result.exitCode, output: tail(result.output) };
   };
 
-  const feedback = async (content: string) => {
+  const feedback = async (content: string, claimant?: string) => {
     if (options.quietChecks) return;
-    const addressed = options.feedbackMention ? `@${options.feedbackMention} ${content}` : content;
+    const mention = options.feedbackMention ?? (options.feedbackToClaimant ? claimant : undefined);
+    const addressed = mention ? `@${mention} ${content}` : content;
     try {
       const posted = await client.request<{ message?: { sender_instance_id?: string } }>(
         "POST",
@@ -473,6 +476,7 @@ export async function goalWatch(
           }
           await feedback(
             `#${claim.sequence} says done, but \`${check.command}\` still fails (exit ${result.exitCode}):\n\n${tail(result.output).trim() || "(no output)"}`,
+            claim.sender?.name ?? claim.sender?.member_id ?? claim.sender_instance_id,
           );
         }
       }

@@ -172,6 +172,29 @@ describe("goal watch", () => {
     expect(result.ended_by).toMatchObject({ trigger: "check make test", detail: "all pass" });
   });
 
+  it("says a failing check to the seat that claimed, where only a mention wakes a seat", async () => {
+    const out = await temporary();
+    const { client, calls } = fakeRoom({
+      until: ["said DONE", "check make test", "count 50"],
+      pages: [
+        [{ sequence: 2, content: "DONE, all units in.", sender: AGENT }],
+        [{ sequence: 3, content: "check failed …", sender: RUNNER }],
+        [{ sequence: 4, content: "Fixed W3. DONE.", sender: AGENT }],
+      ],
+    });
+    const outcomes = [{ exitCode: 1, output: "W3 fails" }, { exitCode: 1, output: "W3 fails" }, { exitCode: 0, output: "all pass" }];
+    const result = await goalWatch(client, "sni_member", "snk_owner", { roomId: ROOM, workspace: out, out, checkEveryMs: 3_600_000, quietChecks: false, feedbackToClaimant: true }, {
+      now: clock(),
+      sleep: async () => undefined,
+      check: async () => outcomes.shift() ?? { exitCode: 1, output: "" },
+      snapshot: null,
+    });
+    const said = calls.filter((call) => call.path.endsWith("/owner-messages"));
+    expect(said).toHaveLength(1);
+    expect((said[0]!.body as { content: string }).content).toMatch(new RegExp(`^@${AGENT} #2 says done`));
+    expect(result.ended_by).toMatchObject({ trigger: "check make test", detail: "all pass" });
+  });
+
   it("stays quiet when told to, and ends on what was said when no check stands behind it", async () => {
     const out = await temporary();
     const quiet = fakeRoom({ until: ["said DONE", "after 1h"], pages: [[{ sequence: 2, content: "DONE", sender: AGENT }]] });

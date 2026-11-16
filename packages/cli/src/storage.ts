@@ -153,7 +153,7 @@ export function getStoragePaths(env: Environment = process.env): StoragePaths {
   };
 }
 
-async function ensureSecureDirectory(path: string): Promise<void> {
+export async function ensureSecureDirectory(path: string): Promise<void> {
   if (process.platform === "win32") unsafeStorage();
   await mkdir(path, { recursive: true, mode: 0o700 });
   const info = await lstat(path);
@@ -167,7 +167,7 @@ async function ensureSecureDirectory(path: string): Promise<void> {
   }
 }
 
-async function readSecureFile(path: string): Promise<string | null> {
+export async function readSecureFile(path: string): Promise<string | null> {
   let info;
   try {
     info = await lstat(path);
@@ -205,7 +205,7 @@ async function readSecureFile(path: string): Promise<string | null> {
   }
 }
 
-async function writeSecureJson(path: string, value: unknown): Promise<void> {
+export async function writeSecureJson(path: string, value: unknown): Promise<void> {
   return writeSecureText(path, `${JSON.stringify(value)}\n`);
 }
 

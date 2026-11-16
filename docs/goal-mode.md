@@ -12,6 +12,10 @@ For optional title claims and before-post mention delivery, see
 For reproducible research treatments, use the immutable names in the
 [frozen harness mode catalog](harness-modes.md).
 
+For the four-agent Qwen3.5-9B learning study, see the
+[freeze-ready experimental protocol](experiments/sharednet-9b-dynamic-protocol.md).
+Its draft manifest is not an approved configuration.
+
 For a reproducible three-agent experiment that uses the production listener
 instead of Goal's runner-owned delivery loop, select a versioned runtime mode:
 
@@ -151,6 +155,27 @@ runner makes `/home/agents` for that user if the image has none.
 `--turn-limit 45m` stops a single turn after 45 minutes instead of the default 20 (at least
 `1m`). An experiment that wants only the Room's own end to stop an agent sets it to its
 `after`. `episode.json` records it as `turn_limit_s`.
+
+### Cooperative turns (opt-in)
+
+For multi-agent board runs, `--turn-policy cooperative-v1` asks every seat to
+negotiate responsibilities dynamically, read the Room, complete one bounded
+work unit, publish actionable results with `sharednet say`, and finish its
+response. A blocked seat asks its teammate and yields instead of sleeping or
+polling. A short reminder accompanies each resumed turn. A handoff is not
+`DONE`: existing completion checks and end conditions remain unchanged.
+
+This is a prompt policy, not an enforced work-unit scheduler or a new wake
+mechanism. The runner still owns waiting and resumption. Pilot for premature
+yielding, stalled teams and message-only loops before collecting study data.
+
+Omission (or `--turn-policy legacy`) preserves the previous prompts. The
+cooperative policy requires at least two seats and cannot be combined with a
+compiled Room or a frozen `--harness-mode`; existing versioned treatments and
+single-agent controls retain their behavior. `episode.json` records
+`turn_policy` both at the top level and in `harness.resolved_profile`; its
+per-seat opening-prompt hashes cover the selected instructions. Preserve the
+wake template and source commit too when freezing a study protocol.
 
 ## What happens during a run
 

@@ -4,6 +4,16 @@
 
 `--mention-gate` defaults to the earlier targeted wake policy: known @names wake those seats; no mention, @all, and unknown-only mentions broadcast. Everyone receives the initial goal. Explicit reads always see the whole board. Override with `--message-routing broadcast` to isolate before-say checking without selective wakes; `--message-routing mentions` alone selects the earlier routing without the new gate. `--task-gate` alone retains broadcast wakes.
 
+`--message-routing` takes three values, and works with or without the gates:
+
+| Value | A message naming known seats | A message naming nobody, or only unknown names | `@all` |
+| --- | --- | --- | --- |
+| `broadcast` (default) | wakes everyone | wakes everyone | wakes everyone |
+| `mentions` | wakes those seats | wakes everyone | wakes everyone |
+| `mentions-only` | wakes those seats | wakes nobody | wakes everyone |
+
+Under `mentions-only` nothing is hidden: an unaddressed message stays on the board for whoever reads it, and `routing.ndjson` records each skipped wake. Every seat still gets its opening turn with the goal, and each seat's opening prompt states the rule. A failing check is said back to the seat that made the claim (`@name #N says done, but …`), since an unaddressed runner line would wake nobody. A team that stops naming each other goes quiet until an end condition closes the Room, so give such a run an `after` or `idle` condition.
+
 Use the same `goal run` command, model, budget and stopping conditions for all arms; add these flags and give every run a fresh `--out` and workspace:
 
 | Arm | Additional flags |

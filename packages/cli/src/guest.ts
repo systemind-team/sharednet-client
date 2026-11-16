@@ -5,6 +5,7 @@ import { isAbsolute, join as joinPath, resolve as resolvePathFrom } from "node:p
 
 import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
 import { compiledPrompt, type CompiledState } from "./compiled.ts";
+import { clearPendingReply, readPendingReply, writePendingReply, type PendingReply } from "./reply-outbox.ts";
 import { claimTask, controlEvent, controlPaths, latestForeignTaskSequence, noteRead, noteTasks, noteTasksSeen, pendingMentions, projectTasks, readMark, readThrough, recentTasks, taskMessage, withControlLock, type BoardMessage } from "./board-controls.ts";
 import { accountCredentialFrom, withCredentialLock } from "./login.ts";
 import { CliError, localError } from "./errors.ts";
@@ -3043,7 +3044,16 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   // Without --run there is nothing to do for a seat but resume the session that took it, so only
   // those seats are served. Any other seat is left to its own waits: a connector that sat in it
   // would count what it never handled as handled, and that seat's next `wait` would miss it.
-  const served = (seat: StoredRoomCredential) => (only ? only.has(seat.room_id) : true) && (command !== undefined || seat.wake !== undefined);
+  const pendingSeats = new Set<string>();
+  const rememberPending = async (all: StoredRoomCredential[]) => {
+    for (const seat of all) {
+      if (only && !only.has(seat.room_id)) continue;
+      const key = `${seat.room_id}/${seat.member_id}`;
+      if (await readPendingReply(paths, seat)) pendingSeats.add(key);
+      else pendingSeats.delete(key);
+    }
+  };
+  const served = (seat: StoredRoomCredential) => (only ? only.has(seat.room_id) : true) && (command !== undefined || seat.wake !== undefined || pendingSeats.has(`${seat.room_id}/${seat.member_id}`));
 
   const listSeats = () => (dependencies.listSeats ? dependencies.listSeats(() => heldSeats(paths)) : heldSeats(paths));
   const discoveryWarnings = new Set<string>();
@@ -3056,6 +3066,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     admitted: remotelyAdmitted,
     signal: dependencies.signal,
   });
+  await rememberPending(held);
   const seats = held.filter(served);
   if (seats.length === 0 && !asService) {
     throw localError(
@@ -3199,7 +3210,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
   );
   if (base !== null) dependencies.stderr?.(`serve: doorbell at ${base}/sharednet/push/<seat>, listening on 127.0.0.1:${listen}; idle until rung\n`);
 
-  const sitIn = async (seat: StoredRoomCredential) => {
+  const sitIn = async (seat: StoredRoomCredential): Promise<void> => {
     const client = new ApiClient(seat.base_url, boundedFetch(dependencies, null, false));
     const me = seat.member_id;
     // A seat taken from inside a Codex or Claude Code session is driven: being addressed resumes
@@ -3213,6 +3224,67 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
     const admitted = remotelyAdmitted.has(seatKey(seat));
     // Driven, a seat wakes when a line addresses it; the wake still carries everything said since.
     const seatFilters = driving || admitted ? new URLSearchParams({ mentions: me }) : filters;
+    const turns = turnTimes.get(seatKey(seat)) ?? [];
+    turnTimes.set(seatKey(seat), turns);
+    // An account's seat can be handed a new token while this runs (its session registered again);
+    // the session file holds the current one, which is the one `say` and `wait` use too.
+    const current = async () => {
+      if (!seat.member_id.startsWith("i_")) return;
+      const session = await readSessionById(paths, seat.member_id).catch(() => null);
+      if (session && sameOrigin(session.base_url, seat.base_url)) seat.member_token = session.instance_token;
+    };
+    // A completed native turn is independent of the current wake binding/binary. Retry its
+    // saved delivery before checking the harness or promoting any cursor mirror.
+    const completePending = async (pending: PendingReply) => {
+      if (pending.content !== null && !pending.committed) {
+        // The service retains message idempotency records for 24h. Beyond that boundary
+        // an ambiguous POST could become a duplicate; leave its bytes/key for reconciliation.
+        const age = dependencies.now().getTime() - Date.parse(pending.created_at);
+        if (age < 0 || age >= 24 * 60 * 60_000) {
+          throw localError("reply_delivery_expired", "The saved reply is outside the service's 24-hour replay window; reconcile its original message before retrying. Its reply file was retained.");
+        }
+        const response = await client.request<{ message?: { id?: unknown; sequence?: unknown; room_id?: unknown } }>(
+          "POST", `/rooms/${encodeURIComponent(seat.room_id)}/messages`, seat.member_token,
+          { content: pending.content }, { "idempotency-key": pending.idempotency_key },
+        );
+        const message = response?.message;
+        if (typeof message?.id !== "string" || !/^msg_[A-Za-z0-9]+$/.test(message.id) ||
+            typeof message.sequence !== "number" || !Number.isSafeInteger(message.sequence) || message.sequence <= pending.through ||
+            (message.room_id !== undefined && message.room_id !== seat.room_id)) throw invalidServerResponse();
+        pending = { ...pending, committed: { id: message.id, sequence: message.sequence } };
+        // A lost POST response retries the same key; a lost ACK response reuses this receipt.
+        await writePendingReply(paths, pending);
+      }
+      const response = await client.request<{ subscription?: { acked_through?: unknown } }>(
+        "POST", `/rooms/${encodeURIComponent(seat.room_id)}/ack`, seat.member_token, { through: pending.through },
+      );
+      const acked = response?.subscription?.acked_through;
+      if (typeof acked !== "number" || !Number.isSafeInteger(acked) || acked < pending.through) throw invalidServerResponse();
+      await writeServeCursor(paths, seat.room_id, seat.member_id, acked);
+      await clearPendingReply(paths, seat);
+      return acked;
+    };
+    await current();
+    const pending = await readPendingReply(paths, seat);
+    if (pending) {
+      dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} recovering saved reply delivery through #${pending.through}; not resuming its session\n`);
+      await completePending(pending);
+    }
+    // A wake may have been turned off while its reply was pending. Finish delivery, then stop.
+    if (!command && !driving) {
+      if (!asService) return;
+      // Installed listeners must keep this recovered seat available for a later wake-on.
+      while (!stopping.signal.aborted) {
+        await setHealth(seat, "stopped");
+        await retryDelay(RESCAN_MS);
+        const fresh = await readRoomCredential(paths, seat.room_id, seat.member_id);
+        if (fresh?.wake && !stopping.signal.aborted) {
+          seat.wake = fresh.wake;
+          return sitIn(seat);
+        }
+      }
+      return;
+    }
     if (driving) {
       // A program that cannot start would take every wake and answer none (#20): look once, first,
       // and leave the seat's lines unread when it does not start.
@@ -3246,16 +3318,6 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       }
       dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} (${me}) wakes ${describeWake(seat.wake!)} when addressed\n`);
     }
-    const turns = turnTimes.get(seatKey(seat)) ?? [];
-    turnTimes.set(seatKey(seat), turns);
-    // An account's seat can be handed a new token while this runs (its session registered again);
-    // the session file holds the current one, which is the one `say` and `wait` use too.
-    const current = async () => {
-      if (!seat.member_id.startsWith("i_")) return;
-      const session = await readSessionById(paths, seat.member_id).catch(() => null);
-      if (session && sameOrigin(session.base_url, seat.base_url)) seat.member_token = session.instance_token;
-    };
-    await current();
     // The place is the service's (wait PR 5), shared with every other door this seat uses; the
     // connector's file mirrors it. A seat that has handled nothing anywhere starts at the Room's
     // current end, so a first start does not hand over the whole history as if it were new.
@@ -3279,8 +3341,10 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       await acknowledgeThrough(client, seat.room_id, seat.member_token, cursor, sleep, dependencies);
       await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
     };
-    const post = (content: string) =>
-      client.request("POST", `/rooms/${encodeURIComponent(seat.room_id)}/messages`, seat.member_token, { content }, { "idempotency-key": randomUUID() });
+    const saveReply = (content: string | null, from: number, through: number) => writePendingReply(paths, {
+      schema_version: 1, base_url: seat.base_url, room_id: seat.room_id, member_id: seat.member_id,
+      from, through, content, idempotency_key: randomUUID(), created_at: dependencies.now().toISOString(),
+    });
     /** One wake of a driven seat, delivered by its plugin. What that means for the Room is decided here. */
     const deliverWake = async (said: MessageShape[], from: number, through: number): Promise<Delivery | null> => {
       const hour = dependencies.now().getTime() - 3_600_000;
@@ -3373,11 +3437,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         // The turn's last message is the seat's reply; the session does not have to reach the Room.
         const answer = replyFrom(delivery.reply, MAX_MESSAGE_BYTES);
         dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} finished its turn${answer ? `: ${answer.replace(/\s+/g, " ").slice(0, 160)}` : " with nothing to say"}\n`);
-        if (answer) {
-          await post(answer).catch((error: unknown) => {
-            dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name}'s reply was not posted (${error instanceof CliError ? error.code : "error"})\n`);
-          });
-        }
+        await saveReply(answer || null, from, through);
       } else if (delivery.kind === "handed") {
         dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed; ${span} ${delivery.note}; it answers in the Room itself\n`);
         // Written before the cursor moves past it: a session that never answers leaves it unanswered.
@@ -3393,7 +3453,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         const notice = delivery.timedOut
           ? `(${seat.name}'s turn was stopped after ${timeoutMs / 60_000} minutes. The listener remains available for the next mention; this task was not automatically retried.)`
           : `(${seat.name} was addressed, but its ${pluginLabel} session could not be resumed: ${delivery.why})`;
-        await post(notice).catch(() => undefined);
+        await saveReply(notice, from, through);
       }
       return delivery;
     };
@@ -3456,8 +3516,13 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
           polled = cursor;
           continue;
         }
-        // Handled only now, so a wake cut short by a crash or a restart is handed over again.
-        await handled(polled);
+        if (delivery.kind === "replied" || delivery.kind === "failed") {
+          const pending = await readPendingReply(paths, seat);
+          if (!pending) throw localError("invalid_reply_outbox", "A completed turn has no saved reply delivery.");
+          cursor = polled = Math.max(polled, await completePending(pending));
+        } else {
+          await handled(polled);
+        }
         continue;
       }
       if (others.length === 0 || !command) {
@@ -3555,6 +3620,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       .then((all) => discoverInstanceRooms(all, paths, dependencies, { command, only, warned: discoveryWarnings, admitted: remotelyAdmitted, signal: stopping.signal }))
       .then(async (all) => {
         if (closing) return;
+        await rememberPending(all);
         const fresh = all.filter(served).filter(begin);
         if (fresh.length === 0) return;
         dependencies.stderr?.(`serve: now also sitting in ${fresh.map((seat) => `${seat.room_id} as ${seat.name}`).join(", ")}\n`);
