@@ -214,6 +214,29 @@ describe("a turn", () => {
     expect(opening).not.toContain("The others:");
     expect(opening).not.toContain("with the others");
     expect(opening).not.toContain("Agree in the Room who does what");
+    expect(opening).not.toContain("## Cooperative turns");
+  });
+
+  it("opts into bounded cooperative work without changing completion requirements or assigning specialist roles", () => {
+    const seats = parseAgents(["codex:gpt-test", "codex:gpt-test"]);
+    const input = { seat: seats[0]!, seats, roomId: ROOM, goal: "Make the tests pass.", goalSequence: 1, until: ["said /^DONE$/", "after 1h"] };
+    const opening = openingPrompt({ ...input, turnPolicy: "cooperative-v1" });
+    expect(opening).toContain("## Cooperative turns");
+    expect(opening).toContain("Responsibilities are negotiated dynamically");
+    expect(opening).toContain("Complete one coherent unit:");
+    expect(opening).toContain("Then finish your response and end your turn.");
+    expect(opening).toContain("If blocked on a teammate, post the specific request");
+    expect(opening).toContain("Do not wait, sleep, poll");
+    expect(opening).toContain("Ending a turn is a handoff, not a declaration of team completion.");
+    expect(opening).toContain('Say "/^DONE$/" in the Room only when you believe the goal is met');
+    expect(opening).not.toContain("do your part, and end your turn when there is nothing more to do now");
+    expect(openingPrompt(input)).not.toContain("## Cooperative turns");
+    expect(openingPrompt({ ...input, turnPolicy: "legacy" })).toBe(openingPrompt(input));
+    const wake = { wake_id: "wk_cooperative", fired: ["message"], events: [], from: 1, through: 2, messages: [{ sequence: 2, content: "Please review.", sender: { name: "codex-2" } }] };
+    expect(wakePrompt(wake, "cooperative-v1")).toContain("#2 codex-2: Please review.");
+    expect(wakePrompt(wake, "cooperative-v1")).toContain("A handoff is not DONE.");
+    expect(wakePrompt(wake)).toBe(wakePrompt(wake, "legacy"));
+    expect(wakePrompt(wake)).not.toContain("cooperative-turn policy");
   });
 
   it("tells each seat which messages will wake it, for either mention routing", () => {
@@ -442,7 +465,14 @@ describe("runGoal", () => {
     expect(dockerCalls).toBe(0);
   });
 
-  it.each([["board", false, false], ["compiled", false, false], ["board", true, false], ["board", false, true], ["board", true, true]] as const)("runs every %s seat with mention=%s task=%s until the budget is spent and keeps credentials private", async (roomType, mentionGate, taskGate) => {
+  it.each([
+    ["board", false, false, "legacy"],
+    ["compiled", false, false, "legacy"],
+    ["board", true, false, "legacy"],
+    ["board", false, true, "legacy"],
+    ["board", true, true, "legacy"],
+    ["board", false, false, "cooperative-v1"],
+  ] as const)("runs every %s seat with mention=%s task=%s turn-policy=%s until the budget is spent and keeps credentials private", async (roomType, mentionGate, taskGate, turnPolicy) => {
     const out = await temporary();
     const workspace = await temporary();
     const cliRoot = await temporary();
@@ -534,7 +564,7 @@ describe("runGoal", () => {
     } as unknown as ApiClient;
 
     let tick = Date.parse("2026-10-05T12:00:00.000Z");
-    const harnessMode = roomType === "board" && !mentionGate && !taskGate
+    const harnessMode = roomType === "board" && !mentionGate && !taskGate && turnPolicy === "legacy"
       ? resolveGoalRunHarnessMode("research/baseline@1")
       : undefined;
     const result = await runGoal(
@@ -555,6 +585,7 @@ describe("runGoal", () => {
         out,
         checkEveryMs: 60_000,
         quietChecks: false,
+        turnPolicy,
         ...(harnessMode ? {
           harnessMode,
         } : {}),
@@ -594,6 +625,8 @@ describe("runGoal", () => {
       expect(calls.some(call => call.args.includes("ack") && call.args.includes("skip_two"))).toBe(true);
     }
     const initial = turns.find(call => !call.args.includes("resume"))!.args.at(-1)!;
+    expect(initial.includes("## Cooperative turns")).toBe(turnPolicy === "cooperative-v1");
+    expect(turns.filter(call => call.args.includes("resume")).every(call => call.args.at(-1)!.includes("A handoff is not DONE.") === (turnPolicy === "cooperative-v1"))).toBe(true);
     expect(initial.includes("Before doing work, understand the goal and claim")).toBe(taskGate);
     expect(initial.includes("Before you say something")).toBe(mentionGate);
     if (taskGate) {
@@ -671,7 +704,8 @@ describe("runGoal", () => {
     await expect(readFile(join(home, ".codex", "auth.json"))).rejects.toThrow();
     await expect(readFile(join(home, ".config", "sharednet", "rooms", "seat.json"))).rejects.toThrow();
     const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
-    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", turn_limit_s: 1200, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
+    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", turn_limit_s: 1200, turn_policy: turnPolicy, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
+    expect(episode.harness.resolved_profile.turn_policy).toBe(turnPolicy);
     expect(episode.agents).toHaveLength(2);
     if (harnessMode) {
       expect(episode.harness).toMatchObject({

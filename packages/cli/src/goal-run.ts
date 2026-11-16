@@ -356,8 +356,28 @@ export function withoutTaskActs(wake: WakeShape): WakeShape {
   return { ...wake, messages: wake.messages.filter(message => !isTaskMessage(message.content)) };
 }
 
+export type TurnPolicy = "legacy" | "cooperative-v1";
+
+const COOPERATIVE_TURNS = [
+  "## Cooperative turns",
+  "",
+  "The team goal spans multiple turns. Responsibilities are negotiated dynamically in the Room; you do not have a permanently assigned role. Your current assignment is one bounded unit of work toward the team goal, not the entire goal.",
+  "",
+  "At the start of each turn, review the delivered messages and read the Room for relevant updates. Coordinate ownership before starting work that may overlap with a teammate's assignment.",
+  "",
+  "Complete one coherent unit: a plan update, implementation increment, review of a published change, or test batch.",
+  "",
+  "After that unit, use sharednet say to publish actionable results: what changed, relevant files or test evidence, and any dependencies or requests. Then finish your response and end your turn.",
+  "",
+  "If blocked on a teammate, post the specific request, mentioning the responsible teammate when known, and end your turn immediately. Do not wait, sleep, poll, or repeatedly check for their response. Do not run sharednet wait or sharednet watch yourself.",
+  "",
+  "Ending a turn is a handoff, not a declaration of team completion. Only post DONE or another configured completion claim when the existing team-completion requirements are met. Do not post repeated \"nothing changed\" messages.",
+].join("\n");
+
+const COOPERATIVE_REMINDER = "Continue under the cooperative-turn policy: complete one bounded work unit, publish actionable results with sharednet say, then finish your response and end your turn. If blocked, request what you need and yield; do not poll or wait. A handoff is not DONE.";
+
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
-export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting }): string {
+export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy }): string {
   const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
   const single = input.seats.length === 1;
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
@@ -390,16 +410,18 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
     "Lines from `runner` are the goal's machinery, such as a check's result, not a person.",
     single
       ? "Work through the goal and end your turn when there is nothing more to do now."
-      : "Agree in the Room who does what, do your part, and end your turn when there is nothing more to do now.",
+      : input.turnPolicy === "cooperative-v1"
+        ? COOPERATIVE_TURNS
+        : "Agree in the Room who does what, do your part, and end your turn when there is nothing more to do now.",
     ...(input.mentionGate ? [MENTION_HELP] : []),
     ...(input.taskGate ? [TASK_HELP] : []),
   ].join("\n");
 }
 
 /** What a woken Agent is told: everything said since its last turn. */
-export function wakePrompt(wake: WakeShape): string {
+export function wakePrompt(wake: WakeShape, turnPolicy: TurnPolicy = "legacy"): string {
   const lines = wake.messages.map((message) => `#${message.sequence} ${message.sender?.name ?? message.sender?.member_id ?? "someone"}: ${message.content}`);
-  return [`New in the Room since your last turn (#${wake.from + 1} to #${wake.through}):`, ...lines, "", "Carry on with the goal."].join("\n");
+  return [`New in the Room since your last turn (#${wake.from + 1} to #${wake.through}):`, ...lines, "", turnPolicy === "cooperative-v1" ? COOPERATIVE_REMINDER : "Carry on with the goal."].join("\n");
 }
 
 /** One turn: a fresh harness run, or the same session resumed, with nothing asked of a person. */
@@ -554,6 +576,7 @@ export interface GoalRunInput {
   mentionGate?: boolean;
   taskGate?: boolean;
   messageRouting?: MessageRouting;
+  turnPolicy?: TurnPolicy;
   /** A canonical treatment selected by --harness-mode. Omission preserves legacy ad-hoc flags. */
   harnessMode?: GoalRunHarnessResolution;
   /** Tests and artifact builders may supply provenance; source runs discover repository and package identity. */
@@ -590,6 +613,10 @@ export async function runGoal(
   const messageRouting = input.messageRouting ?? (input.mentionGate ? "mentions" : "broadcast");
   const mentionGate = input.mentionGate ?? false;
   const taskGate = input.taskGate ?? false;
+  const turnPolicy = input.turnPolicy ?? "legacy";
+  if (turnPolicy !== "legacy" && turnPolicy !== "cooperative-v1") throw localError("invalid_arguments", "--turn-policy is legacy or cooperative-v1.");
+  if (input.harnessMode && turnPolicy !== "legacy") throw localError("invalid_arguments", "--turn-policy cooperative-v1 cannot override a frozen --harness-mode.");
+  if (turnPolicy === "cooperative-v1" && (plan.agents.length < 2 || input.roomType === "compiled")) throw localError("invalid_arguments", "--turn-policy cooperative-v1 requires a multi-agent board Room.");
   if (
     input.harnessMode
     && (input.roomType !== input.harnessMode.profile.room_type
@@ -818,7 +845,7 @@ export async function runGoal(
 
     // Every seat starts once. Subsequent wakes follow the configured routing policy.
     const seatLoop = async (seat: SeatRecord) => {
-      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting });
+      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy });
       openingPromptHashes[seat.name] = sha256(prompt);
       let wake: WakeShape | null = null;
       let failedInARow = 0;
@@ -845,7 +872,7 @@ export async function runGoal(
           if (raw.wake_id) await exec(seat, ["sharednet", "ack", raw.wake_id, "--json"]);
         }
         if (ended || !wake) return;
-        prompt = wakePrompt(wake);
+        prompt = wakePrompt(wake, turnPolicy);
       }
     };
     const seats = records.map((seat) =>
@@ -911,6 +938,7 @@ export async function runGoal(
           image: plan.image,
           web_search: input.webSearch ?? "live",
           turn_limit_s: turnLimitSeconds,
+          turn_policy: turnPolicy,
           mention_gate: input.mentionGate ?? false,
           task_gate: input.taskGate ?? false,
           message_routing: messageRouting,
@@ -921,6 +949,7 @@ export async function runGoal(
               ...profile,
               web_search: input.webSearch ?? "live",
               turn_limit_s: turnLimitSeconds,
+              turn_policy: turnPolicy,
               until: input.until,
             },
             client_commit: codeProvenance.clientCommit,

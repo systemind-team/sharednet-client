@@ -354,6 +354,24 @@ describe("reach: forming a group from the account CLI", () => {
     expect(refused.requests).toEqual([]);
   });
 
+  it("validates the opt-in cooperative-turn policy before reading a goal or making a request", async () => {
+    for (const [extra, expected] of [
+      [["--turn-policy", "unknown"], "--turn-policy is legacy or cooperative-v1"],
+      [["--turn-policy", "cooperative-v1"], "requires a multi-agent board Room"],
+      [["--turn-policy", "cooperative-v1", "--agent", "codex", "--type", "compiled"], "requires a multi-agent board Room"],
+      [["--turn-policy", "cooperative-v1", "--harness-mode", "research/baseline@1"], "cannot override a frozen --harness-mode"],
+      [["--turn-policy", "cooperative-v1", "--harness-mode", "runtime/serve-first@1"], "cannot override a frozen --harness-mode"],
+    ] as const) {
+      const refused = await harness(["goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", ...extra], []);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr.join(" ")).toContain(expected);
+      expect(refused.requests).toEqual([]);
+    }
+    const accepted = await harness(["goal", "run", "missing.md", "--agent", "codex", "--agent", "codex", "--until", "after: 1h", "--turn-policy", "cooperative-v1"], []);
+    expect(accepted.stderr.join(" ")).toContain("file that could not be read: missing.md");
+    expect(accepted.requests).toEqual([]);
+  });
+
   it("validates canonical harness modes before reading the goal or making a request", async () => {
     const malformed = await harness([
       "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "research/baseline",
