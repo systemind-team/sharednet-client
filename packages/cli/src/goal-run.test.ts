@@ -22,6 +22,7 @@ import {
   discoverCodeProvenance,
   freshTokens,
   gatewayTemplate,
+  keyPlaceholders,
   isolationNames,
   loopbackPort,
   openingPrompt,
@@ -794,32 +795,62 @@ describe("an isolated run", () => {
     // A Codex login lives in the container that uses it; the gateway can only sign with a key.
     await expect(prepareRun({ ...base, env: {}, isolate: true }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "agent_auth_missing" });
 
-    // The gateway's image is pulled when it is not here; the model origins follow this machine's own settings.
+    // The gateway's image is pulled when it is not here; the Codex seats' model origin is the one the run names.
     const missing = fakeDocker((call) => ({ code: call.args[0] === "image" && call.args.includes(GATEWAY_IMAGE) ? 1 : 0 }));
-    const plan = await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-test", OPENAI_BASE_URL: "https://llm.example.test/v1" }, isolate: true, agentUser: "agent" }, missing.docker, () => undefined);
+    const plan = await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-test" }, modelApi: "https://llm.example.test/v1", isolate: true, agentUser: "agent" }, missing.docker, () => undefined);
     expect(missing.calls.some((call) => call.args.join(" ") === `pull ${GATEWAY_IMAGE}`)).toBe(true);
     expect(plan).toMatchObject({ agentUser: "agent", isolation: { openai: "https://llm.example.test", anthropic: "https://api.anthropic.com" }, codexAuth: { kind: "api-key" } });
     // Another model API: its key in OPENAI_API_KEY, its path kept; a Codex login signs in to OpenAI alone.
-    const routed = await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-or-test", OPENAI_BASE_URL: "https://openrouter.ai/api/v1" }, isolate: true }, ready.docker, () => undefined);
+    const routed = await prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-or-test" }, modelApi: "https://openrouter.ai/api/v1", isolate: true }, ready.docker, () => undefined);
     expect(routed).toMatchObject({ isolation: { openai: "https://openrouter.ai" }, codexApi: { origin: "https://openrouter.ai", path: "/api/v1", custom: true } });
-    await expect(prepareRun({ ...base, env: { OPENAI_BASE_URL: "https://openrouter.ai/api/v1" } }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "agent_auth_missing" });
+    await expect(prepareRun({ ...base, env: {}, modelApi: "https://openrouter.ai/api/v1" }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "agent_auth_missing" });
+    // What this machine's environment says about a model API chooses nothing: a run that names none uses OpenAI's, as before.
+    const ambient = { OPENAI_BASE_URL: "https://elsewhere.example.test/v1", ANTHROPIC_BASE_URL: "https://elsewhere.example.test" };
+    const login = await prepareRun({ ...base, env: ambient }, ready.docker, () => undefined);
+    expect(login.codexAuth).toMatchObject({ kind: "login" });
+    expect(login.codexApi).toBeUndefined();
+    const keyed = await prepareRun({ ...base, agents: parseAgents(["codex", "claude-code"]), env: { ...ambient, OPENAI_API_KEY: "sk-test", ANTHROPIC_API_KEY: "sk-ant-test" }, isolate: true }, ready.docker, () => undefined);
+    expect(keyed.codexApi).toBeUndefined();
+    expect(keyed.isolation).toEqual({ openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" });
+    // The address goes into the gateway's configuration and Codex's: a plain host and path, nothing else.
+    for (const bad of ["https://x;}server{listen/v1", "https://user:pass@llm.example.test/v1", "https://llm.example.test/v1?key=1", "https://llm.example.test/v1\"", "ftp://llm.example.test/v1", "llm.example.test/v1"]) {
+      await expect(prepareRun({ ...base, env: { OPENAI_API_KEY: "sk-test" }, modelApi: bad }, ready.docker, () => undefined)).rejects.toMatchObject({ code: "invalid_arguments" });
+    }
     // Not isolated, nothing changes: the default user and no gateway.
     expect(await prepareRun({ ...base, env: {} }, ready.docker, () => undefined)).toMatchObject({ agentUser: "node", isolation: null });
   });
 
   it("has a gateway that names the keys it signs with and holds none of them", () => {
+    const placeholders = keyPlaceholders("0123456789abcdef0123456789abcdef");
     const template = gatewayTemplate({
       sharednet: "https://www.sharednet.ai",
       isolation: { openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" },
       codex: true,
       claudeAuth: "ANTHROPIC_API_KEY",
+      placeholders,
     });
+    // A key goes only to an upstream whose certificate is valid for its name.
+    expect(template.match(/proxy_ssl_verify on;/g)).toHaveLength(3);
+    expect(template).toContain("proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;");
+    expect(template).toContain("proxy_ssl_name api.openai.com;");
+    expect(template).toContain("proxy_ssl_name api.anthropic.com;");
+    // A request is signed only when it carries this run's placeholder; the plain SharedNet forward has no key to guard.
+    expect(template).toContain('if ($http_authorization != "Bearer sk-isolated-0123456789abcdef0123456789abcdef") { return 403; }');
+    expect(template).toContain('if ($http_x_api_key != "sk-ant-api03-isolated-0123456789abcdef0123456789abcdef") { return 403; }');
+    expect(template.match(/return 403;/g)).toHaveLength(2);
+    expect(template.indexOf("return 403;")).toBeLessThan(template.indexOf('proxy_set_header Authorization "Bearer ${OPENAI_API_KEY}";'));
+    // A development service on this machine is reached over plain HTTP: nothing to verify there.
+    expect(gatewayTemplate({ sharednet: "http://host.docker.internal:3001", isolation: { openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" }, codex: false, claudeAuth: null, placeholders })).not.toContain("proxy_ssl_verify");
+    // Each run makes its own placeholders, and they are safe to write into a configuration.
+    expect(keyPlaceholders().OPENAI_API_KEY).toMatch(/^sk-isolated-[0-9a-f]{48}$/);
+    expect(keyPlaceholders().OPENAI_API_KEY).not.toBe(keyPlaceholders().OPENAI_API_KEY);
+    expect(() => keyPlaceholders('x"; }')).toThrow();
     expect(template).toContain("listen 8081;");
     expect(template).toContain("proxy_pass https://www.sharednet.ai;");
     expect(template).toContain('proxy_set_header Authorization "Bearer ${OPENAI_API_KEY}";');
     expect(template).toContain('proxy_set_header x-api-key "${ANTHROPIC_API_KEY}";');
-    expect(gatewayTemplate({ sharednet: "https://www.sharednet.ai", isolation: { openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" }, codex: false, claudeAuth: "CLAUDE_CODE_OAUTH_TOKEN" }))
-      .toContain('proxy_set_header Authorization "Bearer ${CLAUDE_CODE_OAUTH_TOKEN}";');
+    expect(gatewayTemplate({ sharednet: "https://www.sharednet.ai", isolation: { openai: "https://api.openai.com", anthropic: "https://api.anthropic.com" }, codex: false, claudeAuth: "CLAUDE_CODE_OAUTH_TOKEN", placeholders }))
+      .toContain('if ($http_authorization != "Bearer sk-ant-oat01-isolated-0123456789abcdef0123456789abcdef") { return 403; }');
   });
 
   it.each([
@@ -892,7 +923,10 @@ describe("an isolated run", () => {
     expect(turn.args.join(" ")).toContain(api.custom ? '-c model_providers.goal_api.base_url="http://gateway:8080/api/v1"' : '-c openai_base_url="http://gateway:8080/v1"');
     expect(turn.args.join(" ").includes('-c model_reasoning_effort="medium"')).toBe(api.custom);
     expect(turn.args.join(" ").includes("-c model_auto_compact_token_limit=150000")).toBe(api.custom);
-    expect(turn.args.find((arg) => arg.startsWith("OPENAI_API_KEY="))).toBe("OPENAI_API_KEY=sk-isolated-the-gateway-holds-the-key");
+    const held = turn.args.find((arg) => arg.startsWith("OPENAI_API_KEY="))!.slice("OPENAI_API_KEY=".length);
+    expect(held).toMatch(/^sk-isolated-[0-9a-f]{48}$/);
+    expect(gateway.env.GATEWAY_TEMPLATE).toContain(`if ($http_authorization != "Bearer ${held}") { return 403; }`);
+    expect(gateway.env.GATEWAY_TEMPLATE).toContain("proxy_ssl_verify on;");
     // The home of an image that has none is made as root, for the Agents' user.
     expect(calls.some((call) => call.args.join(" ").includes("--user root") && call.args.join(" ").endsWith("mkdir -p /home/agents && chown agent /home/agents"))).toBe(true);
 
@@ -911,7 +945,10 @@ describe("an isolated run", () => {
       `rm --force ${names.gateway}`,
       `network rm ${names.network}`,
     ]);
-    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ isolated: true, agent_user: "agent", addresses: { "codex-1": "10.9.0.3" }, web_search: "off", model_api: baseUrl ?? "https://api.openai.com/v1", reasoning_effort: api.custom ? "medium" : null, context_window: api.custom ? 262144 : null, compact_at: api.custom ? 150000 : null });
+    const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
+    expect(episode).toMatchObject({ isolated: true, agent_user: "agent", addresses: { "codex-1": "10.9.0.3" }, web_search: "off", reasoning_effort: api.custom ? "medium" : null, context_window: api.custom ? 262144 : null, compact_at: api.custom ? 150000 : null });
+    // The API is written down when the run names one; a run that names none says nothing about it.
+    expect(episode.model_api).toBe(api.custom ? baseUrl : undefined);
   });
 });
 
@@ -928,7 +965,10 @@ describe("an image of your own", () => {
     expect(await prepareRun({ ...base, image: null }, ready.docker, () => undefined)).toMatchObject({ image: DEFAULT_IMAGE, agentUser: "node" });
   });
 
-  it("runs the Agents as the image's user, and makes their homes for that user", async () => {
+  it.each([
+    ["an API key", { kind: "api-key" }],
+    ["this machine's Codex login", { kind: "login", file: "/Users/someone/.codex/auth.json" }],
+  ] as const)("runs the Agents as the image's user, signed in with %s, and makes their homes for that user", async (_name, codexAuth) => {
     const out = await temporary();
     const workspace = await temporary();
     const plan: RunPlan = {
@@ -937,7 +977,7 @@ describe("an image of your own", () => {
       agents: parseAgents(["codex"]),
       workspace,
       cli: { root: "/opt/cli", entry: "src/main.ts" },
-      codexAuth: { kind: "api-key" },
+      codexAuth,
       claudeAuth: null,
     };
     const { docker, calls } = fakeDocker((_call, command) => {
@@ -975,6 +1015,10 @@ describe("an image of your own", () => {
     expect(homes).toBeLessThan(execs.findIndex((call) => call.args.includes("join")));
     expect(calls.filter((call) => call.args[0] === "run").every((call) => call.args.includes("programbench-agent:1"))).toBe(true);
     expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ image: "programbench-agent:1", agent_user: "agent" });
+    // A login copied into the seat's home belongs to the user the turns run as, or Codex could not read it.
+    const copied = execs.filter((call) => call.args.join(" ").includes("cp /run/codex/auth.json"));
+    expect(copied).toHaveLength(codexAuth.kind === "login" ? 1 : 0);
+    expect(copied.every((call) => call.args.join(" ").includes("chown -R agent '/home/agents/codex-1'"))).toBe(true);
   });
 });
 

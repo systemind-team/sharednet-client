@@ -557,6 +557,23 @@ describe("reach: forming a group from the account CLI", () => {
     expect(words.stderr.join(" ")).toContain("--context-window is a number of tokens");
   });
 
+  it("takes the Codex agents' model API from --model-api alone, and refuses one it cannot use before anything is sent", async () => {
+    const claude = await harness(["goal", "run", "missing.md", "--agent", "claude-code", "--until", "after: 1h", "--model-api", "https://openrouter.ai/api/v1"], []);
+    expect(claude.exitCode).toBe(2);
+    expect(claude.stderr.join(" ")).toContain("--model-api names the model API of the codex agents");
+    expect(claude.requests).toEqual([]);
+    for (const bad of ["openrouter.ai/api/v1", "https://user:pass@llm.example.test/v1", "https://x;}server{listen/v1", "https://llm.example.test/v1?key=1"]) {
+      const refused = await harness(["goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--model-api", bad], []);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr.join(" ")).toMatch(/is not a (URL a gateway can forward to|model API's base URL)/);
+      expect(refused.requests).toEqual([]);
+    }
+    // A usable address passes this check: the run goes on to read its goal file.
+    const accepted = await harness(["goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--model-api", "https://openrouter.ai/api/v1"], []);
+    expect(accepted.stderr.join(" ")).toContain("file that could not be read: missing.md");
+    expect(accepted.requests).toEqual([]);
+  });
+
   it("accepts independent board gates before validating the rest of a run", async () => {
     for (const flags of [["--mention-gate"], ["--task-gate"], ["--mention-gate", "--task-gate"]]) {
       const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after 1h", "--turn-limit", "30s", ...flags], []);

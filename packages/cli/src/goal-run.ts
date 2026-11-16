@@ -2,7 +2,7 @@ import { compiledPrompt, COMPILED_HELP, type CompiledState } from "./compiled.ts
 import { controlPaths, isTaskMessage } from "./board-controls.ts";
 import { TASK_HELP, MENTION_HELP, TASK_PROFILE, TASK_HOOK, TASK_HOOK_SETTINGS } from "./task-guard.ts";
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
@@ -237,33 +237,58 @@ const FAILED_TURNS_LIMIT = 3;
 export const GATEWAY_IMAGE = "nginx:1.27-alpine";
 const GATEWAY_ALIAS = "gateway";
 const GATEWAY_PORTS = { sharednet: 8081, openai: 8080, anthropic: 8082 } as const;
-/** What an isolated Agent holds where its harness wants a key: the gateway signs the real requests. */
-const KEY_PLACEHOLDERS = {
-  OPENAI_API_KEY: "sk-isolated-the-gateway-holds-the-key",
-  ANTHROPIC_API_KEY: "sk-ant-api03-isolated-the-gateway-holds-the-key",
-  CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-isolated-the-gateway-holds-the-token",
-} as const;
+/** Where the gateway's image keeps the certificate authorities it checks a model API's certificate against. */
+const GATEWAY_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
+
+/**
+ * What an isolated Agent holds where its harness wants a key. It is made for one run and is a key
+ * nowhere else: the gateway signs a request with the real key only when the request carries this
+ * run's placeholder, so nothing outside the run's own containers can borrow the key.
+ */
+export type KeyPlaceholders = Record<"OPENAI_API_KEY" | "ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN", string>;
+
+export function keyPlaceholders(secret: string = randomBytes(24).toString("hex")): KeyPlaceholders {
+  // The placeholders are written into the gateway's configuration: hexadecimal only.
+  if (!/^[0-9a-f]{32,}$/.test(secret)) throw localError("invalid_local_state", "A run's key placeholder is made of at least 32 hexadecimal digits.");
+  return {
+    OPENAI_API_KEY: `sk-isolated-${secret}`,
+    ANTHROPIC_API_KEY: `sk-ant-api03-isolated-${secret}`,
+    CLAUDE_CODE_OAUTH_TOKEN: `sk-ant-oat01-isolated-${secret}`,
+  };
+}
 
 /** The internal network and the gateway of an isolated run, named for its Room. */
 export function isolationNames(roomId: string): { network: string; gateway: string } {
   return { network: `sharednet-goal-${roomId}-net`, gateway: `sharednet-goal-${roomId}-gateway` };
 }
 
-/** One server block of the gateway: a port, the upstream it forwards to, and what it adds. */
-function gatewayServer(port: number, upstream: string, log: string, headers: string[], readTimeout: string): string {
-  const host = new URL(upstream).host;
+/**
+ * One server block of the gateway: a port, the upstream it forwards to, and what it adds. A `guard`
+ * refuses a request before it is signed. An upstream reached over TLS must show a certificate
+ * that is valid for its name: a key is sent only to the API the run names.
+ */
+function gatewayServer(port: number, upstream: string, log: string, headers: string[], readTimeout: string, guard: string | null = null): string {
+  const url = new URL(upstream);
+  const verify = url.protocol === "https:" ? [
+    "    proxy_ssl_verify on;",
+    "    proxy_ssl_verify_depth 4;",
+    `    proxy_ssl_trusted_certificate ${GATEWAY_CA_BUNDLE};`,
+    `    proxy_ssl_name ${url.hostname};`,
+  ] : [];
   return [
     "server {",
     `  listen ${port};`,
     `  access_log /var/log/nginx/${log}.log trace;`,
     "  client_max_body_size 64m;",
     "  location / {",
+    ...(guard === null ? [] : [`    ${guard}`]),
     `    proxy_pass ${upstream};`,
-    `    proxy_set_header Host ${host};`,
+    `    proxy_set_header Host ${url.host};`,
     ...headers.map((header) => `    ${header}`),
     "    proxy_set_header Upgrade $http_upgrade;",
     "    proxy_set_header Connection $connection_upgrade;",
     "    proxy_ssl_server_name on;",
+    ...verify,
     "    proxy_http_version 1.1;",
     "    proxy_buffering off;",
     `    proxy_read_timeout ${readTimeout};`,
@@ -275,9 +300,10 @@ function gatewayServer(port: number, upstream: string, log: string, headers: str
 /**
  * The gateway's nginx configuration, as a template the nginx image fills from its environment when
  * it starts: the keys are written into it there, inside the gateway, and appear in no argument.
+ * A model request is signed only when it carries this run's placeholder; any other caller gets 403.
  * Every request is logged with the address of the container it came from.
  */
-export function gatewayTemplate(input: { sharednet: string; isolation: Isolation; codex: boolean; claudeAuth: RunPlan["claudeAuth"] }): string {
+export function gatewayTemplate(input: { sharednet: string; isolation: Isolation; codex: boolean; claudeAuth: RunPlan["claudeAuth"]; placeholders: KeyPlaceholders }): string {
   const blocks = [
     "log_format trace escape=json '{\"time\":\"$time_iso8601\",\"client\":\"$remote_addr\",\"method\":\"$request_method\",'",
     "  '\"uri\":\"$request_uri\",\"status\":$status,\"request_time\":$request_time,\"bytes_sent\":$body_bytes_sent}';",
@@ -285,13 +311,17 @@ export function gatewayTemplate(input: { sharednet: string; isolation: Isolation
     gatewayServer(GATEWAY_PORTS.sharednet, input.sharednet, "sharednet", [], "120s"),
   ];
   if (input.codex) {
-    blocks.push(gatewayServer(GATEWAY_PORTS.openai, input.isolation.openai, "openai", ['proxy_set_header Authorization "Bearer ${OPENAI_API_KEY}";'], "900s"));
+    const guard = `if ($http_authorization != "Bearer ${input.placeholders.OPENAI_API_KEY}") { return 403; }`;
+    blocks.push(gatewayServer(GATEWAY_PORTS.openai, input.isolation.openai, "openai", ['proxy_set_header Authorization "Bearer ${OPENAI_API_KEY}";'], "900s", guard));
   }
   if (input.claudeAuth !== null) {
     const header = input.claudeAuth === "ANTHROPIC_API_KEY"
       ? 'proxy_set_header x-api-key "${ANTHROPIC_API_KEY}";'
       : 'proxy_set_header Authorization "Bearer ${CLAUDE_CODE_OAUTH_TOKEN}";';
-    blocks.push(gatewayServer(GATEWAY_PORTS.anthropic, input.isolation.anthropic, "anthropic", [header], "900s"));
+    const guard = input.claudeAuth === "ANTHROPIC_API_KEY"
+      ? `if ($http_x_api_key != "${input.placeholders.ANTHROPIC_API_KEY}") { return 403; }`
+      : `if ($http_authorization != "Bearer ${input.placeholders.CLAUDE_CODE_OAUTH_TOKEN}") { return 403; }`;
+    blocks.push(gatewayServer(GATEWAY_PORTS.anthropic, input.isolation.anthropic, "anthropic", [header], "900s", guard));
   }
   return `${blocks.join("\n")}\n`;
 }
@@ -335,8 +365,9 @@ export interface Isolation {
 }
 
 /**
- * Codex's model API: OpenAI's own, or what OPENAI_BASE_URL names with its path, such as
+ * Codex's model API: OpenAI's own, or what `--model-api` names with its path, such as
  * https://openrouter.ai/api/v1. Any other host is a provider of Codex's own, reached over HTTP.
+ * Nothing in the environment chooses it: a run that does not name an API uses OpenAI's.
  */
 export interface CodexApi {
   origin: string;
@@ -382,7 +413,7 @@ export function cliPackage(entry: string): { root: string; entry: string } {
  * driver to sign in. A run that would fail half-way is refused here instead.
  */
 export async function prepareRun(
-  input: { agents: AgentSpec[]; image: string | null; workspace: string; env: Record<string, string | undefined>; home: string; entry: string; agentUser?: string | null; isolate?: boolean },
+  input: { agents: AgentSpec[]; image: string | null; workspace: string; env: Record<string, string | undefined>; home: string; entry: string; agentUser?: string | null; isolate?: boolean; modelApi?: string | null },
   docker: DockerRunner,
   log: (line: string) => void,
   pause: (ms: number) => Promise<void> = (ms) => new Promise((resolvePause) => setTimeout(resolvePause, ms)),
@@ -406,7 +437,7 @@ export async function prepareRun(
     if (built.code !== 0) throw localError("image_build_failed", `The Agents' image could not be built: ${built.stderr.trim().split("\n").slice(-3).join(" ")}`);
   }
   let codexAuth: RunPlan["codexAuth"] = null;
-  const codex = codexApi(input.env.OPENAI_BASE_URL);
+  const codex = codexApi(input.modelApi ?? undefined);
   if (input.agents.some((agent) => agent.driver === "codex")) {
     const login = join(input.home, ".codex", "auth.json");
     if (input.env.OPENAI_API_KEY) codexAuth = { kind: "api-key" };
@@ -436,12 +467,13 @@ export async function prepareRun(
       const pulled = await docker(["pull", GATEWAY_IMAGE]);
       if (pulled.code !== 0) throw localError("image_not_found", `The gateway's image ${GATEWAY_IMAGE} could not be pulled: ${pulled.stderr.trim().split("\n").slice(-1).join(" ")}`);
     }
-    isolation = { openai: codex.origin, anthropic: modelOrigin(input.env.ANTHROPIC_BASE_URL, "https://api.anthropic.com") };
+    isolation = { openai: codex.origin, anthropic: ANTHROPIC_ORIGIN };
   }
   return { image, agentUser, isolation, agents: input.agents, workspace: input.workspace, cli: cliPackage(input.entry), codexAuth, claudeAuth, ...(codex.custom ? { codexApi: codex } : {}) };
 }
 
 const OPENAI_ORIGIN = "https://api.openai.com";
+const ANTHROPIC_ORIGIN = "https://api.anthropic.com";
 
 function modelUrl(value: string): URL {
   let url: URL;
@@ -451,12 +483,11 @@ function modelUrl(value: string): URL {
     throw localError("invalid_arguments", `${value} is not a URL a gateway can forward to.`);
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") throw localError("invalid_arguments", `${value} is not a URL a gateway can forward to.`);
+  // The address is written into the gateway's configuration and into Codex's: a plain host and path, nothing else.
+  if (url.username || url.password || url.search || url.hash || !/^[a-z0-9.-]+$/.test(url.hostname) || !/^[A-Za-z0-9/._~-]*$/.test(url.pathname)) {
+    throw localError("invalid_arguments", `${value} is not a model API's base URL: give a plain host and path, such as https://openrouter.ai/api/v1.`);
+  }
   return url;
-}
-
-/** A model API's origin, from this machine's own setting for it when there is one. */
-function modelOrigin(value: string | undefined, fallback: string): string {
-  return value?.trim() ? modelUrl(value).origin : fallback;
 }
 
 // ---- turns ----
@@ -792,6 +823,7 @@ export async function runGoal(
   const isolation = plan.isolation ?? null;
   const isolated = isolation !== null;
   const names = isolationNames(input.roomId);
+  const placeholders = keyPlaceholders();
   // An isolated Agent reaches SharedNet only through the gateway, which its container forwards to
   // its own loopback: the one plain-HTTP address the CLI accepts.
   const seatBase = isolated ? `http://127.0.0.1:${GATEWAY_PORTS.sharednet}` : base;
@@ -854,6 +886,7 @@ export async function runGoal(
       isolation: isolation!,
       codex: plan.codexAuth !== null,
       claudeAuth: plan.claudeAuth,
+      placeholders,
     });
     const keys = [...(plan.codexAuth !== null ? ["OPENAI_API_KEY"] : []), ...(plan.claudeAuth !== null ? [plan.claudeAuth] : [])];
     const started = await docker(
@@ -925,12 +958,12 @@ export async function runGoal(
       // Isolated, a seat holds a placeholder where its harness wants a key, and its requests go to the gateway, which signs them.
       ...(seat?.driver === "claude-code" && plan.claudeAuth
         ? isolated
-          ? ["-e", `${plan.claudeAuth}=${KEY_PLACEHOLDERS[plan.claudeAuth]}`, "-e", `ANTHROPIC_BASE_URL=http://${GATEWAY_ALIAS}:${GATEWAY_PORTS.anthropic}`]
+          ? ["-e", `${plan.claudeAuth}=${placeholders[plan.claudeAuth]}`, "-e", `ANTHROPIC_BASE_URL=http://${GATEWAY_ALIAS}:${GATEWAY_PORTS.anthropic}`]
           : ["-e", plan.claudeAuth]
         : []),
       ...(seat?.driver === "codex" && plan.codexAuth?.kind === "api-key"
         ? isolated
-          ? ["-e", `OPENAI_API_KEY=${KEY_PLACEHOLDERS.OPENAI_API_KEY}`]
+          ? ["-e", `OPENAI_API_KEY=${placeholders.OPENAI_API_KEY}`]
           : ["-e", "OPENAI_API_KEY"]
         : []),
       ...Object.keys(options.env ?? {}).flatMap((name) => ["-e", name]),
@@ -985,7 +1018,7 @@ export async function runGoal(
       const prepared = seat.driver === "codex" && plan.codexAuth?.kind === "login"
         ? await docker([
             "exec", "--user", "root", container, "sh", "-c",
-            `mkdir -p '${home}/.codex' && cp ${CONTAINER_CODEX_AUTH} '${home}/.codex/auth.json' && chown -R ${AGENT_USER} '${home}' && chmod 600 '${home}/.codex/auth.json'`,
+            `mkdir -p '${home}/.codex' && cp ${CONTAINER_CODEX_AUTH} '${home}/.codex/auth.json' && chown -R ${user} '${home}' && chmod 600 '${home}/.codex/auth.json'`,
           ])
         : await exec(seat, [
             "sh", "-c",
@@ -1206,8 +1239,9 @@ export async function runGoal(
           ...(isolated ? { addresses } : {}),
           web_search: input.webSearch ?? "live",
           // Where the Codex seats' model was: a run's numbers are read with the model and its provider.
+          // Recorded when the run names an API: a Codex login's own endpoint is Codex's business, not the run's.
+          ...(plan.codexApi ? { model_api: `${api.origin}${api.path}` } : {}),
           ...(plan.codexAuth !== null ? {
-            model_api: `${api.origin}${api.path}`,
             reasoning_effort: input.codexModel?.reasoningEffort ?? null,
             context_window: input.codexModel?.contextWindow ?? null,
             compact_at: input.codexModel?.compactAt ?? null,
@@ -1225,6 +1259,13 @@ export async function runGoal(
               web_search: input.webSearch ?? "live",
               turn_limit_s: turnLimitSeconds,
               turn_policy: turnPolicy,
+              // Explicit inputs a named mode leaves open, written down when the run sets them.
+              ...(plan.codexApi ? { model_api: `${api.origin}${api.path}` } : {}),
+              ...(input.codexModel?.reasoningEffort === undefined ? {} : { reasoning_effort: input.codexModel.reasoningEffort }),
+              ...(input.codexModel?.contextWindow === undefined ? {} : { context_window: input.codexModel.contextWindow }),
+              ...(input.codexModel?.compactAt === undefined ? {} : { compact_at: input.codexModel.compactAt }),
+              ...(isolated ? { isolated: true } : {}),
+              ...(user === AGENT_USER ? {} : { agent_user: user }),
               until: input.until,
             },
             client_commit: codeProvenance.clientCommit,

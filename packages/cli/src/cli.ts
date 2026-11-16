@@ -10,7 +10,7 @@ import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner, type GuestDependencies } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
-import { REASONING_EFFORTS, cliPackage, discoverCodeProvenance, dockerRunner, isolationNames, parseAgents, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner, type ReasoningEffort } from "./goal-run.ts";
+import { REASONING_EFFORTS, cliPackage, codexApi, discoverCodeProvenance, dockerRunner, isolationNames, parseAgents, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner, type ReasoningEffort } from "./goal-run.ts";
 import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, type ServeKickoff } from "./goal-serve-demo.ts";
 import { assertGoalRunHarnessAgentCount, getHarnessModeSpec, resolveGoalRunHarnessMode, resolveRuntimeHarnessMode, type RuntimeHarnessResolution } from "./harness-modes.ts";
 import { parseDuration } from "./triggers.ts";
@@ -132,6 +132,7 @@ const optionValueNames = new Set([
   "web-search",
   "turn-limit",
   "agent-user",
+  "model-api",
   "turn-policy",
   "message-routing",
   "harness-mode",
@@ -604,7 +605,7 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
   const turnPolicy = option(parsed, "turn-policy") ?? "legacy";
@@ -633,7 +634,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
@@ -682,6 +683,12 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (tuned.length > 0 && !agents.some((agent) => agent.driver === "codex")) {
     throw localError("invalid_arguments", `${tuned.map(([name]) => name).join(", ")} tell Codex about its model; this run has no codex agent.`);
   }
+  // The Codex agents' model API is named here or it is OpenAI's: nothing in the environment chooses it.
+  const modelApi = option(parsed, "model-api");
+  if (modelApi !== undefined) {
+    if (!agents.some((agent) => agent.driver === "codex")) throw localError("invalid_arguments", "--model-api names the model API of the codex agents; this run has no codex agent.");
+    codexApi(modelApi);
+  }
   const content = await readGoalFile(dependencies.cwd, parsed.positionals[0]!);
   const until = parseUntilList(parsed.repeated.get("until") ?? [], dependencies.now().getTime(), { budget: true });
   const workspace = resolvePathFrom(dependencies.cwd, option(parsed, "workspace") ?? ".");
@@ -701,6 +708,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
       image: option(parsed, "image") ?? null,
       agentUser: option(parsed, "agent-user") ?? null,
       isolate,
+      modelApi: modelApi ?? null,
       workspace,
       env: dependencies.env,
       home: dependencies.env.HOME ?? homedir(),

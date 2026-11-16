@@ -19,8 +19,12 @@ sharednet goal run TASK.md \
 controls. It cannot be combined with `--mention-gate`, `--task-gate`, or
 `--message-routing`. All named modes use a board Room. Other run settings,
 including models, image, web search, end conditions, and turn limit, remain
-explicit inputs and are recorded in `episode.json`. Agent topology also remains
-explicit except for `research/single@1`, which requires exactly one seat.
+explicit inputs and are recorded in `episode.json`. So do the model API
+(`--model-api`), what a run tells Codex about its model (`--reasoning-effort`,
+`--context-window`, `--compact-at`), `--isolate` and `--agent-user`: a named mode
+takes them, and `harness.resolved_profile` records each one the run sets. Agent
+topology also remains explicit except for `research/single@1`, which requires
+exactly one seat.
 Every agent in a named mode must pin its model as `driver:model`; an implicit
 provider default is refused because that default can change between runs.
 

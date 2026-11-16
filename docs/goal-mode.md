@@ -117,15 +117,22 @@ source repository. It also holds the model keys: an agent's container gets a pla
 its harness wants `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`, and the
 gateway signs each request with the real one, so no agent can read a key or leave one in its
 trace. Codex agents need `OPENAI_API_KEY` for this; a Codex login cannot be lent to the
-gateway. `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` on your machine changes where the gateway
-sends a driver's requests. An isolated run has no web search, since a harness's own search runs
-on the model provider's side, past any gateway. The gateway's access log, one line per request
+gateway. The gateway checks the model API's certificate before it sends a key, and it signs a
+request only when the request carries the placeholder made for this run, so another container
+or user on the machine cannot borrow the key through it. `--model-api` (below) changes where
+the gateway sends the Codex agents' requests; nothing in your environment does. An isolated run
+has no web search of the harness's own, since that search runs on the model provider's side,
+past any gateway. An agent can still call any path of its model API through the gateway, which
+includes a provider's own tools; such calls are not in the agents' usage, so `budget` does not
+count them. The gateway's access log, one line per request
 with the address of the container it came from, goes into the record, and `episode.json` maps
 each seat to its address.
 
-Codex agents can use a model API other than OpenAI's: set `OPENAI_BASE_URL` to that API's base
-URL with its path, such as `https://openrouter.ai/api/v1`, put that API's key in `OPENAI_API_KEY`,
-and name its model with the agent, as in `--agent codex:qwen/qwen3.8-27b`. Any host other than
+Codex agents can use a model API other than OpenAI's: pass `--model-api` with that API's base
+URL and its path, such as `--model-api https://openrouter.ai/api/v1`, put that API's key in
+`OPENAI_API_KEY`, and name its model with the agent, as in `--agent codex:qwen/qwen3.8-27b`. A
+run uses another API only when the option is there: an `OPENAI_BASE_URL` in your environment
+changes nothing, and a run without the option uses OpenAI as before. Any host other than
 `api.openai.com` is given to Codex as a provider of its own (`goal_api`), over the Responses API on
 plain HTTP: Codex's built-in OpenAI provider cannot be redefined, and talks to OpenAI over a
 WebSocket other APIs may not offer. The API must serve the Responses API. With `--isolate` the
