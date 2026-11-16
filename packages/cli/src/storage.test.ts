@@ -6,17 +6,22 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import { computeLocalInstanceKey } from "./instance-computation.ts";
+import { selectSession } from "./session.ts";
 import {
   backupStoredApiCredential,
   createRoomCredentialIfAbsent,
   getOrCreateInstallationSecret,
   getStoragePaths,
   listSessions,
+  selectProjectSeat,
   readRoomCredential,
   readStoredApiCredential,
   writeSession,
+  writeProjectRoomState,
   writeStoredApiCredential,
   type StoredApiCredential,
+  type StoredSession,
 } from "./storage.ts";
 
 const cleanup: string[] = [];
@@ -31,6 +36,90 @@ async function fixtureRoot() {
   cleanup.push(root);
   return root;
 }
+
+describe("Codex subagent seat selection", () => {
+  const baseUrl = "https://www.sharednet.ai";
+  const parentId = "i_Parent0001";
+  const childId = "i_Child00001";
+  const siblingId = "i_Sibling001";
+  const roomId = "rom_Room000001";
+  const childEnv = { CODEX_SESSION_ID: "root-session", CODEX_THREAD_ID: "child-thread" };
+
+  async function seats() {
+    const root = await fixtureRoot();
+    const paths = getStoragePaths({ HOME: root, XDG_CONFIG_HOME: join(root, "config"), XDG_STATE_HOME: join(root, "state") });
+    const secret = await getOrCreateInstallationSecret(paths);
+    const key = (thread: string) => computeLocalInstanceKey(secret, "codex", thread);
+    const save = async (id: string, anchor: string | null, origin = baseUrl) => {
+      const session: StoredSession = {
+        schema_version: 1, base_url: origin, principal_id: "p_Principal1", agent_id: null,
+        instance_id: id, local_instance_key: anchor, instance_token: `sni_${"T".repeat(43)}`,
+        created_at: "2026-11-11T00:00:00.000Z", lease_expires_at: "2026-11-11T00:01:30.000Z", expires_at: null,
+      };
+      await writeSession(paths, session);
+      await writeProjectRoomState(root, {
+        schema_version: 1, base_url: origin, room_id: roomId, member_id: id, last_sequence: 7,
+      }, { anchorKey: anchor });
+    };
+    return { root, paths, key, save };
+  }
+
+  it("refuses the sole parent account session before a child registers", async () => {
+    const { paths, key, save } = await seats();
+    await save(parentId, key("root-session"));
+    await expect(selectSession(paths, baseUrl, undefined, childEnv)).rejects.toMatchObject({ code: "session_selection_required" });
+  });
+
+  it("refuses the sole parent Room seat before a child joins", async () => {
+    const { root, key, save } = await seats();
+    await save(parentId, key("root-session"));
+    await expect(selectProjectSeat(root, { anchorKey: key("child-thread") })).rejects.toMatchObject({ code: "seat_selection_required" });
+  });
+
+  it("repeatedly selects each child's own account session and Room seat in a shared directory", async () => {
+    const { root, paths, key, save } = await seats();
+    await save(parentId, key("root-session"));
+    await save(childId, key("child-thread"));
+    await save(siblingId, key("sibling-thread"));
+    for (const [thread, id] of [["child-thread", childId], ["sibling-thread", siblingId], ["child-thread", childId]]) {
+      const session = await selectSession(paths, baseUrl, undefined, { ...childEnv, CODEX_THREAD_ID: thread });
+      expect(session.instance_id).toBe(id);
+      expect(await selectProjectSeat(root, { anchorKey: key(thread!) })).toMatchObject({ member_id: id, last_sequence: 7 });
+    }
+  });
+
+  it("honours intentional selectors while keeping the account origin boundary", async () => {
+    const { root, paths, key, save } = await seats();
+    await save(parentId, key("root-session"));
+    expect((await selectSession(paths, baseUrl, parentId, childEnv)).instance_id).toBe(parentId);
+    expect((await selectSession(paths, baseUrl, undefined, { ...childEnv, SHAREDNET_SESSION: parentId })).instance_id).toBe(parentId);
+    expect(await selectProjectSeat(root, { explicit: parentId, anchorKey: key("child-thread") })).toMatchObject({ member_id: parentId });
+    await expect(selectSession(paths, "https://other.example", parentId, childEnv)).rejects.toMatchObject({ code: "session_not_found" });
+    await expect(selectProjectSeat(root, { explicit: childId, anchorKey: key("child-thread") })).rejects.toMatchObject({ code: "seat_not_found" });
+  });
+
+  it("keeps the unbound legacy or --new singleton usable by a detected caller", async () => {
+    const { root, paths, key, save } = await seats();
+    await save(parentId, null);
+    expect((await selectSession(paths, baseUrl, undefined, childEnv)).instance_id).toBe(parentId);
+    expect(await selectProjectSeat(root, { anchorKey: key("child-thread") })).toMatchObject({ member_id: parentId });
+  });
+
+  it("keeps the singleton fallback when the caller has no detected anchor", async () => {
+    const { root, paths, key, save } = await seats();
+    await save(parentId, key("root-session"));
+    expect((await selectSession(paths, baseUrl, undefined, {})).instance_id).toBe(parentId);
+    expect(await selectProjectSeat(root, { anchorKey: null })).toMatchObject({ member_id: parentId });
+  });
+
+  it("refuses ambiguous matches instead of picking between two saved identities", async () => {
+    const { root, paths, key, save } = await seats();
+    await save(childId, key("child-thread"));
+    await save(siblingId, key("child-thread"));
+    await expect(selectSession(paths, baseUrl, undefined, childEnv)).rejects.toMatchObject({ code: "session_selection_required" });
+    await expect(selectProjectSeat(root, { anchorKey: key("child-thread") })).rejects.toMatchObject({ code: "seat_selection_required" });
+  });
+});
 
 describe("secure local state", () => {
   it("creates session directories as 0700 and files as 0600", async () => {

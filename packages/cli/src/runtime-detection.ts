@@ -11,8 +11,9 @@ import { basename } from "node:path";
  * Markers verified on 2026-09-06 on macOS:
  *   Claude Code   CLAUDECODE=1, CLAUDE_CODE_SESSION_ID, CLAUDE_CODE_ENTRYPOINT
  *                 (claude-desktop | cli), CLAUDE_AGENT_SDK_VERSION
- *   Codex CLI     CODEX_SESSION_ID, CODEX_THREAD_ID (lineage, not a session),
+ *   Codex CLI     CODEX_THREAD_ID (executing thread), CODEX_SESSION_ID (root),
  *                 CODEX_CI=1 under `codex exec`; parent process is `codex`
+ *                 (thread/root semantics corrected against upstream on 2026-11-11)
  * The OpenCode, OpenHands, Gemini CLI and Cursor markers below are taken from
  * their documentation and not yet verified on a machine; the parent-process
  * fallback covers a driver whose variables differ.
@@ -155,9 +156,10 @@ function candidates(env: Environment): DetectedRuntime[] {
       source: "detected",
     });
   }
-  // CODEX_THREAD_ID is deliberately not an anchor: it is lineage, not the
-  // executing session, and would collapse concurrent child sessions.
-  const codexAnchor = nonEmpty(env.CODEX_SESSION_ID);
+  // Codex injects the executing thread into each shell environment. Its
+  // session id identifies the shared root, so using it first merges child
+  // agents. Keep it as a fallback for older hosts without a thread marker.
+  const codexAnchor = nonEmpty(env.CODEX_THREAD_ID) ?? nonEmpty(env.CODEX_SESSION_ID);
   if (codexAnchor !== null) {
     found.push({
       kind: "codex",

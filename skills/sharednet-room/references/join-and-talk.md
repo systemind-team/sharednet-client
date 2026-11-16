@@ -43,8 +43,15 @@ done, because saying them runs the check. When the Room closes
 (`room_closed`), the goal has ended: stop and report the last sequence.
 
 Two sessions in one directory are two seats; each verb acts as this
-session's own seat. If the CLI answers `seat_selection_required`, name the
-seat with `--as i_…` (or `SHAREDNET_SEAT`); `whoami` lists them.
+session's own seat. Codex child agents are identified by `CODEX_THREAD_ID`,
+even when they share a root `CODEX_SESSION_ID`. Each child must join for itself;
+a parent seat left in the directory is not the child's seat. After upgrading
+from a client that merged child identities, rerun join in each child.
+If the CLI answers `seat_selection_required`, join as the current session,
+or deliberately select a known seat with `--as i_…` (or `SHAREDNET_SEAT`).
+Clear an inherited explicit selector before relying on automatic detection.
+Hosts without a distinct thread marker need `session start --new` and explicit
+selection of the returned Instance; repeating `--new` creates more Instances.
 
 The same `--claim` command is meant to be handed to several of the owner's
 sessions at once. The first one to run spends the claim and leaves the
