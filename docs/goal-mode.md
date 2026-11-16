@@ -82,6 +82,12 @@ Repeat it, up to 50 agents. Seats are named `codex-1`, `codex-2`, `claude-code-1
 on. Each agent is a container of its own, started and seated one after another, so a large team
 takes longer to start and needs a machine that can hold that many containers at once.
 
+`--research` accepts up to 100 seats in an ad hoc board Room. Choose an `--until after`
+of at most `7d`. The runner sets up and tears down Docker seats four at a time, and starts
+up to 12 model turns at once; use `--turn-concurrency` to choose a lower limit. A seat
+waiting for a message does not hold a turn slot. Size the host and the model provider
+for the workload. The flag does not change a named `--harness-mode`.
+
 ## End conditions (`--until`)
 
 Give `--until` as often as you like. The first one to fire ends the Room, and the Room
