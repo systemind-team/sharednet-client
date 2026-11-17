@@ -1212,6 +1212,30 @@ describe("sharednet say and wait", () => {
       expect(await cursorOf(space)).toBe(2);
     });
 
+    it("has a reply answer the last handed line that addressed the seat, and leave one nobody asked unthreaded", async () => {
+      const space = await joinedSpace();
+      const { exec } = recorder({ exitCode: 0, stdout: "Done.\n" });
+      const result = await run(
+        ["watch", "--on", "message", "--run", "agent-turn", "--reply", "--max-runs", "2", "--json"],
+        space,
+        [
+          // Whom a line addresses is the service's word (mentions), as it sends it.
+          page([{ ...message(2, "@claude-code take W3"), mentions: [MEMBER_ID] } as ReturnType<typeof message>, message(3, "a status line")]),
+          { status: 201, body: { message: { ...own(4, "Done."), id: "msg_reply00004" } } },
+          page([message(5, "the build is green")]),
+          { status: 201, body: { message: { ...own(6, "Done."), id: "msg_reply00006" } } },
+        ],
+        {},
+        { exec },
+      );
+      expect(result.exitCode).toBe(0);
+      const posts = result.requests.filter((request) => request.init.method === "POST" && request.url.endsWith("/messages"));
+      expect(posts.map((post) => JSON.parse(String(post.init.body)))).toEqual([
+        { content: "Done.", reply_to_message_id: "msg_0000000002" },
+        { content: "Done." },
+      ]);
+    });
+
     it("wakes every interval even when the Room is quiet, and after idle once it has gone quiet", async () => {
       const space = await joinedSpace();
       let clock = Date.parse("2026-09-06T12:00:00Z");
@@ -1288,6 +1312,24 @@ describe("sharednet say and wait", () => {
       expect(wake.messages.map((item: any) => item.sequence)).toEqual([2, 3]);
       expect(wake.events.map((event: any) => event.kind)).toEqual(["message", "message"]);
       expect(await cursorOf(space)).toBe(3);
+    });
+
+    it("has the seat answer what it was handed: say replies to the last line that addressed it, unless told none", async () => {
+      const space = await joinedSpace();
+      const posted = (sequence: number) => ({ status: 201, body: { message: own(sequence, "x") } });
+      const body = (result: Awaited<ReturnType<typeof run>>) => JSON.parse(String(result.requests.at(-1)!.init.body));
+      // Handed lines that address nobody, the seat posts on its own.
+      expect((await run(["wait", "--on", "message", "--json"], space, [page([message(2, "the build is green")])])).exitCode).toBe(0);
+      expect(body(await run(["say", "Nice."], space, [posted(3)]))).toEqual({ content: "Nice." });
+      // Addressed, it answers the last line that asked it, however many lines it posts.
+      // The listen an open chat runs: the service hands it what addresses it, then the whole span.
+      const asks = [{ ...message(4, "@claude-code first?"), mentions: [MEMBER_ID] }, { ...message(6, "@claude-code and W3?"), mentions: [MEMBER_ID] }] as ReturnType<typeof message>[];
+      expect((await run(["wait", "--on", "mention", "--json"], space, [roomState("open"), page(asks), page([asks[0]!, message(5, "a status line"), asks[1]!])])).exitCode).toBe(0);
+      expect(body(await run(["say", "On it."], space, [posted(7)]))).toEqual({ content: "On it.", reply_to_message_id: "msg_0000000006" });
+      expect(body(await run(["say", "W3 is up."], space, [posted(8)]))).toEqual({ content: "W3 is up.", reply_to_message_id: "msg_0000000006" });
+      // Told otherwise, it threads where it is told, or nowhere.
+      expect(body(await run(["say", "About #4.", "--reply-to", "msg_0000000004"], space, [posted(9)]))).toEqual({ content: "About #4.", reply_to_message_id: "msg_0000000004" });
+      expect(body(await run(["say", "Unrelated.", "--reply-to", "none"], space, [posted(10)]))).toEqual({ content: "Unrelated." });
     });
 
     it("with --ack manual, hands back the same wake until it is acknowledged, then moves on", async () => {
@@ -2056,7 +2098,8 @@ describe("sharednet say and wait", () => {
       const reply = result.requests[2]!;
       expect(reply.url).toBe(`https://www.sharednet.ai/api/v1/rooms/${ROOM_ID}/messages`);
       expect(header(reply, "authorization")).toBe(`Bearer ${MEMBER_TOKEN}`);
-      expect(JSON.parse(String(reply.init.body))).toEqual({ content: "@host 2+2 is 4." });
+      // It answers the line that addressed the seat, so whoever asked can tell which question.
+      expect(JSON.parse(String(reply.init.body))).toEqual({ content: "@host 2+2 is 4.", reply_to_message_id: "msg_0000000003" });
       // Handled after the turn, not when it was handed over: a crash mid-turn hands it over again.
       expect(cursorDuringTurn).toBe(1);
       expect(result.acks).toEqual([3]);
@@ -2438,7 +2481,7 @@ describe("sharednet say and wait", () => {
 
       expect(result.exitCode).toBe(0);
       expect([turns[0]!.command, ...turns[0]!.args]).toEqual(["claude", "-p", "--resume", "claude-session-stays-local", "--output-format", "json"]);
-      expect(JSON.parse(String(result.requests[2]!.init.body))).toEqual({ content: "@host here." });
+      expect(JSON.parse(String(result.requests[2]!.init.body))).toEqual({ content: "@host here.", reply_to_message_id: "msg_0000000002" });
       expect(result.acks).toEqual([2]);
     });
 
@@ -2616,7 +2659,7 @@ describe("sharednet say and wait", () => {
       expect(result.stderr).toContain("trying #2..#2 again in 10s");
       // The first look acknowledged nothing; the line was looked for again from the same place.
       expect(new URL(result.requests[2]!.url).searchParams.get("after")).toBe("1");
-      expect(JSON.parse(String(result.requests[4]!.init.body))).toEqual({ content: "@host 2+2 is 4." });
+      expect(JSON.parse(String(result.requests[4]!.init.body))).toEqual({ content: "@host 2+2 is 4.", reply_to_message_id: "msg_0000000002" });
       expect(result.acks).toEqual([2]);
       expect(result.heartbeats).toEqual([{ through: 2 }, { through: 2 }]);
     });
@@ -2767,7 +2810,7 @@ describe("sharednet say and wait", () => {
       expect(result.exitCode).toBe(0);
       expect(turns[0]!.command).toBe("/opt/bots/triage");
       expect(JSON.parse(turns[0]!.input)).toMatchObject({ room_id: ROOM_ID, member_id: MEMBER_ID, from: 1, through: 2 });
-      expect(JSON.parse(String(result.requests[2]!.init.body))).toEqual({ content: "@host triaged: flaky test" });
+      expect(JSON.parse(String(result.requests[2]!.init.body))).toEqual({ content: "@host triaged: flaky test", reply_to_message_id: "msg_0000000002" });
       expect(result.acks).toEqual([2]);
     });
 
