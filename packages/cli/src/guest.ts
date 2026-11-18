@@ -1071,8 +1071,8 @@ async function say(args: string[], dependencies: GuestDependencies): Promise<unk
     throw localError("invalid_reply_to", "--reply-to must be a message id such as msg_AbCdEfGhIj, or none.");
   }
   const { client, state, credential } = await currentSeat(dependencies, stringOption(parsed, "as"));
-  const handed = dependencies.env.SHAREDNET_REPLY_TO?.trim();
-  const replyTo = option === "none" ? undefined : option ?? (handed && /^msg_[A-Za-z0-9]+$/.test(handed) ? handed : state.answering ?? undefined);
+  const turn = turnReply(dependencies.env, state.room_id);
+  const replyTo = option === "none" ? undefined : option ?? (turn === undefined ? state.answering ?? undefined : turn ?? undefined);
   await beforeSay(client, state, credential, dependencies);
   return client.request(
     "POST",
@@ -1081,6 +1081,18 @@ async function say(args: string[], dependencies: GuestDependencies): Promise<unk
     { content: parsed.positionals[0]!, ...(replyTo === undefined ? {} : { reply_to_message_id: replyTo }) },
     { "idempotency-key": randomUUID() },
   );
+}
+
+/** What a turn serve or `--run` starts answers: the line that addressed the seat, or none, in that Room. */
+function replyEnv(roomId: string, replyTo: string | undefined): Record<string, string> {
+  return { SHAREDNET_REPLY_TO: replyTo ?? "none", SHAREDNET_REPLY_ROOM: roomId };
+}
+
+/** In such a turn, `say` in its Room answers that line (null: none); elsewhere, undefined. */
+function turnReply(env: GuestDependencies["env"], roomId: string): string | null | undefined {
+  const to = env.SHAREDNET_REPLY_TO?.trim();
+  if (!to || env.SHAREDNET_REPLY_ROOM !== roomId) return undefined;
+  return /^msg_[A-Za-z0-9]+$/.test(to) ? to : null;
 }
 
 /** Read a complete board suffix; pagination must advance or the caller fails closed. */
@@ -1973,7 +1985,7 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
         SHAREDNET_LAST_SEQUENCE: String(cursor),
         SHAREDNET_WAKE_ID: pending.wakeId,
         SHAREDNET_FIRED: fired.join(" | "),
-        ...(asked ? { SHAREDNET_REPLY_TO: asked.id } : {}),
+        ...replyEnv(state.room_id, asked?.id),
       });
       if (result.stderr) log(result.stderr.endsWith("\n") ? result.stderr : `${result.stderr}\n`);
       exitCode = result.exitCode;
@@ -3382,7 +3394,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         | { state: "delivered"; delivery: Delivery; pluginLabel: string; started: number; timeoutMs: number };
       const take = async (currentWake: SeatWake): Promise<WakeRun> => {
         if (stopping.signal.aborted) return { state: "cancelled" };
-        const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through };
+        const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through, replyTo: askedIn(said)?.id };
         const checkpoint = checkpointPath(paths.stateDir, seat.room_id, seat.member_id);
         let compiled = "";
         if (seat.room_type === "compiled") {
@@ -3405,7 +3417,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
             { through },
           ),
           () => plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, {
-            env: { ...dependencies.env, ...(askedIn(said) ? { SHAREDNET_REPLY_TO: askedIn(said)!.id } : {}) }, run: drive, chatOpen: open, timeoutMs,
+            env: { ...dependencies.env, ...replyEnv(seat.room_id, askedIn(said)?.id) }, run: drive, chatOpen: open, timeoutMs,
           }),
         );
         return { state: "delivered", delivery, pluginLabel: plugin.label, started, timeoutMs };

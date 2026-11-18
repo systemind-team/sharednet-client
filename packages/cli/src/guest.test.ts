@@ -1235,7 +1235,7 @@ describe("sharednet say and wait", () => {
         { content: "Done." },
       ]);
       // And the command, which may say things itself, is told which line it answers.
-      expect(calls.map((call) => call.env.SHAREDNET_REPLY_TO)).toEqual(["msg_0000000002", undefined]);
+      expect(calls.map((call) => [call.env.SHAREDNET_REPLY_TO, call.env.SHAREDNET_REPLY_ROOM])).toEqual([["msg_0000000002", ROOM_ID], ["none", ROOM_ID]]);
     });
 
     it("wakes every interval even when the Room is quiet, and after idle once it has gone quiet", async () => {
@@ -1339,8 +1339,11 @@ describe("sharednet say and wait", () => {
       const ask = { ...message(13, "@claude-code W4?"), mentions: [MEMBER_ID] } as ReturnType<typeof message>;
       expect((await run(["wait", "--on", "mention", "--ack", "manual", "--json"], space, [roomState("open"), page([ask]), page([ask])])).exitCode).toBe(0);
       expect(body(await run(["say", "On W4."], space, [posted(14)]))).toEqual({ content: "On W4.", reply_to_message_id: "msg_0000000013" });
-      // In a turn serve or --run started, the line that turn was handed wins.
-      expect(body(await run(["say", "Done."], space, [posted(15)], { SHAREDNET_REPLY_TO: "msg_0000000011" }))).toEqual({ content: "Done.", reply_to_message_id: "msg_0000000011" });
+      // In a turn serve or --run started, what that turn was handed wins, in its own Room: a line, or none.
+      const turn = (to: string, room = ROOM_ID) => ({ SHAREDNET_REPLY_TO: to, SHAREDNET_REPLY_ROOM: room });
+      expect(body(await run(["say", "Done."], space, [posted(15)], turn("msg_0000000011")))).toEqual({ content: "Done.", reply_to_message_id: "msg_0000000011" });
+      expect(body(await run(["say", "Noted."], space, [posted(16)], turn("none")))).toEqual({ content: "Noted." });
+      expect(body(await run(["say", "Here."], space, [posted(17)], turn("msg_0000000011", "rom_ZyXwVuTsRq")))).toEqual({ content: "Here.", reply_to_message_id: "msg_0000000013" });
     });
 
     it("with --ack manual, hands back the same wake until it is acknowledged, then moves on", async () => {
@@ -2099,7 +2102,7 @@ describe("sharednet say and wait", () => {
         "codex", "exec", "resume", "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"', "019a-codex-thread", "-",
       ]);
       expect(turn.cwd).toBe(space.project);
-      expect(turn.env).toMatchObject({ SHAREDNET_SEAT: MEMBER_ID, CODEX_HOME: "/codex-home", SHAREDNET_REPLY_TO: "msg_0000000003" });
+      expect(turn.env).toMatchObject({ SHAREDNET_SEAT: MEMBER_ID, CODEX_HOME: "/codex-home", SHAREDNET_REPLY_TO: "msg_0000000003", SHAREDNET_REPLY_ROOM: ROOM_ID });
       // The session being resumed is not the one serve runs in: its markers stay behind.
       expect(turn.env.CODEX_SESSION_ID).toBeUndefined();
       expect(turn.input).toContain(`You were addressed in Room ${ROOM_ID}`);
