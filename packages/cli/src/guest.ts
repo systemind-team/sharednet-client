@@ -1054,9 +1054,11 @@ async function currentSeat(
 /**
  * Post one message to the Room. `--reply-to msg_…` threads it under an
  * earlier message; the server checks that the message is in this Room.
- * Without it, a seat a wait handed a line that addressed it answers that
- * line (`answering`), so whoever asked can tell which question it answers;
- * `--reply-to none` posts on its own.
+ * Without it, it answers the line that addressed the seat in what it was
+ * last handed: SHAREDNET_REPLY_TO in a turn serve or `--run` started, else
+ * the seat's `answering` from its last wait (none when that wait handed it
+ * nothing addressed to it). So whoever asked can tell which question it
+ * answers. `--reply-to none` posts on its own.
  */
 async function say(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
@@ -1069,7 +1071,8 @@ async function say(args: string[], dependencies: GuestDependencies): Promise<unk
     throw localError("invalid_reply_to", "--reply-to must be a message id such as msg_AbCdEfGhIj, or none.");
   }
   const { client, state, credential } = await currentSeat(dependencies, stringOption(parsed, "as"));
-  const replyTo = option === "none" ? undefined : option ?? state.answering;
+  const handed = dependencies.env.SHAREDNET_REPLY_TO?.trim();
+  const replyTo = option === "none" ? undefined : option ?? (handed && /^msg_[A-Za-z0-9]+$/.test(handed) ? handed : state.answering ?? undefined);
   await beforeSay(client, state, credential, dependencies);
   return client.request(
     "POST",
@@ -1932,9 +1935,10 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
         if (wake.wake_id !== null) {
           await writePendingWake(dependencies.cwd, state.member_id, { wake_id: wake.wake_id, room_id: state.room_id, from: persisted, through: cursor });
         }
+        await writeProjectRoomState(dependencies.cwd, { ...state, answering: asked?.id ?? null });
       } else if (cursor > persisted) {
         await acknowledgeThrough(client, state.room_id, credential.member_token, cursor, sleep, dependencies, deadline);
-        await writeProjectRoomState(dependencies.cwd, { ...state, last_sequence: cursor, ...(asked ? { answering: asked.id } : {}) });
+        await writeProjectRoomState(dependencies.cwd, { ...state, last_sequence: cursor, answering: asked?.id ?? null });
       }
       await appendWakeLog(logPath, {
         at: iso(at),
@@ -1969,6 +1973,7 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
         SHAREDNET_LAST_SEQUENCE: String(cursor),
         SHAREDNET_WAKE_ID: pending.wakeId,
         SHAREDNET_FIRED: fired.join(" | "),
+        ...(asked ? { SHAREDNET_REPLY_TO: asked.id } : {}),
       });
       if (result.stderr) log(result.stderr.endsWith("\n") ? result.stderr : `${result.stderr}\n`);
       exitCode = result.exitCode;
@@ -3347,9 +3352,11 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       await acknowledgeThrough(client, seat.room_id, seat.member_token, cursor, sleep, dependencies);
       await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
     };
+    // A turn answers the last line that addressed the seat, so whoever asked can tell which question:
+    // the reply serve posts for it, and anything it says itself (SHAREDNET_REPLY_TO).
+    const askedIn = (said: MessageShape[]) => said.filter((item) => item.mentions?.includes(me)).at(-1);
     const saveReply = (content: string | null, from: number, through: number, said: MessageShape[]) => {
-      // It answers the last line that addressed the seat, so whoever asked can tell which question.
-      const asked = said.filter((item) => item.mentions?.includes(me)).at(-1);
+      const asked = askedIn(said);
       return writePendingReply(paths, {
         schema_version: 1, base_url: seat.base_url, room_id: seat.room_id, member_id: seat.member_id,
         from, through, content, idempotency_key: randomUUID(), created_at: dependencies.now().toISOString(),
@@ -3397,7 +3404,9 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
             seat.member_token,
             { through },
           ),
-          () => plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs }),
+          () => plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, {
+            env: { ...dependencies.env, ...(askedIn(said) ? { SHAREDNET_REPLY_TO: askedIn(said)!.id } : {}) }, run: drive, chatOpen: open, timeoutMs,
+          }),
         );
         return { state: "delivered", delivery, pluginLabel: plugin.label, started, timeoutMs };
       };

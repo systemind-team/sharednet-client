@@ -60,8 +60,8 @@ export interface ProjectRoomState {
   room_id: string;
   member_id: string;
   last_sequence: number;
-  /** The last line a wait handed this seat that addressed it: what `say` answers (msg_…). */
-  answering?: string;
+  /** The last line a wait handed this seat that addressed it: what `say` answers (msg_…); null once a wait hands it none. */
+  answering?: string | null;
 }
 
 /**
@@ -619,7 +619,7 @@ export async function writeProjectRoomState(
   const sameRoom = existing !== null && existing.room_id === state.room_id;
   const previous = sameRoom ? existing.seats[state.member_id] : undefined;
   const seats = sameRoom ? { ...existing.seats } : {};
-  const answering = state.answering ?? previous?.answering;
+  const answering = state.answering !== undefined ? state.answering : previous?.answering;
   seats[state.member_id] = {
     last_sequence: state.last_sequence,
     anchor_key: options.anchorKey !== undefined ? options.anchorKey : (previous?.anchor_key ?? null),
