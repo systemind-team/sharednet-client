@@ -24,6 +24,8 @@ export interface PendingReply {
   through: number;
   content: string | null;
   idempotency_key: string;
+  /** The line that addressed the seat, which this reply answers (msg_…). */
+  reply_to?: string;
   committed?: { id: string; sequence: number };
 }
 
@@ -92,7 +94,8 @@ function parsePendingReply(value: unknown, seat: Seat): PendingReply {
       typeof reply.content !== "string" || reply.content.trim() === "" ||
       Buffer.byteLength(reply.content, "utf8") > MAX_MESSAGE_BYTES
     )) ||
-    typeof reply.idempotency_key !== "string" || !/^[\x21-\x7e]+$/.test(reply.idempotency_key)
+    typeof reply.idempotency_key !== "string" || !/^[\x21-\x7e]+$/.test(reply.idempotency_key) ||
+    (reply.reply_to !== undefined && (typeof reply.reply_to !== "string" || !/^msg_[A-Za-z0-9]+$/.test(reply.reply_to)))
   ) invalidOutbox();
   const committed = reply.committed;
   if (committed !== undefined) {
@@ -113,6 +116,7 @@ function parsePendingReply(value: unknown, seat: Seat): PendingReply {
     through: reply.through as number,
     content: reply.content as string | null,
     idempotency_key: reply.idempotency_key as string,
+    ...(reply.reply_to === undefined ? {} : { reply_to: reply.reply_to as string }),
     ...(committed === undefined ? {} : { committed: committed as PendingReply["committed"] }),
   };
 }

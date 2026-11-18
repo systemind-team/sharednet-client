@@ -88,6 +88,11 @@ describe("the codex plugin", () => {
     expect(ran[1]!.env).toMatchObject({ CODEX_HOME: "/codex-home", SHAREDNET_SEAT: "i_SeatSeatSe" });
   });
 
+  it("tells an open session which line its answer replies to, when one addressed it", () => {
+    expect(livePrompt({ ...about, replyTo: "msg_AbCdEfGhIj" })).toContain(`sharednet say "…" --as ${about.memberId} --reply-to msg_AbCdEfGhIj (`);
+    expect(livePrompt(about)).toContain(`sharednet say "…" --as ${about.memberId} (`);
+  });
+
   it("queues through the real codex when a launcher script stands in for it", async () => {
     const path = await bin("codex");
     const { ran, context } = scripted({ exitCode: 1, stderr: ACTIVE_WRITER }, {});

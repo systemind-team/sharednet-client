@@ -61,6 +61,15 @@ describe("durable native reply outbox", () => {
     expect(await readdir(directory)).toEqual(["i_AbCdEfGhIj.reply-outbox.json"]);
   });
 
+  it("keeps the line a reply answers, and refuses one that is not a message id", async () => {
+    const { paths, reply, file } = await fixture();
+    const threaded = { ...reply, reply_to: "msg_AbCdEfGhIj" };
+    await writePendingReply(paths, threaded);
+    expect(await readPendingReply(paths, reply)).toEqual(threaded);
+    await writeFile(file, JSON.stringify({ ...reply, reply_to: "../elsewhere" }), { mode: 0o600 });
+    await expect(readPendingReply(paths, reply)).rejects.toMatchObject({ code: "invalid_reply_outbox" });
+  });
+
   it("persists a committed receipt without changing the pending reply and clears only that seat", async () => {
     const { paths, reply } = await fixture();
     const other = { ...reply, member_id: "i_ZyXwVuTsRq", content: null };

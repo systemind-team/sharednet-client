@@ -60,6 +60,8 @@ export interface ProjectRoomState {
   room_id: string;
   member_id: string;
   last_sequence: number;
+  /** The last line a wait handed this seat that addressed it: what `say` answers (msg_…); null once a wait hands it none. */
+  answering?: string | null;
 }
 
 /**
@@ -80,7 +82,10 @@ export interface ProjectSeat {
   last_sequence: number;
   anchor_key: string | null;
   joined_at: string | null;
+  answering?: string;
 }
+
+const MESSAGE_ID = /^msg_[A-Za-z0-9]+$/;
 
 export const PROJECT_STATE_DIR = ".sharednet";
 
@@ -577,6 +582,7 @@ export async function readProjectRoom(cwd: string): Promise<ProjectRoom | null> 
       last_sequence: sequence(record.last_sequence),
       anchor_key: typeof record.anchor_key === "string" ? record.anchor_key : null,
       joined_at: typeof record.joined_at === "string" ? record.joined_at : null,
+      ...(typeof record.answering === "string" && MESSAGE_ID.test(record.answering) ? { answering: record.answering } : {}),
     };
   }
   return {
@@ -601,7 +607,8 @@ async function writeProjectRoom(cwd: string, room: ProjectRoom): Promise<void> {
 /**
  * Records one seat's cursor in the directory's Room. A different Room
  * replaces the file: a directory is in one Room at a time. `anchorKey` ties
- * the seat to the session that took it; omitted, an existing tie is kept.
+ * the seat to the session that took it; omitted, an existing tie is kept, as
+ * is the line the seat is answering when the state names none.
  */
 export async function writeProjectRoomState(
   cwd: string,
@@ -612,10 +619,12 @@ export async function writeProjectRoomState(
   const sameRoom = existing !== null && existing.room_id === state.room_id;
   const previous = sameRoom ? existing.seats[state.member_id] : undefined;
   const seats = sameRoom ? { ...existing.seats } : {};
+  const answering = state.answering !== undefined ? state.answering : previous?.answering;
   seats[state.member_id] = {
     last_sequence: state.last_sequence,
     anchor_key: options.anchorKey !== undefined ? options.anchorKey : (previous?.anchor_key ?? null),
     joined_at: options.joinedAt ?? previous?.joined_at ?? null,
+    ...(answering ? { answering } : {}),
   };
   await writeProjectRoom(cwd, { schema_version: 2, base_url: state.base_url, room_id: state.room_id, seats });
 }
@@ -638,6 +647,7 @@ export async function selectProjectSeat(
     room_id: room.room_id,
     member_id: memberId,
     last_sequence: room.seats[memberId]!.last_sequence,
+    ...(room.seats[memberId]!.answering ? { answering: room.seats[memberId]!.answering } : {}),
   });
   const ids = Object.keys(room.seats);
   if (choice.explicit) {

@@ -1054,18 +1054,25 @@ async function currentSeat(
 /**
  * Post one message to the Room. `--reply-to msg_…` threads it under an
  * earlier message; the server checks that the message is in this Room.
+ * Without it, it answers the line that addressed the seat in what it was
+ * last handed: SHAREDNET_REPLY_TO in a turn serve or `--run` started, else
+ * the seat's `answering` from its last wait (none when that wait handed it
+ * nothing addressed to it). So whoever asked can tell which question it
+ * answers. `--reply-to none` posts on its own.
  */
 async function say(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
   assertOnlyOptions(parsed, ["reply-to", "as"]);
   if (parsed.positionals.length !== 1 || !parsed.positionals[0]!.trim()) {
-    throw localError("invalid_arguments", 'Usage: sharednet say "<message>" [--reply-to <msg_id>] [--as <member_id>]');
+    throw localError("invalid_arguments", 'Usage: sharednet say "<message>" [--reply-to <msg_id>|none] [--as <member_id>]');
   }
-  const replyTo = stringOption(parsed, "reply-to");
-  if (replyTo !== undefined && !/^msg_[A-Za-z0-9]{10}$/.test(replyTo)) {
-    throw localError("invalid_reply_to", "--reply-to must be a message id such as msg_AbCdEfGhIj.");
+  const option = stringOption(parsed, "reply-to");
+  if (option !== undefined && option !== "none" && !/^msg_[A-Za-z0-9]{10}$/.test(option)) {
+    throw localError("invalid_reply_to", "--reply-to must be a message id such as msg_AbCdEfGhIj, or none.");
   }
   const { client, state, credential } = await currentSeat(dependencies, stringOption(parsed, "as"));
+  const turn = turnReply(dependencies.env, state.room_id);
+  const replyTo = option === "none" ? undefined : option ?? (turn === undefined ? state.answering ?? undefined : turn ?? undefined);
   await beforeSay(client, state, credential, dependencies);
   return client.request(
     "POST",
@@ -1074,6 +1081,18 @@ async function say(args: string[], dependencies: GuestDependencies): Promise<unk
     { content: parsed.positionals[0]!, ...(replyTo === undefined ? {} : { reply_to_message_id: replyTo }) },
     { "idempotency-key": randomUUID() },
   );
+}
+
+/** What a turn serve or `--run` starts answers: the line that addressed the seat, or none, in that Room. */
+function replyEnv(roomId: string, replyTo: string | undefined): Record<string, string> {
+  return { SHAREDNET_REPLY_TO: replyTo ?? "none", SHAREDNET_REPLY_ROOM: roomId };
+}
+
+/** In such a turn, `say` in its Room answers that line (null: none); elsewhere, undefined. */
+function turnReply(env: GuestDependencies["env"], roomId: string): string | null | undefined {
+  const to = env.SHAREDNET_REPLY_TO?.trim();
+  if (!to || env.SHAREDNET_REPLY_ROOM !== roomId) return undefined;
+  return /^msg_[A-Za-z0-9]+$/.test(to) ? to : null;
 }
 
 /** Read a complete board suffix; pagination must advance or the caller fails closed. */
@@ -1886,6 +1905,8 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
           ).filter((item) => !isOwn(item, me, state.member_id))
         : batch;
     const events: Array<Record<string, unknown>> = handed.map((item) => ({ kind: "message", ...item }));
+    // The last line here that addressed this seat: what its reply answers.
+    const asked = handed.filter((item) => item.mentions?.includes(me) || mentions(item.content, { memberId: me, name: myName })).at(-1);
     for (const trigger of firedTriggers) {
       if (trigger.kind === "check") {
         events.push({ kind: "check", trigger: trigger.label, command: trigger.command, ...checks.get(trigger.label)!.fire! });
@@ -1926,9 +1947,10 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
         if (wake.wake_id !== null) {
           await writePendingWake(dependencies.cwd, state.member_id, { wake_id: wake.wake_id, room_id: state.room_id, from: persisted, through: cursor });
         }
+        await writeProjectRoomState(dependencies.cwd, { ...state, answering: asked?.id ?? null });
       } else if (cursor > persisted) {
         await acknowledgeThrough(client, state.room_id, credential.member_token, cursor, sleep, dependencies, deadline);
-        await writeProjectRoomState(dependencies.cwd, { ...state, last_sequence: cursor });
+        await writeProjectRoomState(dependencies.cwd, { ...state, last_sequence: cursor, answering: asked?.id ?? null });
       }
       await appendWakeLog(logPath, {
         at: iso(at),
@@ -1963,6 +1985,7 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
         SHAREDNET_LAST_SEQUENCE: String(cursor),
         SHAREDNET_WAKE_ID: pending.wakeId,
         SHAREDNET_FIRED: fired.join(" | "),
+        ...replyEnv(state.room_id, asked?.id),
       });
       if (result.stderr) log(result.stderr.endsWith("\n") ? result.stderr : `${result.stderr}\n`);
       exitCode = result.exitCode;
@@ -1975,7 +1998,7 @@ async function sit(verb: "wait" | "watch", parsed: ParsedGuestArguments, depende
           "POST",
           `/rooms/${encodeURIComponent(state.room_id)}/messages`,
           credential.member_token,
-          { content: pending.reply },
+          { content: pending.reply, ...(asked ? { reply_to_message_id: asked.id } : {}) },
           { "idempotency-key": pending.replyKey },
         );
         replyMessageId = posted?.message?.id ?? null;
@@ -3245,7 +3268,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         }
         const response = await client.request<{ message?: { id?: unknown; sequence?: unknown; room_id?: unknown } }>(
           "POST", `/rooms/${encodeURIComponent(seat.room_id)}/messages`, seat.member_token,
-          { content: pending.content }, { "idempotency-key": pending.idempotency_key },
+          { content: pending.content, ...(pending.reply_to ? { reply_to_message_id: pending.reply_to } : {}) }, { "idempotency-key": pending.idempotency_key },
         );
         const message = response?.message;
         if (typeof message?.id !== "string" || !/^msg_[A-Za-z0-9]+$/.test(message.id) ||
@@ -3341,10 +3364,17 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
       await acknowledgeThrough(client, seat.room_id, seat.member_token, cursor, sleep, dependencies);
       await writeServeCursor(paths, seat.room_id, seat.member_id, cursor);
     };
-    const saveReply = (content: string | null, from: number, through: number) => writePendingReply(paths, {
-      schema_version: 1, base_url: seat.base_url, room_id: seat.room_id, member_id: seat.member_id,
-      from, through, content, idempotency_key: randomUUID(), created_at: dependencies.now().toISOString(),
-    });
+    // A turn answers the last line that addressed the seat, so whoever asked can tell which question:
+    // the reply serve posts for it, and anything it says itself (SHAREDNET_REPLY_TO).
+    const askedIn = (said: MessageShape[]) => said.filter((item) => item.mentions?.includes(me)).at(-1);
+    const saveReply = (content: string | null, from: number, through: number, said: MessageShape[]) => {
+      const asked = askedIn(said);
+      return writePendingReply(paths, {
+        schema_version: 1, base_url: seat.base_url, room_id: seat.room_id, member_id: seat.member_id,
+        from, through, content, idempotency_key: randomUUID(), created_at: dependencies.now().toISOString(),
+        ...(asked ? { reply_to: asked.id } : {}),
+      });
+    };
     /** One wake of a driven seat, delivered by its plugin. What that means for the Room is decided here. */
     const deliverWake = async (said: MessageShape[], from: number, through: number): Promise<Delivery | null> => {
       const hour = dependencies.now().getTime() - 3_600_000;
@@ -3364,7 +3394,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         | { state: "delivered"; delivery: Delivery; pluginLabel: string; started: number; timeoutMs: number };
       const take = async (currentWake: SeatWake): Promise<WakeRun> => {
         if (stopping.signal.aborted) return { state: "cancelled" };
-        const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through };
+        const about = { roomId: seat.room_id, seat: seat.name, memberId: seat.member_id, messages: said, from, through, replyTo: askedIn(said)?.id };
         const checkpoint = checkpointPath(paths.stateDir, seat.room_id, seat.member_id);
         let compiled = "";
         if (seat.room_type === "compiled") {
@@ -3386,7 +3416,9 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
             seat.member_token,
             { through },
           ),
-          () => plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, { env: dependencies.env, run: drive, chatOpen: open, timeoutMs }),
+          () => plugin.deliver(currentWake, { ...about, prompt, livePrompt: livePrompt(about) }, {
+            env: { ...dependencies.env, ...replyEnv(seat.room_id, askedIn(said)?.id) }, run: drive, chatOpen: open, timeoutMs,
+          }),
         );
         return { state: "delivered", delivery, pluginLabel: plugin.label, started, timeoutMs };
       };
@@ -3437,7 +3469,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         // The turn's last message is the seat's reply; the session does not have to reach the Room.
         const answer = replyFrom(delivery.reply, MAX_MESSAGE_BYTES);
         dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} finished its turn${answer ? `: ${answer.replace(/\s+/g, " ").slice(0, 160)}` : " with nothing to say"}\n`);
-        await saveReply(answer || null, from, through);
+        await saveReply(answer || null, from, through, said);
       } else if (delivery.kind === "handed") {
         dependencies.stderr?.(`serve: ${seat.room_id} ${seat.name} addressed; ${span} ${delivery.note}; it answers in the Room itself\n`);
         // Written before the cursor moves past it: a session that never answers leaves it unanswered.
@@ -3453,7 +3485,7 @@ async function serve(args: string[], dependencies: GuestDependencies): Promise<u
         const notice = delivery.timedOut
           ? `(${seat.name}'s turn was stopped after ${timeoutMs / 60_000} minutes. The listener remains available for the next mention; this task was not automatically retried.)`
           : `(${seat.name} was addressed, but its ${pluginLabel} session could not be resumed: ${delivery.why})`;
-        await saveReply(notice, from, through);
+        await saveReply(notice, from, through, said);
       }
       return delivery;
     };
