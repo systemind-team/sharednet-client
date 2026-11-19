@@ -34,7 +34,7 @@ describe("state slot", () => {
       "cc-2",
     );
     expect(view).toContain('- cc-1: in a turn; holds "WAV core"; 1 done');
-    expect(view).toContain("- cc-2 (you): idle; holds no task");
+    expect(view).toContain("- cc-2 (you): this turn; holds no task");
     expect(view).toContain("- cc-3: not started; holds no task");
   });
 });

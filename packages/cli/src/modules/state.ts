@@ -87,7 +87,8 @@ export function renderActivity(seats: readonly SeatActivity[], tasks: readonly T
   const done = (seat: SeatActivity) => tasks.filter((task) => task.status === "done" && (task.owner_name === seat.name || (seat.member_id && task.owner === seat.member_id))).length;
   const lines = seats.map((seat) => {
     const holding = held(seat);
-    const state = seat.busy ? "in a turn" : seat.turns === 0 ? "not started" : "idle";
+    // The view is built just before the reader's own turn starts, so its own record still says idle.
+    const state = seat.name === me ? "this turn" : seat.busy ? "in a turn" : seat.turns === 0 ? "not started" : "idle";
     const tasksText = holding.length > 0 ? `holds ${holding.map((task) => `"${task.title}"`).join(", ")}` : "holds no task";
     const finished = done(seat);
     return `- ${seat.name}${seat.name === me ? " (you)" : ""}: ${state}; ${tasksText}${finished > 0 ? `; ${finished} done` : ""}`;
