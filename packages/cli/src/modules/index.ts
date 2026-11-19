@@ -9,9 +9,11 @@
  *   topology     --topology                        all          topology.ts
  *   protocol     --message-schema                  free         protocol.ts
  *   information  --probe, --probe-every            none         information.ts
+ *   environment  --env-push, --env-audience        off          environment.ts
  *
  * See docs/harness-modules.md for what each slot is for and what an experiment changes in it.
  */
+import type { EnvironmentModule } from "./environment.ts";
 import type { Probe } from "./information.ts";
 import type { MessageSchema } from "./protocol.ts";
 import type { TaskJudge } from "./state.ts";
@@ -23,6 +25,7 @@ export interface HarnessModules {
   topology: Topology;
   messageSchema: MessageSchema;
   probe: Probe | null;
+  environment: EnvironmentModule;
 }
 
 export const DEFAULT_MODULES: HarnessModules = Object.freeze({
@@ -31,10 +34,11 @@ export const DEFAULT_MODULES: HarnessModules = Object.freeze({
   topology: Object.freeze({ kind: "all" }) as Topology,
   messageSchema: "free",
   probe: null,
+  environment: Object.freeze({ push: "off", audience: "affected", watch: Object.freeze([]) as unknown as EnvironmentModule["watch"] }) as EnvironmentModule,
 }) as HarnessModules;
 
 export function isDefaultModules(modules: HarnessModules): boolean {
-  return modules.taskJudge === "off" && !modules.activityView && modules.topology.kind === "all" && modules.messageSchema === "free" && modules.probe === null;
+  return modules.taskJudge === "off" && !modules.activityView && modules.topology.kind === "all" && modules.messageSchema === "free" && modules.probe === null && modules.environment.push === "off";
 }
 
 /** What a run record says about its modules. */
@@ -44,6 +48,7 @@ export function describeModules(modules: HarnessModules): Record<string, unknown
     topology: modules.topology.kind === "islands" ? `islands:${modules.topology.count}` : "all",
     protocol: modules.messageSchema,
     information: modules.probe ? { probe: modules.probe.command, every_ms: modules.probe.everyMs } : null,
+    environment: modules.environment.push === "off" ? null : { push: modules.environment.push, audience: modules.environment.audience, ...(modules.environment.watch.length > 0 ? { watch: modules.environment.watch.map((root) => root.mount) } : {}) },
   };
 }
 

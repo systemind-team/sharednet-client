@@ -1,6 +1,7 @@
 import { compiledPrompt, COMPILED_HELP, type CompiledState } from "./compiled.ts";
 import { controlPaths, isTaskMessage, type Task } from "./board-controls.ts";
 import { DEFAULT_MODULES, describeModules, seatEnvironment, type HarnessModules } from "./modules/index.ts";
+import { ENV_HELP, ENV_HOOK, ENV_HOOK_DIR, ENV_HOOK_PATH, ENV_HOOKS, ENV_POST_GAP_MS, ENV_SCAN_MS, ENV_SETTLE_MS, Environment, diffSnapshots, envLineForAnother, envMessage, fileKey, hookNotes, renderNotes, sameBytes, snapshotRoots, type Delivery, type Note } from "./modules/environment.ts";
 import { PROBE_HELP, probeMessage } from "./modules/information.ts";
 import { SBAR_HELP, renderRequests, requestsFor } from "./modules/protocol.ts";
 import { ACTIVITY_HELP, TASK_JUDGE_HELP, renderActivity } from "./modules/state.ts";
@@ -597,7 +598,15 @@ export function moduleHelp(seat: string, names: readonly string[], modules: Harn
     ...topologyHelp(seat, names, modules.topology),
     ...(modules.messageSchema === "sbar" ? [SBAR_HELP] : []),
     ...(modules.probe ? [PROBE_HELP] : []),
+    ...(modules.environment.push !== "off" ? [ENV_HELP] : []),
   ];
+}
+
+/** The hooks a Claude Code seat's turn runs with: the task gate's, the workspace's, or both. */
+export function hookSettings(taskGate: boolean, environment: boolean): string {
+  if (!environment) return TASK_HOOK_SETTINGS;
+  const task = taskGate ? (JSON.parse(TASK_HOOK_SETTINGS) as { hooks: { PreToolUse: unknown[] } }).hooks.PreToolUse : [];
+  return JSON.stringify({ hooks: { PreToolUse: [...task, ...ENV_HOOKS.PreToolUse], PostToolUse: ENV_HOOKS.PostToolUse } });
 }
 
 /** What a woken Agent is told: everything said since its last turn. */
@@ -872,6 +881,18 @@ export async function runGoal(
   const modules = input.modules ?? DEFAULT_MODULES;
   // Who is in a turn now: the activity view reads it, so it is the runner's record, not a seat's word.
   const busy = new Set<string>();
+  // The workspace as a participant (modules/environment.ts); null unless --env-push is on.
+  const watchRoots = [{ host: plan.workspace, mount: CONTAINER_WORKSPACE }, ...modules.environment.watch];
+  const watch = modules.environment.push !== "off"
+    ? new Environment(plan.agents.map((agent) => agent.name), {
+        audience: modules.environment.audience,
+        // A folder mounted beside the workspace is shared; a seat may hold its own copy of a file in it.
+        shared: modules.environment.watch.map((root) => fileKey(root.mount, "")),
+        identical: (a, b) => sameBytes(watchRoots, a, b),
+      })
+    : null;
+  const envInTurn = (seat: { driver: string } | null) => modules.environment.push === "on-action" && seat?.driver === "claude-code";
+  const envPosts = modules.environment.push === "on-event" || modules.environment.push === "on-action";
   if (input.harnessMode && turnPolicy !== "legacy") throw localError("invalid_arguments", "--turn-policy cooperative-v1 cannot override a frozen --harness-mode.");
   if (turnPolicy === "cooperative-v1" && (plan.agents.length < 2 || input.roomType === "compiled")) throw localError("invalid_arguments", "--turn-policy cooperative-v1 requires a multi-agent board Room.");
   if (
@@ -994,6 +1015,7 @@ export async function runGoal(
       ...(seat && input.mentionGate ? ["-e", "SHAREDNET_MENTION_GATE=1"] : []),
       ...(seat && options.through !== undefined ? ["-e", `SHAREDNET_TURN_THROUGH=${options.through}`] : []),
       ...(seat ? seatEnvironment(modules) : []),
+      ...(envInTurn(seat) ? ["-e", `SHAREDNET_ENV_DIR=${ENV_HOOK_DIR}`] : []),
       ...(controls && input.taskGate ? ["-e", "SHAREDNET_TASK_GATE=1", "-e", `SHAREDNET_TASK_FILE=${controls.tasks}`, "-e", `SHAREDNET_TASK_AUDIT=${join(controls.root, "shell-blocks.tsv")}`, "-e", "SHAREDNET_TASK_PROFILE=/etc/profile.d/sharednet-task.sh"] : []),
       // Isolated, a seat holds a placeholder where its harness wants a key, and its requests go to the gateway, which signs them.
       ...(seat?.driver === "claude-code" && plan.claudeAuth
@@ -1054,6 +1076,10 @@ export async function runGoal(
           if (hook.code !== 0) throw localError("container_failed", "Could not install the Claude task hook.");
         }
       }
+      if (envInTurn(seat)) {
+        const hook = await docker(["exec", "--user", "root", "--interactive", container, "sh", "-c", `mkdir -p /usr/local/lib ${ENV_HOOK_DIR} && chmod 777 ${ENV_HOOK_DIR} && cat > ${ENV_HOOK_PATH} && chmod 644 ${ENV_HOOK_PATH}`], { input: ENV_HOOK });
+        if (hook.code !== 0) throw localError("container_failed", "Could not install the workspace hook.");
+      }
       const home = `${CONTAINER_HOMES}/${seat.name}`;
       const prepared = seat.driver === "codex" && plan.codexAuth?.kind === "login"
         ? await docker([
@@ -1107,6 +1133,26 @@ export async function runGoal(
       ? { url: `http://${GATEWAY_ALIAS}:${GATEWAY_PORTS.openai}${api.path}`, custom: api.custom }
       : api.custom ? { url: `${api.origin}${api.path}`, custom: true } : null;
 
+    // The workspace as a participant: its log, what has been given to whom, and what a turn's hook gave.
+    const logEnv = (record: Record<string, unknown>) => appendFile(join(input.out, "environment.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), ...record })}\n`);
+    const given = async (seat: SeatRecord, notes: Note[], how: Delivery) => {
+      if (!watch || notes.length === 0) return;
+      watch.delivered(seat.name, notes.map((note) => note.id), dependencies.now().getTime());
+      await logEnv({ event: "delivered", seat: seat.name, how, turn: seat.turns, notes: notes.map((note) => ({ id: note.id, path: note.path, kind: note.kind, by: note.by, interest: note.interest, ...(note.copy !== undefined ? { copy: note.copy } : {}) })) });
+    };
+    const handed = new Map<string, string>();
+    const collectInTurn = async (seat: SeatRecord) => {
+      if (!watch) return;
+      const read = await docker(["exec", "--user", user, containerName(input.roomId, seat.name), "sh", "-c", `cat ${ENV_HOOK_DIR}/delivered.ndjson 2>/dev/null; rm -f ${ENV_HOOK_DIR}/delivered.ndjson ${ENV_HOOK_DIR}/pending.json`]);
+      const how = new Map<string, string>();
+      for (const line of (read.stdout ?? "").split("\n")) {
+        try { const record = JSON.parse(line) as { id: string; how: string }; how.set(record.id, record.how); } catch { /* not a record */ }
+      }
+      const waiting = watch.waiting(seat.name);
+      for (const kind of ["note", "held-edit"] as const) await given(seat, waiting.filter((note) => how.get(note.id) === kind), kind);
+      handed.delete(seat.name);
+    };
+
     const runTurn = async (seat: SeatRecord, prompt: string, wake: WakeShape | null) => {
       if (input.roomType === "compiled") {
         // The CLI inside the seat's container holds its own credential; the owner cannot render its obligations.
@@ -1128,15 +1174,19 @@ export async function runGoal(
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
       const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, codexBase, input.codexModel ?? {}, input.disallowedTools ?? []);
-      if (input.taskGate && seat.driver === "claude-code") command.splice(command.length - 1, 0, "--settings", TASK_HOOK_SETTINGS);
+      watch?.turnStarted(seat.name, seat.turns, dependencies.now().getTime());
+      if (seat.driver === "claude-code" && (input.taskGate || envInTurn(seat))) command.splice(command.length - 1, 0, "--settings", hookSettings(Boolean(input.taskGate), envInTurn(seat)));
       const result = await exec(seat, command, {
         through: wake?.through ?? input.goalSequence,
         onLine: (line) => {
           reader.line(line);
+          watch?.sawLine(seat.name, seat.turns, line, dependencies.now().getTime());
           writes = writes.then(() => appendFile(stream, `${line}\n`));
         },
       });
       await writes;
+      watch?.turnEnded(seat.name, dependencies.now().getTime());
+      if (envInTurn(seat)) await collectInTurn(seat);
       if (result.stderr.trim()) await writeFile(join(directory, `turn-${number}.stderr.txt`), result.stderr);
       const reading = reader.reading;
       seat.session_id = reading.sessionId ?? seat.session_id;
@@ -1180,7 +1230,57 @@ export async function runGoal(
         try { tasks = (JSON.parse(listed.stdout) as { tasks?: Task[] }).tasks ?? []; } catch { /* the view goes out without tasks */ }
         parts.push(renderActivity(records.map((record) => ({ name: record.name, member_id: record.member_id ?? null, busy: busy.has(record.name), turns: record.turns })), tasks, seat.name));
       }
+      if (watch) {
+        const waiting = watch.waiting(seat.name);
+        const changed = renderNotes(waiting, dependencies.now().getTime());
+        if (changed) { parts.push(changed); await given(seat, waiting, "wake"); }
+      }
       return parts;
+    };
+
+    // The workspace watches itself: a scan every few seconds, then each seat is told at a time it can use.
+    const envLoop = async () => {
+      if (!watch) return;
+      let before = await snapshotRoots(watchRoots);
+      watch.know(before.keys());
+      let since = dependencies.now().getTime();
+      const lastPost = new Map<string, number>();
+      while (!ended) {
+        await sleep(ENV_SCAN_MS);
+        if (ended) break;
+        const after = await snapshotRoots(watchRoots);
+        const now = dependencies.now().getTime();
+        const changes = diffSnapshots(before, after);
+        watch.know(after.keys());
+        if (changes.length > 0) {
+          const added = watch.observe(changes, since, now);
+          await logEnv({ event: "changes", changes: changes.slice(0, 200), total: changes.length, in_turn: [...busy], notes: added.map((note) => ({ id: note.id, seat: note.seat, path: note.path, by: note.by, interest: note.interest, ...(note.copy !== undefined ? { copy: note.copy } : {}) })) });
+        }
+        before = after;
+        since = now;
+        for (const seat of records) {
+          const waiting = watch.waiting(seat.name);
+          if (waiting.length === 0) continue;
+          if (busy.has(seat.name)) {
+            // In a turn: a Claude Code seat's hook reads what is waiting; any other seat gets it with its next wake.
+            if (!envInTurn(seat)) continue;
+            const key = waiting.map((note) => `${note.id}@${note.at}`).join(",");
+            if (handed.get(seat.name) === key) continue;
+            handed.set(seat.name, key);
+            await docker(["exec", "--user", user, "--interactive", containerName(input.roomId, seat.name), "sh", "-c", `cat > ${ENV_HOOK_DIR}/pending.tmp && mv ${ENV_HOOK_DIR}/pending.tmp ${ENV_HOOK_DIR}/pending.json`], { input: JSON.stringify(hookNotes(waiting)) });
+            continue;
+          }
+          if (!envPosts || seat.turns === 0) continue;
+          if (now - waiting.at(-1)!.at < ENV_SETTLE_MS || now - (lastPost.get(seat.name) ?? Number.NEGATIVE_INFINITY) < ENV_POST_GAP_MS) continue;
+          try {
+            await client.request("POST", `/rooms/${encodeURIComponent(input.roomId)}/owner-messages`, apiKey, { content: envMessage(seat.name, waiting, now), as: "runner" });
+            lastPost.set(seat.name, now);
+            await given(seat, waiting, "post");
+          } catch (error) {
+            log(`goal: a workspace change was not posted (${error instanceof CliError ? error.code : "error"})\n`);
+          }
+        }
+      }
     };
 
     // The information slot: a probe on a fixed clock, in the checks container, posted as the runner.
@@ -1232,9 +1332,15 @@ export async function runGoal(
           if (raw.fired.includes("closed")) return;
           wake = reachable(routeWake(raw, seat, records, messageRouting), seat, records, modules.topology);
           if (input.taskGate) wake = withoutTaskActs(wake);
+          // An [env] line is for the seat it names: it wakes nobody else, whatever the routing.
+          if (envPosts) {
+            const own = wake;
+            const seatIds = new Set(records.map((record) => record.member_id));
+            wake = { ...own, messages: own.messages.filter((message) => (message.sender?.member_id !== undefined && seatIds.has(message.sender.member_id)) || !envLineForAnother(message.content, seat.name)) };
+          }
           const delivered = wake.messages.map(message => message.sequence);
-          if (messageRouting !== "broadcast" || input.taskGate || modules.topology.kind !== "all") await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
-          if (delivered.length > 0 || (messageRouting === "broadcast" && !input.taskGate && modules.topology.kind === "all")) break;
+          if (messageRouting !== "broadcast" || input.taskGate || modules.topology.kind !== "all" || envPosts) await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
+          if (delivered.length > 0 || (messageRouting === "broadcast" && !input.taskGate && modules.topology.kind === "all" && !envPosts)) break;
           if (raw.wake_id) await exec(seat, ["sharednet", "ack", raw.wake_id, "--json"]);
         }
         if (ended || !wake) return;
@@ -1246,6 +1352,9 @@ export async function runGoal(
         log(`goal: ${seat.name} stopped (${error instanceof Error ? error.message : "error"})\n`);
       }),
     );
+    const environing = envLoop().catch((error: unknown) => {
+      log(`goal: the workspace watch stopped (${error instanceof Error ? error.message : "error"})\n`);
+    });
     const probing = probeLoop().catch((error: unknown) => {
       log(`goal: the probe stopped (${error instanceof Error ? error.message : "error"})\n`);
     });
@@ -1273,6 +1382,7 @@ export async function runGoal(
     await docker(["stop", "--time", "5", ...containers]);
     await Promise.all(seats);
     await probing;
+    await environing;
 
     // Each Agent's own trace is its home: Codex keeps sessions in ~/.codex, Claude Code in ~/.claude.
     for (const seat of records) {
