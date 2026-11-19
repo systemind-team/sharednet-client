@@ -107,19 +107,20 @@ describe("information slot", () => {
 });
 
 describe("the slots together", () => {
-  const all: HarnessModules = { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "p", everyMs: 60_000 } };
+  const all: HarnessModules = { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "p", everyMs: 60_000 }, environment: { push: "on-event", audience: "affected" } };
   it("has today's behaviour as its default", () => {
     expect(isDefaultModules(DEFAULT_MODULES)).toBe(true);
     expect(isDefaultModules(all)).toBe(false);
     expect(seatEnvironment(DEFAULT_MODULES)).toEqual([]);
     expect(seatEnvironment(all)).toEqual(["-e", "SHAREDNET_TASK_JUDGE=lexical", "-e", "SHAREDNET_MESSAGE_SCHEMA=sbar"]);
-    expect(describeModules(all)).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "p", every_ms: 60_000 } });
+    expect(describeModules(all)).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "p", every_ms: 60_000 }, environment: { push: "on-event", audience: "affected" } });
+    expect(describeModules(DEFAULT_MODULES).environment).toBeNull();
   });
   it("leaves the opening prompt exactly as it was when every slot is at its default", () => {
     const input = { seat: { driver: "claude-code" as const, model: null, name: "a" }, seats: [{ driver: "claude-code" as const, model: null, name: "a" }, { driver: "claude-code" as const, model: null, name: "b" }], roomId: "rom_x", goal: "g", goalSequence: 1, until: ["after 10m"] };
     expect(openingPrompt({ ...input, modules: DEFAULT_MODULES })).toBe(openingPrompt(input));
     expect(moduleHelp("a", ["a", "b"], DEFAULT_MODULES)).toEqual([]);
     const withAll = openingPrompt({ ...input, modules: all });
-    for (const marker of ["--distinct", "who is doing what", "island 1", "SBAR", "[probe]"]) expect(withAll).toContain(marker);
+    for (const marker of ["--distinct", "who is doing what", "island 1", "SBAR", "[probe]", "[env]"]) expect(withAll).toContain(marker);
   });
 });

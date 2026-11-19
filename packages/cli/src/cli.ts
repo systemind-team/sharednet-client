@@ -15,6 +15,7 @@ import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo,
 import { assertGoalRunHarnessAgentCount, getHarnessModeSpec, resolveGoalRunHarnessMode, resolveRuntimeHarnessMode, type RuntimeHarnessResolution } from "./harness-modes.ts";
 import { parseDuration } from "./triggers.ts";
 import { isDefaultModules, type HarnessModules } from "./modules/index.ts";
+import { parseEnvAudience, parseEnvPush } from "./modules/environment.ts";
 import { parseProbe } from "./modules/information.ts";
 import { parseMessageSchema } from "./modules/protocol.ts";
 import { parseTaskJudge } from "./modules/state.ts";
@@ -153,6 +154,8 @@ const optionValueNames = new Set([
   "message-schema",
   "probe",
   "probe-every",
+  "env-push",
+  "env-audience",
   "disallow-tools",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate", "activity-view"]);
@@ -616,7 +619,7 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools", "env-push", "env-audience"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
   const turnPolicy = option(parsed, "turn-policy") ?? "legacy";
@@ -649,6 +652,10 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     topology: parseTopology(option(parsed, "topology")),
     messageSchema: parseMessageSchema(option(parsed, "message-schema")),
     probe: parseProbe(option(parsed, "probe"), parsed.options.has("probe-every") ? parseDuration(option(parsed, "probe-every"), "--probe-every") : undefined),
+    environment: (() => {
+      const push = parseEnvPush(option(parsed, "env-push"));
+      return { push, audience: parseEnvAudience(option(parsed, "env-audience"), push) };
+    })(),
   };
   if (!isDefaultModules(modules) && namedMode !== undefined) {
     throw localError("invalid_arguments", "--harness-mode fixes a frozen treatment; the module options are not part of one yet.");
@@ -659,7 +666,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--disallow-tools <Tool,Tool>]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--env-push off|on-wake|on-event|on-action [--env-audience affected|all]] [--disallow-tools <Tool,Tool>]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);

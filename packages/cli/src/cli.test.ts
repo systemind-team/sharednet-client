@@ -360,6 +360,22 @@ describe("reach: forming a group from the account CLI", () => {
     expect(taken.stderr.join(" ")).not.toContain("--disallow-tools");
   });
 
+  it("takes the workspace push and its audience, and refuses a level it does not know, an audience with no push, and a compiled Room", async () => {
+    const run = (...options: string[]) => harness(["goal", "run", "no-such-goal-file.md", "--agent", "claude-code", "--until", "after: 1h", ...options], []);
+    const level = await run("--env-push", "always");
+    expect(level.stderr.join(" ")).toContain("--env-push is off, on-wake, on-event or on-action");
+    expect(level.requests).toEqual([]);
+    expect((await run("--env-audience", "all")).stderr.join(" ")).toContain("--env-audience needs --env-push");
+    expect((await run("--env-push", "on-wake", "--env-audience", "some")).stderr.join(" ")).toContain("--env-audience is affected or all");
+    expect((await run("--type", "compiled", "--env-push", "on-wake")).stderr.join(" ")).toContain("The module options are for plain board Rooms");
+    // Accepted, the run goes on to the goal file, which does not exist.
+    for (const push of ["off", "on-wake", "on-event", "on-action"]) {
+      const taken = await run("--env-push", push, ...(push === "off" ? [] : ["--env-audience", "all"]));
+      expect(taken.exitCode).not.toBe(0);
+      expect(taken.stderr.join(" ")).not.toContain("--env-");
+    }
+  });
+
   it("refuses a goal run whose turn limit is shorter than a minute, before anything is sent", async () => {
     const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--turn-limit", "30s"], []);
     expect(refused.exitCode).not.toBe(0);

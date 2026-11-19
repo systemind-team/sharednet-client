@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { ApiClient } from "./api-client.ts";
 import { resolveGoalRunHarnessMode } from "./harness-modes.ts";
+import { DEFAULT_MODULES } from "./modules/index.ts";
 import {
   AGENT_DOCKERFILE,
   DEFAULT_IMAGE,
@@ -1194,7 +1195,7 @@ describe("module slots in a run", () => {
       OWNER_KEY,
       {
         plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, messageRouting: "mentions-only",
-        modules: { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "python3 probe.py", everyMs: 60_000 } },
+        modules: { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "python3 probe.py", everyMs: 60_000 }, environment: DEFAULT_MODULES.environment },
         disallowedTools: ["ScheduleWakeup"],
       },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
@@ -1213,6 +1214,116 @@ describe("module slots in a run", () => {
     expect(turns[0]!.args.slice(turns[0]!.args.indexOf("--disallowedTools"), turns[0]!.args.indexOf("--disallowedTools") + 2)).toEqual(["--disallowedTools", "ScheduleWakeup"]);
     expect(posts).toContainEqual({ content: "@all [probe] 2 differences: -buildconf exits 1", as: "runner" });
     expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).disallowed_tools).toEqual(["ScheduleWakeup"]);
-    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).modules).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "python3 probe.py", every_ms: 60_000 } });
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).modules).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "python3 probe.py", every_ms: 60_000 }, environment: null });
+  });
+});
+
+describe("the workspace as a participant", () => {
+  const until = async (condition: () => boolean | Promise<boolean>) => {
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      if (await condition()) return;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+    }
+    throw new Error("the condition never held");
+  };
+  const tool = (name: string, file: string) => JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name, input: { file_path: `/workspace/${file}` } }] } });
+
+  /** Seat 1 reads src/a.c, seat 2 then edits it; what seat 1's next wait returns is the scenario's. */
+  async function scenario(push: "on-wake" | "on-action", seatOneWait: (state: { posts: Array<{ content: string }>; out: string }) => Promise<unknown>) {
+    const out = await temporary();
+    const workspace = await temporary();
+    await mkdir(join(workspace, "src"));
+    await writeFile(join(workspace, "src", "a.c"), "int a;\n");
+    const plan: RunPlan = { image: DEFAULT_IMAGE, agents: parseAgents(["claude-code", "claude-code"]), workspace, cli: { root: "/opt/cli", entry: "src/main.ts" }, codexAuth: null, claudeAuth: "ANTHROPIC_API_KEY" };
+    const seat1 = containerName(ROOM, "claude-code-1");
+    const posts: Array<{ content: string }> = [];
+    const waits: Record<string, number> = {};
+    let oneRead = false;
+    const { docker, calls } = fakeDocker(async (call, command) => {
+      const mine = call.args.includes(seat1);
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: mine ? "i_ClaudeOne01" : "i_ClaudeTwo02" }) };
+      if (call.args.includes("claude") && mine) { oneRead = true; return { lines: [tool("Read", "src/a.c")] }; }
+      if (call.args.includes("claude")) {
+        // Seat 2 edits the file once seat 1's turn, which read it, is on record.
+        await until(() => oneRead);
+        await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+        await writeFile(join(workspace, "src", "a.c"), "int a;\nint b;\n");
+        return { lines: [tool("Edit", "src/a.c")] };
+      }
+      if (command[0] === "sharednet" && command[1] === "wait") {
+        const n = (waits[mine ? "1" : "2"] = (waits[mine ? "1" : "2"] ?? 0) + 1);
+        if (mine && n === 1) return { stdout: JSON.stringify(await seatOneWait({ posts, out })) };
+        // Seat 2 sees the same Room: an [env] line for seat 1 is in its wake too.
+        if (!mine && n === 1 && push === "on-action") {
+          await until(() => posts.length > 0);
+          return { stdout: JSON.stringify({ wake_id: "wk_two", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: posts[0]!.content, sender: { member_id: "sni_owner-seat", name: "runner" } }] }) };
+        }
+        return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 3, through: 3, events: [{ kind: "closed" }], messages: [] }) };
+      }
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["after 900h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) {
+          const over = calls.filter(call => call.args.includes("claude")).length >= 3;
+          return { room: { id: ROOM, state: over ? "closed" : "open", goal: over ? { ...goal, ended_by: { trigger: "after 900h", at: new Date(tick).toISOString() } } : goal }, memberships: [] };
+        }
+        // The watcher's long poll answers at once here, and every reading of the fake clock moves it a second:
+        // a short real pause keeps the goal's own time limit from running out while the seats' turns take real time.
+        if (method === "GET" && path.startsWith(`/rooms/${ROOM}/wait`)) { await new Promise((resolveWait) => setTimeout(resolveWait, 2)); return { items: [] }; }
+        if (method === "POST" && path === `/rooms/${ROOM}/owner-messages`) { posts.push(body as { content: string }); return { message: {} }; }
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: new Date(tick).toISOString() } } } };
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    await runGoal(
+      client, "sni_owner-seat", OWNER_KEY,
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, modules: { ...DEFAULT_MODULES, environment: { push, audience: "affected" } } },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => { await new Promise((resolveWait) => setTimeout(resolveWait, 1)); } },
+    );
+    const log = (await readFile(join(out, "environment.ndjson"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    const turns = calls.filter(call => call.args.includes(seat1) && call.args.includes("claude"));
+    return { out, posts, calls, log, turns, seat1 };
+  }
+  const logged = async (out: string, event: string) => (await readFile(join(out, "environment.ndjson"), "utf8").catch(() => "")).includes(`"event":"${event}"`);
+
+  it("on-wake: a seat's next wake says that a file it read was changed, and by whom; nothing is posted", async () => {
+    const run = await scenario("on-wake", async ({ out }) => {
+      await until(() => logged(out, "changes"));
+      return { wake_id: "wk_one", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: "carry on", sender: { member_id: "i_ClaudeTwo02", name: "claude-code-2" } }] };
+    });
+    const woken = run.turns.at(-1)!.args.at(-1)!;
+    expect(woken).toMatch(/Changed in the workspace by others since you last saw these files:\n- src\/a\.c changed \d+ s ago, by claude-code-2; you last had it in turn 1/);
+    expect(run.turns[0]!.args.at(-1)).toContain("The workspace itself tells you when a file you have read or changed is changed by someone else");
+    expect(run.posts).toEqual([]);
+    expect(run.log.find(record => record.event === "changes")).toMatchObject({ changes: [{ path: "src/a.c", kind: "changed" }], notes: [{ seat: "claude-code-1", path: "src/a.c", by: "claude-code-2", interest: "read" }] });
+    expect(run.log.find(record => record.event === "delivered")).toMatchObject({ seat: "claude-code-1", how: "wake", notes: [{ path: "src/a.c", by: "claude-code-2" }] });
+    // No hook and no settings below on-action.
+    expect(run.turns[0]!.args).not.toContain("--settings");
+    expect(run.calls.some(call => call.input?.includes("SHAREDNET_ENV_DIR"))).toBe(false);
+    expect(JSON.parse(await readFile(join(run.out, "episode.json"), "utf8")).modules.environment).toEqual({ push: "on-wake", audience: "affected" });
+  });
+
+  it("on-action: an idle seat is told by an [env] line that wakes it alone, and a Claude Code seat's turn runs with the hook", async () => {
+    const run = await scenario("on-action", async ({ posts }) => {
+      await until(() => posts.length > 0);
+      return { wake_id: "wk_one", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: posts[0]!.content, sender: { member_id: "sni_owner-seat", name: "runner" } }] };
+    });
+    expect(run.posts).toHaveLength(1);
+    expect(run.posts[0]).toMatchObject({ as: "runner" });
+    expect(run.posts[0]!.content).toMatch(/^@claude-code-1 \[env\] src\/a\.c changed \d+ s ago, by claude-code-2; you last had it in turn 1$/);
+    expect(run.turns.at(-1)!.args.at(-1)).toContain("runner: @claude-code-1 [env] src/a.c changed");
+    // The line named seat 1: seat 2 had it in its wake and took no turn for it.
+    const routing = (await readFile(join(run.out, "routing.ndjson"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    expect(routing.find(record => record.seat === "claude-code-2")).toMatchObject({ delivered: [], skipped: [2], model_wake: false });
+    expect(run.calls.filter(call => call.args.includes("claude") && !call.args.includes(run.seat1))).toHaveLength(1);
+    expect(run.log.find(record => record.event === "delivered")).toMatchObject({ seat: "claude-code-1", how: "post" });
+    // The hook is in each Claude Code seat's container, and its turns run with it.
+    expect(run.calls.filter(call => call.input?.includes("SHAREDNET_ENV_DIR") && call.args.join(" ").includes("/usr/local/lib/sharednet-env-hook.cjs"))).toHaveLength(2);
+    const settings = JSON.parse(run.turns[0]!.args[run.turns[0]!.args.indexOf("--settings") + 1]!);
+    expect(Object.keys(settings.hooks)).toEqual(["PreToolUse", "PostToolUse"]);
+    expect(run.turns[0]!.args).toContain("SHAREDNET_ENV_DIR=/tmp/sharednet-env");
   });
 });
