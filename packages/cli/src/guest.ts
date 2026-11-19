@@ -7,6 +7,8 @@ import { ApiClient, resolveBaseUrl, sameOrigin } from "./api-client.ts";
 import { compiledPrompt, type CompiledState } from "./compiled.ts";
 import { clearPendingReply, readPendingReply, writePendingReply, type PendingReply } from "./reply-outbox.ts";
 import { claimTask, controlEvent, controlPaths, latestForeignTaskSequence, noteRead, noteTasks, noteTasksSeen, pendingMentions, projectTasks, readMark, readThrough, recentTasks, taskMessage, withControlLock, type BoardMessage } from "./board-controls.ts";
+import { isDirected, sbarMissing, sbarRefusal } from "./modules/protocol.ts";
+import { closestHeldTask, duplicateRefusal } from "./modules/state.ts";
 import { accountCredentialFrom, withCredentialLock } from "./login.ts";
 import { CliError, localError } from "./errors.ts";
 import { computeLocalInstanceKey } from "./instance-computation.ts";
@@ -138,7 +140,7 @@ const INVITE_TOKEN_PATTERN = /^rit_[A-Za-z0-9_-]{43}$/;
 /** The server caps one wait at this; the client loops. */
 const WAIT_MAX_SECONDS = 25;
 
-const VALUE_OPTIONS = new Set(["name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume", "config-dir"]);
+const VALUE_OPTIONS = new Set(["distinct", "name", "token", "timeout", "reply-to", "min", "on", "run", "max-runs", "max-failures", "as", "claim", "agent", "runtime", "after", "before", "limit", "order", "last", "from-instance", "from-agent", "grep", "memo", "out", "rooms", "ack", "log", "settle", "check-every", "push", "listen", "data", "work", "file", "command", "resume", "config-dir"]);
 /** Options that may be given more than once; every value is kept, in order. */
 const REPEATABLE_OPTIONS = new Set(["on", "artifact"]);
 const FLAG_OPTIONS = new Set(["hook", "private", "reply", "room", "force", "status", "stop", "no-wake", "switch-account", "install", "uninstall", "service"]);
@@ -1066,6 +1068,11 @@ async function say(args: string[], dependencies: GuestDependencies): Promise<unk
   if (parsed.positionals.length !== 1 || !parsed.positionals[0]!.trim()) {
     throw localError("invalid_arguments", 'Usage: sharednet say "<message>" [--reply-to <msg_id>|none] [--as <member_id>]');
   }
+  // The protocol slot (modules/protocol.ts): under SBAR, a message to a named teammate is a handoff.
+  if (dependencies.env.SHAREDNET_MESSAGE_SCHEMA === "sbar" && isDirected(parsed.positionals[0]!)) {
+    const missing = sbarMissing(parsed.positionals[0]!);
+    if (missing.length > 0) throw localError("sbar_required", sbarRefusal(missing));
+  }
   const option = stringOption(parsed, "reply-to");
   if (option !== undefined && option !== "none" && !/^msg_[A-Za-z0-9]{10}$/.test(option)) {
     throw localError("invalid_reply_to", "--reply-to must be a message id such as msg_AbCdEfGhIj, or none.");
@@ -1137,10 +1144,11 @@ function taskReviewCount(env: GuestDependencies["env"]): number {
 
 async function task(args: string[], dependencies: GuestDependencies): Promise<unknown> {
   const parsed = parseGuestArguments(args);
-  assertOnlyOptions(parsed, ["as"]);
+  assertOnlyOptions(parsed, ["as", "distinct"]);
   const [action, title] = parsed.positionals;
+  const distinct = stringOption(parsed, "distinct");
   if (!(["claim", "done"].includes(action ?? "") && parsed.positionals.length === 2) && !(action === "list" && parsed.positionals.length === 1)) {
-    throw localError("invalid_arguments", 'Usage: sharednet task claim "<title>" | done "<title>" | list');
+    throw localError("invalid_arguments", 'Usage: sharednet task claim "<title>" [--distinct "<how yours differs>"] | done "<title>" | list');
   }
   const { client, state, credential } = await currentSeat(dependencies, stringOption(parsed, "as"));
   if (credential.room_type === "compiled") throw localError("invalid_room_type", "Title tasks are for plain board Rooms; compiled Rooms use acts.");
@@ -1173,6 +1181,15 @@ async function task(args: string[], dependencies: GuestDependencies): Promise<un
         await noteTasksSeen(paths, latest);
         throw localError("review_tasks", "Nothing was claimed. Compare your title with these recent tasks, newest first. If your work is the same as one of them, do not claim it: pick other work, or coordinate with its owner. Otherwise run the same claim again.\n" + JSON.stringify(recent));
       }
+      // The state slot (modules/state.ts): a title close to a task someone else holds is refused, once.
+      if (dependencies.env.SHAREDNET_TASK_JUDGE === "lexical" && distinct === undefined) {
+        const held = closestHeldTask(title!, projectTasks(history.length ? history : await list()), state.member_id);
+        if (held) {
+          await controlEvent(paths, { kind: "claim_judged_duplicate", title: title!, like: held.task.title, owner: held.task.owner_name ?? held.task.owner, overlap: held.overlap });
+          throw localError("similar_task", duplicateRefusal(title!, held));
+        }
+      }
+      if (distinct !== undefined) await controlEvent(paths, { kind: "claim_distinct", title: title!, how: distinct });
       try {
         const claimed = await claimTask({ list, post }, state.member_id, title!);
         const tasks = projectTasks(history);

@@ -347,6 +347,19 @@ describe("reach: forming a group from the account CLI", () => {
     }
   });
 
+  it("keeps named tools from Claude Code seats and refuses the list for a run without one, before anything is sent", async () => {
+    const codexOnly = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--disallow-tools", "ScheduleWakeup"], []);
+    expect(codexOnly.exitCode).not.toBe(0);
+    expect(codexOnly.stderr.join(" ")).toContain("--disallow-tools is for Claude Code seats");
+    expect(codexOnly.requests).toEqual([]);
+    const badName = await harness(["goal", "run", "TASK.md", "--agent", "claude-code", "--until", "after: 1h", "--disallow-tools", "Schedule Wakeup"], []);
+    expect(badName.stderr.join(" ")).toContain("--disallow-tools is a comma-separated list");
+    expect(badName.requests).toEqual([]);
+    // Accepted, the run goes on to the goal file, which does not exist.
+    const taken = await harness(["goal", "run", "no-such-goal-file.md", "--agent", "claude-code", "--until", "after: 1h", "--disallow-tools", "ScheduleWakeup,CronCreate"], []);
+    expect(taken.stderr.join(" ")).not.toContain("--disallow-tools");
+  });
+
   it("refuses a goal run whose turn limit is shorter than a minute, before anything is sent", async () => {
     const refused = await harness(["goal", "run", "TASK.md", "--agent", "codex", "--until", "after: 1h", "--turn-limit", "30s"], []);
     expect(refused.exitCode).not.toBe(0);

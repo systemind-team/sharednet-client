@@ -5421,3 +5421,51 @@ describe("seats that resume one session take turns", () => {
     expect(await inTurnOrder("k", "b", () => undefined, async () => "next")).toBe("next");
   });
 });
+
+describe("module slots inside a seat", () => {
+  async function joinedSpace() {
+    const space = await workspace();
+    const result = await run(["join", PASTED_INVITE], space, [joined([message(1, "Welcome")])]);
+    expect(result.exitCode).toBe(0);
+    return space;
+  }
+
+  it("state: a claim close to a task someone else holds is refused once, and --distinct claims it", async () => {
+    const space = await joinedSpace();
+    const { taskMessage } = await import("./board-controls.ts");
+    const judge = { SHAREDNET_TASK_JUDGE: "lexical" };
+    const theirs = { ...message(2, taskMessage("claim", "static info replay: -version -formats")), sender: { member_id: "i_Other00001", kind: "guest", name: "codex-3" } };
+    // The first look shows the teammate's task, as without the judge.
+    const reviewed = await run(["task", "claim", "replay of -formats and -version static info", "--json"], space, [page([theirs])], judge);
+    expect(reviewed.stderr).toContain("review_tasks");
+    // The repeated claim is judged: same work, so nothing is posted.
+    const judged = await run(["task", "claim", "replay of -formats and -version static info", "--json"], space, [page([theirs])], judge);
+    expect(judged.exitCode).toBe(2);
+    expect(judged.stderr).toContain("similar_task");
+    expect(judged.stderr).toContain("codex-3");
+    expect(judged.requests.every(r => r.init.method === "GET")).toBe(true);
+    const mine = own(3, taskMessage("claim", "replay of -formats and -version static info"));
+    const distinct = await run(["task", "claim", "replay of -formats and -version static info", "--distinct", "the -h topic pages, not the lists", "--json"], space, [page([theirs]), page([theirs]), { body: { message: mine } }, page([theirs, mine])], judge);
+    expect(distinct.exitCode).toBe(0);
+    // Without the judge the same claim goes through, as before.
+    const plainSpace = await joinedSpace();
+    await run(["task", "claim", "replay of -formats and -version static info", "--json"], plainSpace, [page([theirs])]);
+    const plain = await run(["task", "claim", "replay of -formats and -version static info", "--json"], plainSpace, [page([theirs]), page([theirs]), { body: { message: mine } }, page([theirs, mine])]);
+    expect(plain.exitCode).toBe(0);
+  });
+
+  it("protocol: under SBAR a handoff without its four parts is refused before anything is posted", async () => {
+    const space = await joinedSpace();
+    const sbar = { SHAREDNET_MESSAGE_SCHEMA: "sbar" };
+    const refused = await run(["say", "@codex-3 please review my branch", "--json"], space, [], sbar);
+    expect(refused.exitCode).toBe(2);
+    expect(refused.stderr).toContain("sbar_required");
+    expect(refused.requests).toHaveLength(0);
+    const handoff = "@codex-3 S: wav path done | B: commit 1a2b in candidates/claude-code/repo | A: matches the reference on both assets | R: fetch it and run the difftest";
+    const posted = await run(["say", handoff, "--json"], space, [{ status: 201, body: { message: { ...message(2, handoff, "claude-code"), sender: { member_id: MEMBER_ID, kind: "guest", name: "claude-code" } } } }], sbar);
+    expect(posted.exitCode).toBe(0);
+    // Free text and @all stay free.
+    const free = await run(["say", "@all wav path is done", "--json"], space, [{ status: 201, body: { message: { ...message(3, "@all wav path is done", "claude-code"), sender: { member_id: MEMBER_ID, kind: "guest", name: "claude-code" } } } }], sbar);
+    expect(free.exitCode).toBe(0);
+  });
+});
