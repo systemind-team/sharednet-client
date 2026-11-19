@@ -1129,3 +1129,72 @@ describe("scrubHome", () => {
     expect(await readFile(join(home, ".claude", "projects", "w", "s.jsonl"), "utf8")).toBe("{}\n");
   });
 });
+
+describe("module slots in a run", () => {
+  it("filters wakes by island, adds requests and the activity view, posts a probe, and records the modules", async () => {
+    const out = await temporary();
+    const workspace = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents(["claude-code", "claude-code"]),
+      workspace,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: null,
+      claudeAuth: "ANTHROPIC_API_KEY",
+    };
+    const seat1 = containerName(ROOM, "claude-code-1");
+    const waits: Record<string, number> = {};
+    const from2 = (sequence: number, content: string) => ({ sequence, content, sender: { member_id: "i_ClaudeTwo02", name: "claude-code-2" } });
+    const { docker, calls } = fakeDocker((call, command) => {
+      const mine = call.args.includes(seat1);
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: mine ? "i_ClaudeOne01" : "i_ClaudeTwo02" }) };
+      if (command[0] === "sharednet" && command[1] === "task") return { stdout: JSON.stringify({ tasks: [{ key: "wav", title: "WAV core", owner: "i_ClaudeTwo02", owner_name: "claude-code-2", status: "claimed", claim_sequence: 2 }] }) };
+      if (command[0] === "sharednet" && command[1] === "wait") {
+        const n = (waits[mine ? "1" : "2"] = (waits[mine ? "1" : "2"] ?? 0) + 1);
+        if (mine && n === 1) return { stdout: JSON.stringify({ wake_id: "wk_one", fired: ["message"], from: 1, through: 2, events: [], messages: [from2(2, "chatter in island two")] }) };
+        if (mine && n === 2) return { stdout: JSON.stringify({ wake_id: "wk_two", fired: ["message"], from: 2, through: 3, events: [], messages: [from2(3, "@claude-code-1 S: wav done | B: 1a2b | A: matches | R: fetch it and run the difftest")] }) };
+        return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 3, through: 3, events: [{ kind: "closed" }], messages: [] }) };
+      }
+      if (command[0] === "sh" && command[2] === "python3 probe.py") return { stdout: "2 differences: -buildconf exits 1\n" };
+      return {};
+    });
+    const posts: unknown[] = [];
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) {
+          // The goal's clock runs out once both seats have had their turns.
+          const over = calls.filter(call => call.args.includes("claude")).length >= 3;
+          return { room: { id: ROOM, state: over ? "closed" : "open", goal: over ? { ...goal, ended_by: { trigger: "after 2h", at: new Date(tick).toISOString() } } : goal }, memberships: [] };
+        }
+        if (method === "POST" && path === `/rooms/${ROOM}/owner-messages`) { posts.push(body); return { message: {} }; }
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: new Date(tick).toISOString() } } } };
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    await runGoal(
+      client,
+      "sni_owner-seat",
+      OWNER_KEY,
+      {
+        plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, messageRouting: "mentions-only",
+        modules: { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "python3 probe.py", everyMs: 60_000 } },
+      },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
+    );
+    // The line from the other island that names nobody woke nobody; the handoff that names the seat crossed.
+    const routing = (await readFile(join(out, "routing.ndjson"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    expect(routing.find(r => r.seat === "claude-code-1" && r.wake_id === "wk_one")).toMatchObject({ delivered: [], skipped: [2] });
+    const turns = calls.filter(call => call.args.includes(seat1) && call.args.includes("claude"));
+    const woken = turns.at(-1)!.args.at(-1)!;
+    expect(woken).toContain("#3 claude-code-2: @claude-code-1 S: wav done");
+    expect(woken).toContain("Asked of you (the R: part of each handoff to you):\n- #3 claude-code-2 asks: fetch it and run the difftest");
+    expect(woken).toContain('- claude-code-2: idle; holds "WAV core"');
+    expect(turns[0]!.args.at(-1)).toContain("Yours is island 1, where you are alone.");
+    expect(turns[0]!.args).toContain("SHAREDNET_MESSAGE_SCHEMA=sbar");
+    expect(turns[0]!.args).toContain("SHAREDNET_TASK_JUDGE=lexical");
+    expect(posts).toContainEqual({ content: "@all [probe] 2 differences: -buildconf exits 1", as: "runner" });
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).modules).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "python3 probe.py", every_ms: 60_000 } });
+  });
+});
