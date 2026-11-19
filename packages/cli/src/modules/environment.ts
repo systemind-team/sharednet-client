@@ -4,10 +4,13 @@
  *
  * The runner does all of it, with no model behind it:
  *
- *   observe   a scan of the workspace every few seconds finds files that changed, appeared or went
- *   attribute a change is by the seat whose turn showed an edit of that file, or else by the one
- *             seat that was in a turn; with several in a turn and no edit seen, the author is unknown
- *   interest  a seat's files are the workspace paths its turns have mentioned, as input or output
+ *   observe   a scan of the workspace every few seconds finds files that changed, appeared or went,
+ *             and the time each was written
+ *   interest  a seat's files are the workspace paths its turns have named, in a command or in what
+ *             a command printed, read from where the seat's shell was standing at the time
+ *   attribute a change is by the seat that had a command running when the file was written; with
+ *             several running, by the one whose command named the file; otherwise the author is
+ *             unknown and the note names the seats that were working
  *   push      a seat is told about a change, by someone else, to a file it has an interest in
  *             (`--env-audience affected`) or to any file (`all`)
  *
@@ -15,18 +18,20 @@
  *
  *   on-wake    with its next wake, whatever caused the wake
  *   on-event   also by an `[env]` line that names it, which wakes it when it is idle
- *   on-action  also inside its turn (Claude Code seats): an edit to a file that changed under it
+ *   on-action  also inside its turn (Claude Code seats): a write to a file that changed under it
  *              is held once, and other changes arrive after its next tool call
  *
  * Off by default. Every change and every delivery is logged in `environment.ndjson`.
  */
 import { readdir, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { localError } from "../errors.ts";
 
 export type EnvPush = "off" | "on-wake" | "on-event" | "on-action";
 export type EnvAudience = "affected" | "all";
-export interface EnvironmentModule { push: EnvPush; audience: EnvAudience }
+/** A folder the environment watches besides the workspace: where it is on this machine, and where the seats see it. */
+export interface WatchRoot { host: string; mount: string }
+export interface EnvironmentModule { push: EnvPush; audience: EnvAudience; watch: WatchRoot[] }
 
 export const ENV_MARK = "[env]";
 export const ENV_HELP = `The workspace itself tells you when a file you have read or changed is changed by someone else: with a wake, or in a line that starts with ${ENV_MARK}, or inside your turn. No model writes these; they come from the files. When one names a file you rely on, look at the file again before you build on what you remember of it.`;
@@ -44,12 +49,25 @@ export function parseEnvAudience(raw: string | undefined, push: EnvPush): EnvAud
   throw localError("invalid_arguments", "--env-audience is affected or all.");
 }
 
+/** `--env-watch <folder>:<path in the containers>`, for a folder that is mounted into the seats beside the workspace. */
+export function parseEnvWatch(raw: readonly string[], push: EnvPush): WatchRoot[] {
+  if (raw.length > 0 && push === "off") throw localError("invalid_arguments", "--env-watch needs --env-push.");
+  return raw.map((item) => {
+    const cut = item.lastIndexOf(":/");
+    const host = cut === -1 ? "" : item.slice(0, cut);
+    const mount = cut === -1 ? "" : item.slice(cut + 1).replace(/\/+$/, "");
+    if (!host || !mount) throw localError("invalid_arguments", "--env-watch is <folder>:<absolute path in the containers>, such as ./best:/workspace/best.");
+    return { host, mount };
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Observing the workspace
 
 export interface FileState { mtimeMs: number; size: number }
 export type Snapshot = Map<string, FileState>;
-export interface Change { path: string; kind: "changed" | "new" | "deleted" }
+/** A file that is not as it was at the last scan; `mtimeMs` is when it was written, for one that is still there. */
+export interface Change { path: string; kind: "changed" | "new" | "deleted"; mtimeMs?: number }
 
 const SKIPPED = new Set(["node_modules", "__pycache__", "target", "dist", "build"]);
 /** What a compiler leaves behind: it changes with every build and nobody reads it. */
@@ -76,12 +94,32 @@ export async function snapshot(root: string, limit = SNAPSHOT_LIMIT): Promise<Sn
   return files;
 }
 
+/** The name a file goes by: relative to the workspace when the seats see it there, else its whole path in the containers. */
+export function fileKey(mount: string, relative: string, workspace = "/workspace"): string {
+  if (mount === workspace) return relative;
+  return mount.startsWith(`${workspace}/`) ? `${mount.slice(workspace.length + 1)}/${relative}` : `${mount}/${relative}`;
+}
+
+/** Where the seats see a file. */
+export function containerPath(key: string, workspace = "/workspace"): string {
+  return key.startsWith("/") ? key : `${workspace}/${key}`;
+}
+
+/** One snapshot of every watched folder, each file under the name the seats know it by. */
+export async function snapshotRoots(roots: readonly WatchRoot[], limit = SNAPSHOT_LIMIT): Promise<Snapshot> {
+  const all: Snapshot = new Map();
+  for (const root of roots) {
+    for (const [relative, state] of await snapshot(root.host, limit - all.size)) all.set(fileKey(root.mount, relative), state);
+  }
+  return all;
+}
+
 export function diffSnapshots(before: Snapshot, after: Snapshot): Change[] {
   const changes: Change[] = [];
   for (const [path, now] of after) {
     const was = before.get(path);
-    if (!was) changes.push({ path, kind: "new" });
-    else if (was.mtimeMs !== now.mtimeMs || was.size !== now.size) changes.push({ path, kind: "changed" });
+    if (!was) changes.push({ path, kind: "new", mtimeMs: now.mtimeMs });
+    else if (was.mtimeMs !== now.mtimeMs || was.size !== now.size) changes.push({ path, kind: "changed", mtimeMs: now.mtimeMs });
   }
   for (const path of before.keys()) if (!after.has(path)) changes.push({ path, kind: "deleted" });
   return changes.sort((a, b) => a.path.localeCompare(b.path));
@@ -121,7 +159,7 @@ export function endings(known: Iterable<string>): Map<string, string | null> {
 }
 
 /** The known workspace files one line of a turn's record mentions. */
-export function pathsIn(raw: string, known: ReadonlySet<string>, mount = "/workspace", byEnding?: ReadonlyMap<string, string | null>): string[] {
+export function pathsIn(raw: string, known: ReadonlySet<string>, mount = "/workspace", byEnding?: ReadonlyMap<string, string | null>, cwd?: string): string[] {
   const found = new Set<string>();
   // A record is JSON: a line break inside a string is written \n, which would run into the next word.
   const line = raw.replace(/\\[nrt]/g, " ");
@@ -130,7 +168,9 @@ export function pathsIn(raw: string, known: ReadonlySet<string>, mount = "/works
     const at = match.index;
     const absolute = at > 0 && line[at - 1] === "/" ? `/${token}` : token;
     let hit: string | null = null;
-    for (const candidate of [workspacePath(absolute, mount), workspacePath(token, mount)]) {
+    // As written from the root of the file system, from where the seat's shell stands, or from the workspace.
+    const fromCwd = cwd && absolute === token ? [workspacePath(posix.normalize(posix.join(cwd, workspacePath(token, mount))), mount)] : [];
+    for (const candidate of [workspacePath(absolute, mount), ...fromCwd, workspacePath(token, mount)]) {
       if (known.has(candidate)) { hit = candidate; break; }
     }
     // Written from a folder inside the workspace: the one known file that ends this way.
@@ -148,6 +188,49 @@ export function editsIn(line: string, mount = "/workspace"): string[] {
   return [...found];
 }
 
+/** What one line of a turn's record means to the environment. */
+export interface LineReading {
+  /** The tool calls this line starts, each as its text: a command, or a tool's input. */
+  starts: string[];
+  /** The line carries a tool's result: the calls in flight are over. */
+  ends: boolean;
+  /** Each command starts in the session's folder again (Codex); Claude Code's shell stays where the last one left it. */
+  fresh: boolean;
+}
+
+const QUIET: LineReading = Object.freeze({ starts: Object.freeze([]) as unknown as string[], ends: false, fresh: false });
+
+/** Reads a line of Claude Code's or Codex's turn record; any other line starts and ends nothing. */
+export function readLine(line: string): LineReading {
+  if (!line.startsWith("{")) return QUIET;
+  let record: { type?: string; message?: { content?: unknown }; item?: { type?: string; command?: unknown } };
+  try { record = JSON.parse(line); } catch { return QUIET; }
+  const content = Array.isArray(record.message?.content) ? (record.message!.content as Array<{ type?: string; name?: string; input?: { command?: unknown } }>) : [];
+  if (record.type === "assistant") {
+    const starts = content.filter((part) => part?.type === "tool_use").map((part) => (typeof part.input?.command === "string" ? part.input.command : JSON.stringify(part.input ?? {})));
+    return starts.length > 0 ? { starts, ends: false, fresh: false } : QUIET;
+  }
+  if (record.type === "user") return content.some((part) => part?.type === "tool_result") ? { starts: [], ends: true, fresh: false } : QUIET;
+  if (record.type === "item.started" && typeof record.item?.command === "string") return { starts: [record.item.command], ends: false, fresh: true };
+  if (record.type === "item.completed" && record.item?.type !== "agent_message" && record.item?.type !== "reasoning") return { starts: [], ends: true, fresh: true };
+  return QUIET;
+}
+
+const CD = /(?:^|&&|\|\||;|\n|\(|\{)\s*cd\s+(?:--\s+)?(?:"([^"\n]+)"|'([^'\n]+)'|([^\s;&|)<>]+))/g;
+
+/** Where a shell stands after a command, from where it stood: each `cd` in the command, read before any here-document. */
+export function folderAfter(cwd: string, command: string): string {
+  const heredoc = command.indexOf("<<");
+  let now = cwd;
+  for (const match of (heredoc === -1 ? command : command.slice(0, heredoc)).matchAll(CD)) {
+    const target = match[1] ?? match[2] ?? match[3]!;
+    if (target === "-" || target.startsWith("~") || /[$`*?]/.test(target)) continue;
+    now = posix.normalize(target.startsWith("/") ? target : posix.join(now, target));
+    if (now.length > 1 && now.endsWith("/")) now = now.slice(0, -1);
+  }
+  return now;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The environment's own state
 
@@ -156,11 +239,11 @@ export interface Note {
   seat: string;
   path: string;
   kind: Change["kind"];
-  /** The author, or null when several seats were in a turn and none showed an edit. */
+  /** The author, or null when it cannot be told apart from the other seats that were working. */
   by: string | null;
   candidates: string[];
   at: number;
-  /** Why this seat: it edited the file, it only read it, or the audience is everyone. */
+  /** Why this seat: it changed the file itself earlier, it only read it, or the audience is everyone. */
   interest: "edited" | "read" | "all";
   seenTurn: number | null;
 }
@@ -173,22 +256,33 @@ export interface EnvironmentOptions {
   repeatMs?: number;
   /** How far back a seat's own mention of a file counts as its own change, when the author is unknown. */
   ownMs?: number;
+  /** A file a seat only read stops being its concern after this many of its turns without naming it. */
+  interestTurns?: number;
+  /** Where the seats see the workspace, and where each seat's shell starts. */
+  mount?: string;
 }
 
 interface Seen { at: number; turn: number; edited: number | null }
+interface Span { start: number; end: number | null }
+interface Call extends Span { paths: Set<string> }
+interface SeatState { seen: Map<string, Seen>; pending: Map<string, Note>; calls: Call[]; turns: Span[]; turn: number; cwd: string }
 
-/** More known files than this on one line of a turn's record make it a listing. */
+/** More known files than this in what a command printed make it a listing, not a reading of each. */
 export const LISTING = 8;
+/** How far a file's written time and a command's times, taken on two clocks' readings, may be apart. */
+export const CLOCK_SLACK_MS = 2_000;
+const KEPT_CALLS = 400;
 
 export class Environment {
-  private readonly seen = new Map<string, Map<string, Seen>>();
-  private readonly pending = new Map<string, Map<string, Note>>();
+  private readonly state = new Map<string, SeatState>();
   private readonly told = new Map<string, number>();
   private known = new Set<string>();
   private byEnding = new Map<string, string | null>();
   private serial = 0;
   private readonly repeatMs: number;
   private readonly ownMs: number;
+  private readonly interestTurns: number;
+  private readonly mount: string;
   private readonly seats: readonly string[];
   private readonly options: EnvironmentOptions;
 
@@ -197,7 +291,9 @@ export class Environment {
     this.options = options;
     this.repeatMs = options.repeatMs ?? 60_000;
     this.ownMs = options.ownMs ?? 20_000;
-    for (const seat of seats) { this.seen.set(seat, new Map()); this.pending.set(seat, new Map()); }
+    this.interestTurns = options.interestTurns ?? 6;
+    this.mount = options.mount ?? "/workspace";
+    for (const seat of seats) this.state.set(seat, { seen: new Map(), pending: new Map(), calls: [], turns: [], turn: 0, cwd: this.mount });
   }
 
   /** The files the workspace holds now; a seat's interest is counted only in these. */
@@ -206,44 +302,88 @@ export class Environment {
     this.byEnding = endings(this.known);
   }
 
-  /** One line of a seat's turn record: the files it mentions, and the ones it edits. */
-  sawLine(seat: string, turn: number, line: string, at: number): void {
-    const mine = this.seen.get(seat);
+  /** A seat's turn begins: it is working from now on. */
+  turnStarted(seat: string, turn: number, at: number): void {
+    const mine = this.state.get(seat);
     if (!mine) return;
-    const edits = new Set(editsIn(line));
-    // A line that names many files is a listing or a search, not a reading of each of them.
-    const mentioned = pathsIn(line, this.known, "/workspace", this.byEnding);
-    for (const path of new Set([...(mentioned.length > LISTING ? [] : mentioned), ...edits])) {
-      const before = mine.get(path);
-      mine.set(path, { at, turn, edited: edits.has(path) ? at : before?.edited ?? null });
+    mine.turn = Math.max(mine.turn, turn);
+    if (mine.turns.at(-1)?.end !== null) mine.turns.push({ start: at, end: null });
+  }
+
+  /** A seat's turn is over, and so is any command it left without a result. */
+  turnEnded(seat: string, at: number): void {
+    const mine = this.state.get(seat);
+    if (!mine) return;
+    for (const span of [...mine.turns, ...mine.calls]) if (span.end === null) span.end = at;
+  }
+
+  /** One line of a seat's turn record: the commands it starts or ends, and the files it names. */
+  sawLine(seat: string, turn: number, line: string, at: number): void {
+    const mine = this.state.get(seat);
+    if (!mine) return;
+    this.turnStarted(seat, turn, at);
+    const reading = readLine(line);
+    if (reading.ends) for (const call of mine.calls) if (call.end === null) call.end = at;
+    const named = new Set<string>();
+    for (const command of reading.starts) {
+      // A file is named from where the shell stands once the command's own `cd`s have run.
+      const cwd = folderAfter(reading.fresh ? this.mount : mine.cwd, command);
+      if (!reading.fresh) mine.cwd = cwd;
+      const paths = new Set(pathsIn(command, this.known, this.mount, this.byEnding, cwd));
+      mine.calls.push({ start: at, end: null, paths });
+      for (const path of paths) named.add(path);
+    }
+    if (mine.calls.length > KEPT_CALLS) mine.calls.splice(0, mine.calls.length - KEPT_CALLS);
+    const edits = new Set(editsIn(line, this.mount));
+    if (reading.starts.length === 0) {
+      // What a command printed, or a line of another kind: many files on it are a listing.
+      const mentioned = pathsIn(line, this.known, this.mount, this.byEnding, mine.cwd);
+      if (mentioned.length <= LISTING) for (const path of mentioned) named.add(path);
+    }
+    for (const path of new Set([...named, ...edits])) {
+      const before = mine.seen.get(path);
+      mine.seen.set(path, { at, turn, edited: edits.has(path) ? at : before?.edited ?? null });
     }
   }
 
   /** The files a seat has an interest in, with the turn that last showed each. */
   interest(seat: string): Array<{ path: string; turn: number; edited: boolean }> {
-    return [...(this.seen.get(seat) ?? [])].map(([path, seen]) => ({ path, turn: seen.turn, edited: seen.edited !== null }));
+    return [...(this.state.get(seat)?.seen ?? [])].map(([path, seen]) => ({ path, turn: seen.turn, edited: seen.edited !== null }));
   }
 
-  /** Changes found by a scan: who made each, and who is told. Returns the notes this adds. */
-  observe(changes: readonly Change[], busy: ReadonlySet<string>, since: number, at: number): Note[] {
+  /** Where a seat's shell stands, as far as its commands have shown. */
+  folder(seat: string): string | null { return this.state.get(seat)?.cwd ?? null; }
+
+  /** Changes found by a scan, since the scan before it: who made each, and who is told. Returns the notes this adds. */
+  observe(changes: readonly Change[], since: number, at: number): Note[] {
     const added: Note[] = [];
     for (const change of changes) {
-      const editors = this.seats.filter((seat) => {
-        const edited = this.seen.get(seat)?.get(change.path)?.edited ?? null;
-        return edited !== null && edited >= since - this.ownMs;
-      });
-      const candidates = editors.length > 0 ? editors : this.seats.filter((seat) => busy.has(seat));
+      // When the file was written; one that is gone went at some time since the last scan.
+      const from = (change.mtimeMs ?? since) - CLOCK_SLACK_MS;
+      const to = (change.mtimeMs ?? at) + CLOCK_SLACK_MS;
+      const then = (span: Span) => span.start <= to && (span.end ?? Number.POSITIVE_INFINITY) >= from;
+      const having = (pick: (state: SeatState) => boolean) => this.seats.filter((seat) => pick(this.state.get(seat)!));
+      const naming = having((state) => state.calls.some((call) => then(call) && call.paths.has(change.path)));
+      const running = having((state) => state.calls.some(then));
+      const working = having((state) => state.turns.some(then));
+      const candidates = naming.length > 0 ? naming : running.length > 0 ? running : working;
       const by = candidates.length === 1 ? candidates[0]! : null;
+      if (by !== null) {
+        // The author has made the file its own: it is told when someone else changes it later.
+        const own = this.state.get(by)!;
+        own.seen.set(change.path, { at: own.seen.get(change.path)?.at ?? at, turn: own.seen.get(change.path)?.turn ?? own.turn, edited: change.mtimeMs ?? at });
+      }
       for (const seat of this.seats) {
         if (seat === by) continue;
-        const seen = this.seen.get(seat)!.get(change.path);
-        // With the author unknown, a seat that was just working with the file is taken to be the author.
-        if (by === null && candidates.includes(seat) && seen && seen.at >= since - this.ownMs) continue;
-        if (this.options.audience === "affected" && !seen) continue;
+        const mine = this.state.get(seat)!;
+        const seen = mine.seen.get(change.path);
+        // With the author unknown, a seat whose command named the file, or that was just working with it, is taken to be the author.
+        if (by === null && candidates.includes(seat) && (naming.includes(seat) || (seen !== undefined && seen.at >= from - this.ownMs))) continue;
+        const interested = seen !== undefined && (seen.edited !== null || mine.turn - seen.turn <= this.interestTurns);
+        if (this.options.audience === "affected" && !interested) continue;
         const last = this.told.get(`${seat}\n${change.path}`);
         if (last !== undefined && at - last < this.repeatMs) continue;
-        const queue = this.pending.get(seat)!;
-        const earlier = queue.get(change.path);
+        const earlier = mine.pending.get(change.path);
         const note: Note = {
           id: earlier?.id ?? `n${(this.serial += 1)}`,
           seat,
@@ -251,11 +391,11 @@ export class Environment {
           kind: change.kind,
           by: earlier && earlier.by !== by ? null : by,
           candidates: [...new Set([...(earlier?.candidates ?? []), ...candidates])].filter((name) => name !== seat),
-          at,
-          interest: seen ? (seen.edited !== null ? "edited" : "read") : "all",
-          seenTurn: seen?.turn ?? null,
+          at: change.mtimeMs ?? at,
+          interest: interested ? (seen!.edited !== null ? "edited" : "read") : "all",
+          seenTurn: interested ? seen!.turn : null,
         };
-        queue.set(change.path, note);
+        mine.pending.set(change.path, note);
         if (!earlier) added.push(note);
       }
     }
@@ -264,12 +404,12 @@ export class Environment {
 
   /** What a seat has not been told yet, oldest first. */
   waiting(seat: string): Note[] {
-    return [...(this.pending.get(seat)?.values() ?? [])].sort((a, b) => a.at - b.at || a.path.localeCompare(b.path));
+    return [...(this.state.get(seat)?.pending.values() ?? [])].sort((a, b) => a.at - b.at || a.path.localeCompare(b.path));
   }
 
   /** The notes are with the seat now. */
   delivered(seat: string, ids: readonly string[], at: number): Note[] {
-    const queue = this.pending.get(seat);
+    const queue = this.state.get(seat)?.pending;
     if (!queue) return [];
     const gone: Note[] = [];
     for (const note of [...queue.values()]) {
@@ -290,7 +430,7 @@ const VERB = { changed: "changed", new: "is new", deleted: "was deleted" } as co
 
 /** One change, in one sentence, for the seat it goes to. With now left out, the age is the mark {ago}. */
 export function describeNote(note: Note, now: number | null): string {
-  const who = note.by ?? (note.candidates.length > 0 ? `${note.candidates.join(" or ")} (in a turn at the time)` : "no seat in a turn (a check, a probe, or something a seat left running)");
+  const who = note.by ?? (note.candidates.length > 0 ? `${note.candidates.join(" or ")} (working at the time)` : "no seat that was working (a check, a probe, or something a seat left running)");
   const mine = note.interest === "edited" ? `you edited it in turn ${note.seenTurn}` : note.interest === "read" ? `you last had it in turn ${note.seenTurn}` : null;
   return `${note.path} ${VERB[note.kind]} ${now === null ? "{ago}" : ago(now - note.at)}, by ${who}${mine ? `; ${mine}` : ""}`;
 }
@@ -321,7 +461,7 @@ export function envLineForAnother(content: string, seat: string): boolean {
 
 /** What the hook in a seat's container reads: the notes still waiting. The hook fills in each one's age when it gives it. */
 export function hookNotes(notes: readonly Note[], mount = "/workspace"): Array<{ id: string; file: string; at: number; text: string }> {
-  return notes.map((note) => ({ id: note.id, file: `${mount}/${note.path}`, at: note.at, text: describeNote(note, null) }));
+  return notes.map((note) => ({ id: note.id, file: containerPath(note.path, mount), at: note.at, text: describeNote(note, null) }));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -331,12 +471,14 @@ export const ENV_HOOK_DIR = "/tmp/sharednet-env";
 export const ENV_HOOK_PATH = "/usr/local/lib/sharednet-env-hook.cjs";
 
 /**
- * Claude Code runs this before and after each tool call. Before an edit to a file that changed
- * under the seat, it holds the edit once and says who changed the file. After any tool call, it
- * hands over the other changes waiting for the seat. Each note is given once.
+ * Claude Code runs this before and after each tool call. Before a write to a file that changed
+ * under the seat (an edit tool on it, or a shell command that names it and writes), it holds the
+ * call once and says who changed the file. After any tool call, it hands over the other changes
+ * waiting for the seat. Each note is given once.
  */
 export const ENV_HOOK = String.raw`
 const fs = require('node:fs');
+const path = require('node:path').posix;
 const dir = process.env.SHAREDNET_ENV_DIR;
 if (!dir) process.exit(0);
 let input, pending;
@@ -349,13 +491,40 @@ const waiting = pending.filter((note) => !done.has(note.id)).map((note) => ({ ..
 if (waiting.length === 0) process.exit(0);
 const give = (notes, how) => fs.appendFileSync(dir + '/delivered.ndjson', notes.map((note) => JSON.stringify({ id: note.id, how, at: new Date().toISOString() }) + '\n').join(''));
 const event = input.hook_event_name;
-const target = input.tool_input && (input.tool_input.file_path || input.tool_input.notebook_path);
+const tool = input.tool_input || {};
+// A shell command writes when it redirects into a file, edits in place, moves or removes, or has git rewrite the tree.
+const WRITES = /(^|[^0-9&>])>{1,2}(?![&>])|\btee\b|\bsed\s+(-[A-Za-z]*i|--in-place)|\bperl\s+-[A-Za-z]*i|\b(mv|cp|rm|patch|truncate|install)\s|\bgit\s+(apply|am|checkout|restore|reset|stash|merge|rebase|pull|cherry-pick|revert|clean)\b/;
+const CD = /(?:^|&&|\|\||;|\n|\(|\{)\s*cd\s+(?:--\s+)?(?:"([^"\n]+)"|'([^'\n]+)'|([^\s;&|)<>]+))/g;
+function named(command, cwd) {
+  const heredoc = command.indexOf('<<');
+  let now = cwd;
+  for (const m of (heredoc === -1 ? command : command.slice(0, heredoc)).matchAll(CD)) {
+    const target = m[1] || m[2] || m[3];
+    if (target === '-' || target.startsWith('~') || /[$\x60*?]/.test(target)) continue;
+    now = path.normalize(target.startsWith('/') ? target : path.join(now, target));
+  }
+  const files = new Set();
+  for (const m of command.matchAll(/[A-Za-z0-9_@+.\/-]+/g)) {
+    const token = m[0].replace(/[.,:;]+$/, '');
+    if (!token) continue;
+    files.add(path.normalize(token.startsWith('/') ? token : path.join(now, token)));
+  }
+  return files;
+}
 if (event === 'PreToolUse') {
-  if (!['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(input.tool_name) || !target) process.exit(0);
-  const mine = waiting.filter((note) => note.file === target);
+  let mine = [];
+  let what = 'edit';
+  if (['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(input.tool_name)) {
+    const target = tool.file_path || tool.notebook_path;
+    mine = target ? waiting.filter((note) => note.file === target) : [];
+  } else if (input.tool_name === 'Bash' && typeof tool.command === 'string' && WRITES.test(tool.command)) {
+    const files = named(tool.command, typeof input.cwd === 'string' && input.cwd ? input.cwd : '/workspace');
+    mine = waiting.filter((note) => files.has(note.file));
+    what = 'command';
+  }
   if (mine.length === 0) process.exit(0);
   give(mine, 'held-edit');
-  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'SharedNet workspace: ' + mine.map((note) => note.text).join('; ') + '. This edit was held once and nothing was written. Read the file as it is now, then repeat or revise the edit.' } }));
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'SharedNet workspace: ' + mine.map((note) => note.text).join('; ') + '. This ' + what + ' was held once and nothing was written. Look at the file as it is now, then repeat or revise the ' + what + '.' } }));
   process.exit(0);
 }
 if (event === 'PostToolUse') {
@@ -370,6 +539,6 @@ export const ENV_SETTLE_MS = 15_000;
 export const ENV_POST_GAP_MS = 120_000;
 
 export const ENV_HOOKS = {
-  PreToolUse: [{ matcher: "Edit|Write|MultiEdit|NotebookEdit", hooks: [{ type: "command", command: `node ${ENV_HOOK_PATH}` }] }],
+  PreToolUse: [{ matcher: "Edit|Write|MultiEdit|NotebookEdit|Bash", hooks: [{ type: "command", command: `node ${ENV_HOOK_PATH}` }] }],
   PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: `node ${ENV_HOOK_PATH}` }] }],
 };

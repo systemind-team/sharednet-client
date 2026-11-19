@@ -30,7 +30,7 @@ before any of these options existed. A run records what it used in `episode.json
 | Delivery | which posts a resumed seat is given, and what else comes with them | everything new at the start of the turn; more on `sharednet read` | `--mention-gate`, `--topology`, `--activity-view` |
 | Board | what a post is, and what a seat may publish | plain posts | `--task-gate`, `--task-judge`, `--message-schema`, `--type compiled` |
 | Stop | when the run ends | the first `--until` trigger to fire | `--until`, `--check-every`, `--quiet-checks` |
-| Workspace | where work lands | one shared `/workspace` that every seat writes to | `--workspace` |
+| Workspace | where work lands, and what the workspace tells the seats | one shared `/workspace` that every seat writes to, and says nothing | `--workspace`, `--env-push`, `--env-audience`, `--env-watch` |
 
 Options marked new below came with the modules; the others were there before and are listed so
 that every option has one place.
@@ -103,9 +103,43 @@ out of the Room. The all-member and verifier stops of the report have no option 
 
 ### Workspace
 
-`--workspace` names the folder every seat shares. Nothing stands between a seat and that folder.
-A landing gate (a candidate is accepted only if a measure does not fall) is not in `goal run`
-yet; tools built on it add their own.
+`--workspace` names the folder every seat shares. Nothing stands between a seat and that folder,
+and by default nothing tells a seat that a file changed under it.
+
+- New: `--env-push on-wake|on-event|on-action` makes the workspace a participant. The runner
+  scans it every five seconds, with no model behind it. For each seat it keeps the files the
+  seat's turns have named, in a command or in what a command printed, read from the folder the
+  seat's shell was standing in (many files in one command's output are a listing, not a reading
+  of each). When a file a seat has an interest in is changed by someone else, the seat is told
+  which file, who changed it, and in which turn it last had the file. The author is the seat
+  that had a command running at the moment the file was written; with several running, the one
+  whose command named the file; otherwise the note names the seats that were working. A file a
+  seat only read stops being its concern after six of its turns; a file it changed stays its
+  own. The levels add up, each one a time at which the seat is told:
+  - `on-wake`: with its next wake, whatever caused the wake.
+  - `on-event`: also by a line from the runner, `@seat [env] …`, once the change has rested for
+    15 s. The line resumes that seat when it is idle and no other seat, whatever the routing, and
+    a seat gets at most one every two minutes.
+  - `on-action`: also inside a Claude Code seat's turn, through a hook. A write to a file that
+    changed under the seat (an edit tool on it, or a shell command that names it and redirects
+    into it, edits it in place, or has git rewrite it) is held once: nothing is written, and the
+    seat is told who changed the file. Other changes arrive after its next tool call. Seats of
+    other harnesses are told as with `on-event`.
+- `--env-audience all` tells every other seat about every change, new files included. The
+  default, `affected`, tells only the seats with an interest in the file.
+- `--env-watch <folder>:<path in the containers>` adds a folder that is mounted into the seats
+  beside the workspace. It can be given more than once.
+
+Every change and every delivery is logged in `environment.ndjson`: what changed, who was in a
+turn, who was told, and how (`wake`, `post`, `note`, `held-edit`). The option changes Delivery
+(what a seat is given) and Activation (an `[env]` line resumes an idle seat); it is listed here
+because the workspace is what speaks.
+
+Not yet: other layouts than one shared folder (a fork of the workspace that a seat merges back,
+or no shared folder at all and only a shared repository that each seat clones and lands into), a
+landing gate (a candidate is accepted only if a measure does not fall; tools built on `goal run`
+add their own), a note that says what a landing means for a seat's own copy, a model that says
+what a change means for the seat, and state that is not files.
 
 ## Presets
 
@@ -133,6 +167,7 @@ with `index.ts` holding their defaults, the run record and the environment a sea
 | `topology.ts` | `--topology` | Delivery |
 | `protocol.ts` | `--message-schema` | Board |
 | `information.ts` | `--probe` | Team |
+| `environment.ts` | `--env-push`, `--env-audience`, `--env-watch` | Workspace |
 
 ## Rules for adding an option
 

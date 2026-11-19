@@ -368,6 +368,9 @@ describe("reach: forming a group from the account CLI", () => {
     expect((await run("--env-audience", "all")).stderr.join(" ")).toContain("--env-audience needs --env-push");
     expect((await run("--env-push", "on-wake", "--env-audience", "some")).stderr.join(" ")).toContain("--env-audience is affected or all");
     expect((await run("--type", "compiled", "--env-push", "on-wake")).stderr.join(" ")).toContain("The module options are for plain board Rooms");
+    expect((await run("--env-watch", "best:/workspace/best")).stderr.join(" ")).toContain("--env-watch needs --env-push");
+    expect((await run("--env-push", "on-wake", "--env-watch", "best")).stderr.join(" ")).toContain("--env-watch is <folder>:<absolute path in the containers>");
+    expect((await run("--env-push", "on-wake", "--env-watch", "best:/workspace/best", "--env-watch", "notes:/notes")).stderr.join(" ")).not.toContain("--env-");
     // Accepted, the run goes on to the goal file, which does not exist.
     for (const push of ["off", "on-wake", "on-event", "on-action"]) {
       const taken = await run("--env-push", push, ...(push === "off" ? [] : ["--env-audience", "all"]));

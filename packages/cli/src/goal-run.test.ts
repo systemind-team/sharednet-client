@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -312,7 +312,7 @@ describe("a turn", () => {
 type DockerCall = { args: readonly string[]; env: Record<string, string>; input?: string };
 
 /** Docker as goal run uses it, answering from a script. */
-function fakeDocker(answer: (call: DockerCall, command: readonly string[]) => { code?: number; stdout?: string; stderr?: string; lines?: string[] } | Promise<{ code?: number; stdout?: string; stderr?: string; lines?: string[] }>) {
+function fakeDocker(answer: (call: DockerCall, command: readonly string[], emit: (line: string) => void) => { code?: number; stdout?: string; stderr?: string; lines?: string[] } | Promise<{ code?: number; stdout?: string; stderr?: string; lines?: string[] }>) {
   const calls: DockerCall[] = [];
   const docker: DockerRunner = async (args, options = {}) => {
     const call: DockerCall = { args, env: options.env ?? {}, ...(options.input === undefined ? {} : { input: options.input }) };
@@ -320,7 +320,8 @@ function fakeDocker(answer: (call: DockerCall, command: readonly string[]) => { 
     // Every container of the run is named for the Room: an Agent's adds its seat.
     const container = args.findIndex((arg) => arg.startsWith(containerName(ROOM)));
     const command = args[0] === "exec" && container !== -1 ? args.slice(container + 1) : [];
-    const result = await answer(call, command);
+    // `emit` hands a line over while the command still runs; `lines` hands the rest over when it ends.
+    const result = await answer(call, command, (line) => options.onLine?.(line));
     for (const line of result.lines ?? []) options.onLine?.(line);
     return { code: result.code ?? 0, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
   };
@@ -1239,16 +1240,21 @@ describe("the workspace as a participant", () => {
     const posts: Array<{ content: string }> = [];
     const waits: Record<string, number> = {};
     let oneRead = false;
-    const { docker, calls } = fakeDocker(async (call, command) => {
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    const done = JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: "ok" }] } });
+    const { docker, calls } = fakeDocker(async (call, command, emit) => {
       const mine = call.args.includes(seat1);
       if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: mine ? "i_ClaudeOne01" : "i_ClaudeTwo02" }) };
-      if (call.args.includes("claude") && mine) { oneRead = true; return { lines: [tool("Read", "src/a.c")] }; }
+      if (call.args.includes("claude") && mine) { oneRead = true; return { lines: [tool("Read", "src/a.c"), done] }; }
       if (call.args.includes("claude")) {
         // Seat 2 edits the file once seat 1's turn, which read it, is on record.
         await until(() => oneRead);
         await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+        // The edit is in flight around the write, and the file's time is the run's own clock's.
+        emit(tool("Edit", "src/a.c"));
         await writeFile(join(workspace, "src", "a.c"), "int a;\nint b;\n");
-        return { lines: [tool("Edit", "src/a.c")] };
+        await utimes(join(workspace, "src", "a.c"), new Date(tick), new Date(tick));
+        return { lines: [done] };
       }
       if (command[0] === "sharednet" && command[1] === "wait") {
         const n = (waits[mine ? "1" : "2"] = (waits[mine ? "1" : "2"] ?? 0) + 1);
@@ -1263,7 +1269,6 @@ describe("the workspace as a participant", () => {
       return {};
     });
     const goal = { message_id: "msg_goal000001", sequence: 1, until: ["after 900h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
-    let tick = Date.parse("2026-10-05T12:00:00.000Z");
     const client = {
       async request(method: string, path: string, _token: string, body?: unknown) {
         if (method === "GET" && path === `/rooms/${ROOM}`) {
@@ -1280,7 +1285,7 @@ describe("the workspace as a participant", () => {
     } as unknown as ApiClient;
     await runGoal(
       client, "sni_owner-seat", OWNER_KEY,
-      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, modules: { ...DEFAULT_MODULES, environment: { push, audience: "affected" } } },
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, modules: { ...DEFAULT_MODULES, environment: { push, audience: "affected", watch: [] } } },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => { await new Promise((resolveWait) => setTimeout(resolveWait, 1)); } },
     );
     const log = (await readFile(join(out, "environment.ndjson"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
@@ -1295,7 +1300,7 @@ describe("the workspace as a participant", () => {
       return { wake_id: "wk_one", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: "carry on", sender: { member_id: "i_ClaudeTwo02", name: "claude-code-2" } }] };
     });
     const woken = run.turns.at(-1)!.args.at(-1)!;
-    expect(woken).toMatch(/Changed in the workspace by others since you last saw these files:\n- src\/a\.c changed \d+ s ago, by claude-code-2; you last had it in turn 1/);
+    expect(woken).toMatch(/Changed in the workspace by others since you last saw these files:\n- src\/a\.c changed \d+ (?:s|min) ago, by claude-code-2; you last had it in turn 1/);
     expect(run.turns[0]!.args.at(-1)).toContain("The workspace itself tells you when a file you have read or changed is changed by someone else");
     expect(run.posts).toEqual([]);
     expect(run.log.find(record => record.event === "changes")).toMatchObject({ changes: [{ path: "src/a.c", kind: "changed" }], notes: [{ seat: "claude-code-1", path: "src/a.c", by: "claude-code-2", interest: "read" }] });
@@ -1313,7 +1318,7 @@ describe("the workspace as a participant", () => {
     });
     expect(run.posts).toHaveLength(1);
     expect(run.posts[0]).toMatchObject({ as: "runner" });
-    expect(run.posts[0]!.content).toMatch(/^@claude-code-1 \[env\] src\/a\.c changed \d+ s ago, by claude-code-2; you last had it in turn 1$/);
+    expect(run.posts[0]!.content).toMatch(/^@claude-code-1 \[env\] src\/a\.c changed \d+ (?:s|min) ago, by claude-code-2; you last had it in turn 1$/);
     expect(run.turns.at(-1)!.args.at(-1)).toContain("runner: @claude-code-1 [env] src/a.c changed");
     // The line named seat 1: seat 2 had it in its wake and took no turn for it.
     const routing = (await readFile(join(run.out, "routing.ndjson"), "utf8")).trim().split("\n").map(line => JSON.parse(line));

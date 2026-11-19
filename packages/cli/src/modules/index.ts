@@ -34,7 +34,7 @@ export const DEFAULT_MODULES: HarnessModules = Object.freeze({
   topology: Object.freeze({ kind: "all" }) as Topology,
   messageSchema: "free",
   probe: null,
-  environment: Object.freeze({ push: "off", audience: "affected" }) as EnvironmentModule,
+  environment: Object.freeze({ push: "off", audience: "affected", watch: Object.freeze([]) as unknown as EnvironmentModule["watch"] }) as EnvironmentModule,
 }) as HarnessModules;
 
 export function isDefaultModules(modules: HarnessModules): boolean {
@@ -48,7 +48,7 @@ export function describeModules(modules: HarnessModules): Record<string, unknown
     topology: modules.topology.kind === "islands" ? `islands:${modules.topology.count}` : "all",
     protocol: modules.messageSchema,
     information: modules.probe ? { probe: modules.probe.command, every_ms: modules.probe.everyMs } : null,
-    environment: modules.environment.push === "off" ? null : { push: modules.environment.push, audience: modules.environment.audience },
+    environment: modules.environment.push === "off" ? null : { push: modules.environment.push, audience: modules.environment.audience, ...(modules.environment.watch.length > 0 ? { watch: modules.environment.watch.map((root) => root.mount) } : {}) },
   };
 }
 

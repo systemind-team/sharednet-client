@@ -107,13 +107,13 @@ describe("information slot", () => {
 });
 
 describe("the slots together", () => {
-  const all: HarnessModules = { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "p", everyMs: 60_000 }, environment: { push: "on-event", audience: "affected" } };
+  const all: HarnessModules = { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "p", everyMs: 60_000 }, environment: { push: "on-event", audience: "affected", watch: [{ host: "/runs/7/best", mount: "/workspace/best" }] } };
   it("has today's behaviour as its default", () => {
     expect(isDefaultModules(DEFAULT_MODULES)).toBe(true);
     expect(isDefaultModules(all)).toBe(false);
     expect(seatEnvironment(DEFAULT_MODULES)).toEqual([]);
     expect(seatEnvironment(all)).toEqual(["-e", "SHAREDNET_TASK_JUDGE=lexical", "-e", "SHAREDNET_MESSAGE_SCHEMA=sbar"]);
-    expect(describeModules(all)).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "p", every_ms: 60_000 }, environment: { push: "on-event", audience: "affected" } });
+    expect(describeModules(all)).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "p", every_ms: 60_000 }, environment: { push: "on-event", audience: "affected", watch: ["/workspace/best"] } });
     expect(describeModules(DEFAULT_MODULES).environment).toBeNull();
   });
   it("leaves the opening prompt exactly as it was when every slot is at its default", () => {

@@ -1,7 +1,7 @@
 import { compiledPrompt, COMPILED_HELP, type CompiledState } from "./compiled.ts";
 import { controlPaths, isTaskMessage, type Task } from "./board-controls.ts";
 import { DEFAULT_MODULES, describeModules, seatEnvironment, type HarnessModules } from "./modules/index.ts";
-import { ENV_HELP, ENV_HOOK, ENV_HOOK_DIR, ENV_HOOK_PATH, ENV_HOOKS, ENV_POST_GAP_MS, ENV_SCAN_MS, ENV_SETTLE_MS, Environment, diffSnapshots, envLineForAnother, envMessage, hookNotes, renderNotes, snapshot, type Delivery, type Note } from "./modules/environment.ts";
+import { ENV_HELP, ENV_HOOK, ENV_HOOK_DIR, ENV_HOOK_PATH, ENV_HOOKS, ENV_POST_GAP_MS, ENV_SCAN_MS, ENV_SETTLE_MS, Environment, diffSnapshots, envLineForAnother, envMessage, hookNotes, renderNotes, snapshotRoots, type Delivery, type Note } from "./modules/environment.ts";
 import { PROBE_HELP, probeMessage } from "./modules/information.ts";
 import { SBAR_HELP, renderRequests, requestsFor } from "./modules/protocol.ts";
 import { ACTIVITY_HELP, TASK_JUDGE_HELP, renderActivity } from "./modules/state.ts";
@@ -882,7 +882,8 @@ export async function runGoal(
   // Who is in a turn now: the activity view reads it, so it is the runner's record, not a seat's word.
   const busy = new Set<string>();
   // The workspace as a participant (modules/environment.ts); null unless --env-push is on.
-  const environment = modules.environment.push !== "off" ? new Environment(plan.agents.map((agent) => agent.name), { audience: modules.environment.audience }) : null;
+  const watch = modules.environment.push !== "off" ? new Environment(plan.agents.map((agent) => agent.name), { audience: modules.environment.audience }) : null;
+  const watchRoots = [{ host: plan.workspace, mount: CONTAINER_WORKSPACE }, ...modules.environment.watch];
   const envInTurn = (seat: { driver: string } | null) => modules.environment.push === "on-action" && seat?.driver === "claude-code";
   const envPosts = modules.environment.push === "on-event" || modules.environment.push === "on-action";
   if (input.harnessMode && turnPolicy !== "legacy") throw localError("invalid_arguments", "--turn-policy cooperative-v1 cannot override a frozen --harness-mode.");
@@ -1128,19 +1129,19 @@ export async function runGoal(
     // The workspace as a participant: its log, what has been given to whom, and what a turn's hook gave.
     const logEnv = (record: Record<string, unknown>) => appendFile(join(input.out, "environment.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), ...record })}\n`);
     const given = async (seat: SeatRecord, notes: Note[], how: Delivery) => {
-      if (!environment || notes.length === 0) return;
-      environment.delivered(seat.name, notes.map((note) => note.id), dependencies.now().getTime());
+      if (!watch || notes.length === 0) return;
+      watch.delivered(seat.name, notes.map((note) => note.id), dependencies.now().getTime());
       await logEnv({ event: "delivered", seat: seat.name, how, turn: seat.turns, notes: notes.map((note) => ({ id: note.id, path: note.path, kind: note.kind, by: note.by, interest: note.interest })) });
     };
     const handed = new Map<string, string>();
     const collectInTurn = async (seat: SeatRecord) => {
-      if (!environment) return;
+      if (!watch) return;
       const read = await docker(["exec", "--user", user, containerName(input.roomId, seat.name), "sh", "-c", `cat ${ENV_HOOK_DIR}/delivered.ndjson 2>/dev/null; rm -f ${ENV_HOOK_DIR}/delivered.ndjson ${ENV_HOOK_DIR}/pending.json`]);
       const how = new Map<string, string>();
       for (const line of (read.stdout ?? "").split("\n")) {
         try { const record = JSON.parse(line) as { id: string; how: string }; how.set(record.id, record.how); } catch { /* not a record */ }
       }
-      const waiting = environment.waiting(seat.name);
+      const waiting = watch.waiting(seat.name);
       for (const kind of ["note", "held-edit"] as const) await given(seat, waiting.filter((note) => how.get(note.id) === kind), kind);
       handed.delete(seat.name);
     };
@@ -1166,16 +1167,18 @@ export async function runGoal(
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
       const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, codexBase, input.codexModel ?? {}, input.disallowedTools ?? []);
+      watch?.turnStarted(seat.name, seat.turns, dependencies.now().getTime());
       if (seat.driver === "claude-code" && (input.taskGate || envInTurn(seat))) command.splice(command.length - 1, 0, "--settings", hookSettings(Boolean(input.taskGate), envInTurn(seat)));
       const result = await exec(seat, command, {
         through: wake?.through ?? input.goalSequence,
         onLine: (line) => {
           reader.line(line);
-          environment?.sawLine(seat.name, seat.turns, line, dependencies.now().getTime());
+          watch?.sawLine(seat.name, seat.turns, line, dependencies.now().getTime());
           writes = writes.then(() => appendFile(stream, `${line}\n`));
         },
       });
       await writes;
+      watch?.turnEnded(seat.name, dependencies.now().getTime());
       if (envInTurn(seat)) await collectInTurn(seat);
       if (result.stderr.trim()) await writeFile(join(directory, `turn-${number}.stderr.txt`), result.stderr);
       const reading = reader.reading;
@@ -1220,8 +1223,8 @@ export async function runGoal(
         try { tasks = (JSON.parse(listed.stdout) as { tasks?: Task[] }).tasks ?? []; } catch { /* the view goes out without tasks */ }
         parts.push(renderActivity(records.map((record) => ({ name: record.name, member_id: record.member_id ?? null, busy: busy.has(record.name), turns: record.turns })), tasks, seat.name));
       }
-      if (environment) {
-        const waiting = environment.waiting(seat.name);
+      if (watch) {
+        const waiting = watch.waiting(seat.name);
         const changed = renderNotes(waiting, dependencies.now().getTime());
         if (changed) { parts.push(changed); await given(seat, waiting, "wake"); }
       }
@@ -1230,26 +1233,26 @@ export async function runGoal(
 
     // The workspace watches itself: a scan every few seconds, then each seat is told at a time it can use.
     const envLoop = async () => {
-      if (!environment) return;
-      let before = await snapshot(plan.workspace);
-      environment.know(before.keys());
+      if (!watch) return;
+      let before = await snapshotRoots(watchRoots);
+      watch.know(before.keys());
       let since = dependencies.now().getTime();
       const lastPost = new Map<string, number>();
       while (!ended) {
         await sleep(ENV_SCAN_MS);
         if (ended) break;
-        const after = await snapshot(plan.workspace);
+        const after = await snapshotRoots(watchRoots);
         const now = dependencies.now().getTime();
         const changes = diffSnapshots(before, after);
-        environment.know(after.keys());
+        watch.know(after.keys());
         if (changes.length > 0) {
-          const added = environment.observe(changes, new Set(busy), since, now);
+          const added = watch.observe(changes, since, now);
           await logEnv({ event: "changes", changes: changes.slice(0, 200), total: changes.length, in_turn: [...busy], notes: added.map((note) => ({ id: note.id, seat: note.seat, path: note.path, by: note.by, interest: note.interest })) });
         }
         before = after;
         since = now;
         for (const seat of records) {
-          const waiting = environment.waiting(seat.name);
+          const waiting = watch.waiting(seat.name);
           if (waiting.length === 0) continue;
           if (busy.has(seat.name)) {
             // In a turn: a Claude Code seat's hook reads what is waiting; any other seat gets it with its next wake.
