@@ -10,7 +10,7 @@ import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner, type GuestDependencies } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
-import { REASONING_EFFORTS, cliPackage, codexApi, discoverCodeProvenance, dockerRunner, isolationNames, parseAgents, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner, type ReasoningEffort } from "./goal-run.ts";
+import { REASONING_EFFORTS, cliPackage, codexApi, discoverCodeProvenance, dockerRunner, isolationNames, parseAgents, parseDisallowedTools, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner, type ReasoningEffort } from "./goal-run.ts";
 import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, type ServeKickoff } from "./goal-serve-demo.ts";
 import { assertGoalRunHarnessAgentCount, getHarnessModeSpec, resolveGoalRunHarnessMode, resolveRuntimeHarnessMode, type RuntimeHarnessResolution } from "./harness-modes.ts";
 import { parseDuration } from "./triggers.ts";
@@ -153,6 +153,7 @@ const optionValueNames = new Set([
   "message-schema",
   "probe",
   "probe-every",
+  "disallow-tools",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate", "activity-view"]);
 
@@ -615,7 +616,7 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
   const turnPolicy = option(parsed, "turn-policy") ?? "legacy";
@@ -658,10 +659,15 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--disallow-tools <Tool,Tool>]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
+  // Claude Code tools kept from the Claude Code seats; Codex has no such list, so a run without a Claude Code seat refuses it.
+  const disallowedTools = parseDisallowedTools(option(parsed, "disallow-tools"));
+  if (disallowedTools.length > 0 && !agents.some((agent) => agent.driver === "claude-code")) {
+    throw localError("invalid_arguments", "--disallow-tools is for Claude Code seats; this run has none.");
+  }
   if (turnPolicy === "cooperative-v1" && (agents.length < 2 || type === "compiled")) throw localError("invalid_arguments", "--turn-policy cooperative-v1 requires a multi-agent board Room.");
   if (harnessMode && agents.some((agent) => agent.model === null)) {
     throw localError("harness_model_required", "A frozen --harness-mode requires every --agent to pin its model, for example --agent codex:<model>.");
@@ -793,6 +799,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           ...(codeProvenance ? { codeProvenance } : {}),
           ...(isDefaultModules(modules) ? {} : { modules }),
           webSearch,
+          ...(disallowedTools.length > 0 ? { disallowedTools } : {}),
           ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
           codexModel: {
             ...(reasoningEffort === undefined ? {} : { reasoningEffort: reasoningEffort as ReasoningEffort }),

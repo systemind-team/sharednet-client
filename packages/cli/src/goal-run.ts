@@ -606,6 +606,20 @@ export function wakePrompt(wake: WakeShape, turnPolicy: TurnPolicy = "legacy"): 
   return [`New in the Room since your last turn (#${wake.from + 1} to #${wake.through}):`, ...lines, "", turnPolicy === "cooperative-v1" ? COOPERATIVE_REMINDER : "Carry on with the goal."].join("\n");
 }
 
+/**
+ * Claude Code tools the seats may not use, from a comma-separated list of tool names
+ * (`ScheduleWakeup,CronCreate`). A seat that calls ScheduleWakeup waits inside its own turn, and
+ * the runner does not wake a seat that is in a turn, so what is said to it waits too.
+ */
+export function parseDisallowedTools(raw: string | undefined): string[] {
+  if (raw === undefined) return [];
+  const names = raw.split(",").map((name) => name.trim()).filter((name) => name.length > 0);
+  if (names.length === 0 || names.some((name) => !/^[A-Za-z][A-Za-z0-9_]*$/.test(name))) {
+    throw localError("invalid_arguments", "--disallow-tools is a comma-separated list of Claude Code tool names, such as ScheduleWakeup,CronCreate.");
+  }
+  return [...new Set(names)];
+}
+
 /** One turn: a fresh harness run, or the same session resumed, with nothing asked of a person. */
 /** Whether the Agents may search the web: on by default, off for a benchmark that forbids it. */
 export type WebSearch = "live" | "off";
@@ -636,7 +650,7 @@ export interface CodexModel {
 /** The provider Codex is given for a model API other than OpenAI's: Responses over HTTP, keyed from OPENAI_API_KEY. */
 const CODEX_PROVIDER = "goal_api";
 
-export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live", turnLimitSeconds = TURN_LIMIT_SECONDS, codexBase: CodexBase | null = null, model: CodexModel = {}): string[] {
+export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live", turnLimitSeconds = TURN_LIMIT_SECONDS, codexBase: CodexBase | null = null, model: CodexModel = {}, disallowedTools: readonly string[] = []): string[] {
   const limit = ["timeout", String(turnLimitSeconds)];
   if (seat.driver === "codex") {
     // Live web search, which Claude Code has by default: a goal is as often research as code.
@@ -666,7 +680,7 @@ export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string |
     "claude",
     "-p",
     // A list option takes every argument up to the next flag, so it stands before the other flags.
-    ...(webSearch === "off" ? ["--disallowedTools", "WebSearch", "WebFetch"] : []),
+    ...(webSearch === "off" || disallowedTools.length > 0 ? ["--disallowedTools", ...(webSearch === "off" ? ["WebSearch", "WebFetch"] : []), ...disallowedTools] : []),
     "--output-format",
     "stream-json",
     "--verbose",
@@ -795,6 +809,8 @@ export interface GoalRunInput {
   quietChecks: boolean;
   /** `off` takes web search away from every Agent; the default is `live`. */
   webSearch?: WebSearch;
+  /** Claude Code tools the Claude Code seats may not use, such as ScheduleWakeup (a seat that waits inside its turn cannot be woken). */
+  disallowedTools?: readonly string[];
   /** The longest one turn may run; the default is 20 minutes. An experiment may set it to the run's own limit. */
   turnLimitMs?: number;
   /** Opt-in board controls. Mention gates default to targeted wakes unless overridden. */
@@ -1111,7 +1127,7 @@ export async function runGoal(
       const reader = new TurnReader(seat.driver);
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
-      const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, codexBase, input.codexModel ?? {});
+      const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, codexBase, input.codexModel ?? {}, input.disallowedTools ?? []);
       if (input.taskGate && seat.driver === "claude-code") command.splice(command.length - 1, 0, "--settings", TASK_HOOK_SETTINGS);
       const result = await exec(seat, command, {
         through: wake?.through ?? input.goalSequence,
@@ -1308,6 +1324,7 @@ export async function runGoal(
           isolated,
           ...(isolated ? { addresses } : {}),
           web_search: input.webSearch ?? "live",
+          ...(input.disallowedTools?.length ? { disallowed_tools: input.disallowedTools } : {}),
           // Where the Codex seats' model was: a run's numbers are read with the model and its provider.
           // Recorded when the run names an API: a Codex login's own endpoint is Codex's business, not the run's.
           ...(plan.codexApi ? { model_api: `${api.origin}${api.path}` } : {}),

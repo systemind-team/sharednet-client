@@ -34,6 +34,7 @@ import {
   runGoal,
   scrubHome,
   turnCommand,
+  parseDisallowedTools,
   wakePrompt,
   type DockerRunner,
   type RunPlan,
@@ -170,6 +171,20 @@ describe("a turn", () => {
     const openai = turnCommand(codex!, "the goal", null, "off", 1200, { url: "http://gateway:8080/v1", custom: false }).join(" ");
     expect(openai).toContain('-c openai_base_url="http://gateway:8080/v1"');
     expect(openai).not.toContain("model_provider");
+  });
+
+  it("keeps the tools a run names from Claude Code seats, next to web search when that is off", () => {
+    const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
+    expect(turnCommand(claude, "the goal", null, "live", 1200, null, {}, ["ScheduleWakeup"])).toEqual([
+      "timeout", "1200", "claude", "-p", "--disallowedTools", "ScheduleWakeup", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "the goal",
+    ]);
+    expect(turnCommand(claude, "the goal", null, "off", 1200, null, {}, ["ScheduleWakeup"]).slice(4, 8)).toEqual(["--disallowedTools", "WebSearch", "WebFetch", "ScheduleWakeup"]);
+    const codex = { name: "codex-1", driver: "codex" as const, model: null };
+    expect(turnCommand(codex, "the goal", null, "live", 1200, null, {}, ["ScheduleWakeup"])).toEqual(turnCommand(codex, "the goal", null, "live"));
+    expect(parseDisallowedTools(undefined)).toEqual([]);
+    expect(parseDisallowedTools("ScheduleWakeup, CronCreate,ScheduleWakeup")).toEqual(["ScheduleWakeup", "CronCreate"]);
+    expect(() => parseDisallowedTools(",")).toThrow(/comma-separated list/u);
+    expect(() => parseDisallowedTools("Bash(rm *)")).toThrow(/comma-separated list/u);
   });
 
   it("takes web search away from every Agent when it is off, for a benchmark that forbids the internet", () => {
@@ -1180,6 +1195,7 @@ describe("module slots in a run", () => {
       {
         plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, messageRouting: "mentions-only",
         modules: { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "python3 probe.py", everyMs: 60_000 } },
+        disallowedTools: ["ScheduleWakeup"],
       },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
     );
@@ -1194,7 +1210,9 @@ describe("module slots in a run", () => {
     expect(turns[0]!.args.at(-1)).toContain("Yours is island 1, where you are alone.");
     expect(turns[0]!.args).toContain("SHAREDNET_MESSAGE_SCHEMA=sbar");
     expect(turns[0]!.args).toContain("SHAREDNET_TASK_JUDGE=lexical");
+    expect(turns[0]!.args.slice(turns[0]!.args.indexOf("--disallowedTools"), turns[0]!.args.indexOf("--disallowedTools") + 2)).toEqual(["--disallowedTools", "ScheduleWakeup"]);
     expect(posts).toContainEqual({ content: "@all [probe] 2 differences: -buildconf exits 1", as: "runner" });
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).disallowed_tools).toEqual(["ScheduleWakeup"]);
     expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).modules).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "python3 probe.py", every_ms: 60_000 } });
   });
 });
