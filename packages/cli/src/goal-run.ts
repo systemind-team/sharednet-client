@@ -1,5 +1,10 @@
 import { compiledPrompt, COMPILED_HELP, type CompiledState } from "./compiled.ts";
-import { controlPaths, isTaskMessage } from "./board-controls.ts";
+import { controlPaths, isTaskMessage, type Task } from "./board-controls.ts";
+import { DEFAULT_MODULES, describeModules, seatEnvironment, type HarnessModules } from "./modules/index.ts";
+import { PROBE_HELP, probeMessage } from "./modules/information.ts";
+import { SBAR_HELP, renderRequests, requestsFor } from "./modules/protocol.ts";
+import { ACTIVITY_HELP, TASK_JUDGE_HELP, renderActivity } from "./modules/state.ts";
+import { reachable, topologyHelp } from "./modules/topology.ts";
 import { TASK_HELP, MENTION_HELP, TASK_PROFILE, TASK_HOOK, TASK_HOOK_SETTINGS } from "./task-guard.ts";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -8,7 +13,7 @@ import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/pro
 import { dirname, join, relative } from "node:path";
 
 import type { ApiClient } from "./api-client.ts";
-import { localError } from "./errors.ts";
+import { CliError, localError } from "./errors.ts";
 import { goalWatch, type GoalWatchResult } from "./goal.ts";
 import { assertGoalRunHarnessAgentCount, type GoalRunHarnessResolution } from "./harness-modes.ts";
 import { mentions } from "./triggers.ts";
@@ -541,7 +546,8 @@ const COOPERATIVE_TURNS = [
 const COOPERATIVE_REMINDER = "Continue under the cooperative-turn policy: complete one bounded work unit, publish actionable results with sharednet say, then finish your response and end your turn. If blocked, request what you need and yield; do not poll or wait. A handoff is not DONE.";
 
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
-export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy }): string {
+export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules }): string {
+  const modules = input.modules ?? DEFAULT_MODULES;
   const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
   const single = input.seats.length === 1;
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
@@ -579,7 +585,19 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
         : "Agree in the Room who does what, do your part, and end your turn when there is nothing more to do now.",
     ...(input.mentionGate ? [MENTION_HELP] : []),
     ...(input.taskGate ? [TASK_HELP] : []),
+    ...moduleHelp(input.seat.name, input.seats.map((seat) => seat.name), modules),
   ].join("\n");
+}
+
+/** What the module slots add to a seat's first prompt; nothing when every slot is at its default. */
+export function moduleHelp(seat: string, names: readonly string[], modules: HarnessModules): string[] {
+  return [
+    ...(modules.taskJudge !== "off" ? [TASK_JUDGE_HELP] : []),
+    ...(modules.activityView ? [ACTIVITY_HELP] : []),
+    ...topologyHelp(seat, names, modules.topology),
+    ...(modules.messageSchema === "sbar" ? [SBAR_HELP] : []),
+    ...(modules.probe ? [PROBE_HELP] : []),
+  ];
 }
 
 /** What a woken Agent is told: everything said since its last turn. */
@@ -790,6 +808,8 @@ export interface GoalRunInput {
   codeProvenance?: CodeProvenance;
   /** What Codex is told about the Codex seats' model; Codex's own defaults when left out. */
   codexModel?: CodexModel;
+  /** The module slots (modules/index.ts); left out, every slot keeps today's behaviour. */
+  modules?: HarnessModules;
 }
 
 export interface GoalRunDependencies {
@@ -833,6 +853,9 @@ export async function runGoal(
   const taskGate = input.taskGate ?? false;
   const turnPolicy = input.turnPolicy ?? "legacy";
   if (turnPolicy !== "legacy" && turnPolicy !== "cooperative-v1") throw localError("invalid_arguments", "--turn-policy is legacy or cooperative-v1.");
+  const modules = input.modules ?? DEFAULT_MODULES;
+  // Who is in a turn now: the activity view reads it, so it is the runner's record, not a seat's word.
+  const busy = new Set<string>();
   if (input.harnessMode && turnPolicy !== "legacy") throw localError("invalid_arguments", "--turn-policy cooperative-v1 cannot override a frozen --harness-mode.");
   if (turnPolicy === "cooperative-v1" && (plan.agents.length < 2 || input.roomType === "compiled")) throw localError("invalid_arguments", "--turn-policy cooperative-v1 requires a multi-agent board Room.");
   if (
@@ -954,6 +977,7 @@ export async function runGoal(
       ...(seat ? ["-e", "SHAREDNET_WAKE=off"] : []),
       ...(seat && input.mentionGate ? ["-e", "SHAREDNET_MENTION_GATE=1"] : []),
       ...(seat && options.through !== undefined ? ["-e", `SHAREDNET_TURN_THROUGH=${options.through}`] : []),
+      ...(seat ? seatEnvironment(modules) : []),
       ...(controls && input.taskGate ? ["-e", "SHAREDNET_TASK_GATE=1", "-e", `SHAREDNET_TASK_FILE=${controls.tasks}`, "-e", `SHAREDNET_TASK_AUDIT=${join(controls.root, "shell-blocks.tsv")}`, "-e", "SHAREDNET_TASK_PROFILE=/etc/profile.d/sharednet-task.sh"] : []),
       // Isolated, a seat holds a placeholder where its harness wants a key, and its requests go to the gateway, which signs them.
       ...(seat?.driver === "claude-code" && plan.claudeAuth
@@ -1127,14 +1151,56 @@ export async function runGoal(
       return failed;
     };
 
+    /** What the module slots add to a wake: what has been asked of the seat, and who is doing what. */
+    const wakeContext = async (seat: SeatRecord, wake: WakeShape): Promise<string[]> => {
+      const parts: string[] = [];
+      if (modules.messageSchema === "sbar") {
+        const asked = renderRequests(requestsFor(wake.messages, seat));
+        if (asked) parts.push(asked);
+      }
+      if (modules.activityView) {
+        let tasks: Task[] = [];
+        const listed = await exec(seat, ["sharednet", "task", "list", "--json"]);
+        try { tasks = (JSON.parse(listed.stdout) as { tasks?: Task[] }).tasks ?? []; } catch { /* the view goes out without tasks */ }
+        parts.push(renderActivity(records.map((record) => ({ name: record.name, member_id: record.member_id ?? null, busy: busy.has(record.name), turns: record.turns })), tasks, seat.name));
+      }
+      return parts;
+    };
+
+    // The information slot: a probe on a fixed clock, in the checks container, posted as the runner.
+    const probeLoop = async () => {
+      const probe = modules.probe;
+      if (!probe) return;
+      const probeLog = join(input.out, "probe.ndjson");
+      while (!ended) {
+        // Short sleeps, so that the end of the goal does not wait out a whole probe interval.
+        for (let waited = 0; waited < probe.everyMs && !ended; waited += 5_000) await sleep(Math.min(5_000, probe.everyMs - waited));
+        if (ended) break;
+        const startedAt = dependencies.now().toISOString();
+        const result = await exec(null, ["sh", "-c", probe.command]);
+        const content = probeMessage(result.stdout);
+        let posted = false;
+        if (content && !ended) {
+          try {
+            await client.request("POST", `/rooms/${encodeURIComponent(input.roomId)}/owner-messages`, apiKey, { content, as: "runner" });
+            posted = true;
+          } catch (error) {
+            log(`goal: a probe result was not posted (${error instanceof CliError ? error.code : "error"})\n`);
+          }
+        }
+        await appendFile(probeLog, `${JSON.stringify({ at: startedAt, exit_code: result.code, chars: result.stdout.length, posted })}\n`);
+      }
+    };
+
     // Every seat starts once. Subsequent wakes follow the configured routing policy.
     const seatLoop = async (seat: SeatRecord) => {
-      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy });
+      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules });
       openingPromptHashes[seat.name] = sha256(prompt);
       let wake: WakeShape | null = null;
       let failedInARow = 0;
       while (!ended) {
-        const failed = await runTurn(seat, prompt, wake);
+        busy.add(seat.name);
+        const failed = await runTurn(seat, prompt, wake).finally(() => busy.delete(seat.name));
         if (wake?.wake_id) await exec(seat, ["sharednet", "ack", wake.wake_id, "--json"]);
         failedInARow = failed ? failedInARow + 1 : 0;
         if (ended) break;
@@ -1148,15 +1214,15 @@ export async function runGoal(
           let raw: WakeShape;
           try { raw = JSON.parse(waited.stdout) as WakeShape; } catch { return; }
           if (raw.fired.includes("closed")) return;
-          wake = routeWake(raw, seat, records, messageRouting);
+          wake = reachable(routeWake(raw, seat, records, messageRouting), seat, records, modules.topology);
           if (input.taskGate) wake = withoutTaskActs(wake);
           const delivered = wake.messages.map(message => message.sequence);
-          if (messageRouting !== "broadcast" || input.taskGate) await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
-          if (delivered.length > 0 || (messageRouting === "broadcast" && !input.taskGate)) break;
+          if (messageRouting !== "broadcast" || input.taskGate || modules.topology.kind !== "all") await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
+          if (delivered.length > 0 || (messageRouting === "broadcast" && !input.taskGate && modules.topology.kind === "all")) break;
           if (raw.wake_id) await exec(seat, ["sharednet", "ack", raw.wake_id, "--json"]);
         }
         if (ended || !wake) return;
-        prompt = wakePrompt(wake, turnPolicy);
+        prompt = [wakePrompt(wake, turnPolicy), ...(await wakeContext(seat, wake))].join("\n\n");
       }
     };
     const seats = records.map((seat) =>
@@ -1164,6 +1230,9 @@ export async function runGoal(
         log(`goal: ${seat.name} stopped (${error instanceof Error ? error.message : "error"})\n`);
       }),
     );
+    const probing = probeLoop().catch((error: unknown) => {
+      log(`goal: the probe stopped (${error instanceof Error ? error.message : "error"})\n`);
+    });
 
     const watched = await goalWatch(
       client,
@@ -1187,6 +1256,7 @@ export async function runGoal(
     // Stopping the containers ends every turn and every wait still running.
     await docker(["stop", "--time", "5", ...containers]);
     await Promise.all(seats);
+    await probing;
 
     // Each Agent's own trace is its home: Codex keeps sessions in ~/.codex, Claude Code in ~/.claude.
     for (const seat of records) {
@@ -1251,6 +1321,7 @@ export async function runGoal(
           mention_gate: input.mentionGate ?? false,
           task_gate: input.taskGate ?? false,
           message_routing: messageRouting,
+          modules: describeModules(modules),
           harness: {
             mode: input.harnessMode?.name ?? null,
             spec_sha256: input.harnessMode?.specSha256 ?? null,

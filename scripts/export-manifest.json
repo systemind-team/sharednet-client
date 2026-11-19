@@ -734,6 +734,13 @@
     "docs/experiments/sharednet-9b-dynamic-protocol.md",
     "docs/experiments/sharednet-9b-dynamic.template.json",
     "scripts/check-experiment-protocol.mjs",
-    "scripts/check-experiment-protocol.test.mjs"
+    "scripts/check-experiment-protocol.test.mjs",
+    "docs/harness-modules.md",
+    "packages/cli/src/modules/index.ts",
+    "packages/cli/src/modules/information.ts",
+    "packages/cli/src/modules/modules.test.ts",
+    "packages/cli/src/modules/protocol.ts",
+    "packages/cli/src/modules/state.ts",
+    "packages/cli/src/modules/topology.ts"
   ]
 }

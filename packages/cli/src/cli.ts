@@ -14,6 +14,11 @@ import { REASONING_EFFORTS, cliPackage, codexApi, discoverCodeProvenance, docker
 import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, type ServeKickoff } from "./goal-serve-demo.ts";
 import { assertGoalRunHarnessAgentCount, getHarnessModeSpec, resolveGoalRunHarnessMode, resolveRuntimeHarnessMode, type RuntimeHarnessResolution } from "./harness-modes.ts";
 import { parseDuration } from "./triggers.ts";
+import { isDefaultModules, type HarnessModules } from "./modules/index.ts";
+import { parseProbe } from "./modules/information.ts";
+import { parseMessageSchema } from "./modules/protocol.ts";
+import { parseTaskJudge } from "./modules/state.ts";
+import { parseTopology } from "./modules/topology.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
 import type { ProcessProbe } from "./process-identity.ts";
@@ -143,8 +148,13 @@ const optionValueNames = new Set([
   "reasoning-effort",
   "context-window",
   "compact-at",
+  "task-judge",
+  "topology",
+  "message-schema",
+  "probe",
+  "probe-every",
 ]);
-const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate"]);
+const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate", "activity-view"]);
 
 /** Room mode is fixed at creation. Omission retains the service default. */
 function roomType(parsed: ParsedArguments): "board" | "compiled" | undefined {
@@ -605,7 +615,7 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
   const turnPolicy = option(parsed, "turn-policy") ?? "legacy";
@@ -631,10 +641,24 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (type === "compiled" && (mentionGate || taskGate || (messageRouting !== undefined && messageRouting !== "broadcast"))) {
     throw localError("invalid_arguments", "The mention/task gates are for plain board Rooms.");
   }
+  // The module slots (modules/index.ts). Left out, each slot keeps today's behaviour.
+  const modules: HarnessModules = {
+    taskJudge: parseTaskJudge(option(parsed, "task-judge")),
+    activityView: parsed.options.get("activity-view") === true,
+    topology: parseTopology(option(parsed, "topology")),
+    messageSchema: parseMessageSchema(option(parsed, "message-schema")),
+    probe: parseProbe(option(parsed, "probe"), parsed.options.has("probe-every") ? parseDuration(option(parsed, "probe-every"), "--probe-every") : undefined),
+  };
+  if (!isDefaultModules(modules) && namedMode !== undefined) {
+    throw localError("invalid_arguments", "--harness-mode fixes a frozen treatment; the module options are not part of one yet.");
+  }
+  if (!isDefaultModules(modules) && type === "compiled") {
+    throw localError("invalid_arguments", "The module options are for plain board Rooms.");
+  }
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
@@ -767,6 +791,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           ...(messageRouting ? { messageRouting } : {}),
           ...(harnessMode ? { harnessMode } : {}),
           ...(codeProvenance ? { codeProvenance } : {}),
+          ...(isDefaultModules(modules) ? {} : { modules }),
           webSearch,
           ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
           codexModel: {
