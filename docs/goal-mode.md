@@ -167,8 +167,8 @@ runner makes `/home/agents` for that user if the image has none.
 Code seats (Codex has no such list, so a run without a Claude Code seat refuses the option).
 `ScheduleWakeup` is the case it was added for: a seat that calls it to "wait for review" sleeps
 inside its own turn, and the runner does not wake a seat that is in a turn, so a teammate's
-@mention waits until the sleep ends. In the FFmpeg module rounds (2026-11-19) six of ten teams had
-a seat that did so, for 10 to 45 minutes of a 30-minute run. `episode.json` records the list as
+@mention waits until the sleep ends. In the FFmpeg module rounds (2026-11-19) six of ten teams of
+four had a seat asleep this way for 16 to 29 of the run's 30 minutes. `episode.json` records the list as
 `disallowed_tools`; without the option nothing changes.
 
 ### Cooperative turns (opt-in)
