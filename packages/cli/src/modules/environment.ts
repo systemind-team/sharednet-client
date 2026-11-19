@@ -10,7 +10,8 @@
  *             a command printed, read from where the seat's shell was standing at the time
  *   attribute a change is by the seat that had a command running when the file was written; with
  *             several running, by the one whose command named the file, or else the one whose
- *             shell stood in a folder that holds it (git and build scripts name no files);
+ *             shell stood in a folder that holds it (git and build scripts name no files; a
+ *             command is in every folder it changes into);
  *             otherwise the author is unknown and the note names the seats that were working
  *   push      a seat is told about a change, by someone else, to a file it has an interest in
  *             (`--env-audience affected`) or to any file (`all`)
@@ -155,6 +156,7 @@ export function diffSnapshots(before: Snapshot, after: Snapshot): Change[] {
 // What a seat's turn shows
 
 const TOKEN = /[A-Za-z0-9_@+][A-Za-z0-9_@+.\/-]*/g;
+const DOTS = /(?:^|[^A-Za-z0-9_@+.\/-])((?:\.\.?\/)+)$/;
 const EDIT_TOOL = /"name"\s*:\s*"(?:Edit|Write|MultiEdit|NotebookEdit)"/;
 const FILE_PATH = /"(?:file_path|notebook_path)"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
 const PATCH_FILE = /\*\*\* (?:Update|Add|Delete) File: ([^\s"\\]+)/g;
@@ -192,10 +194,12 @@ export function pathsIn(raw: string, known: ReadonlySet<string>, mount = "/works
   for (const match of line.matchAll(TOKEN)) {
     const token = match[0];
     const at = match.index;
-    const absolute = at > 0 && line[at - 1] === "/" ? `/${token}` : token;
+    // `./a.c` and `../lib/a.c` are written from where the shell stands, `/a.c` from the root of the file system.
+    const dots = DOTS.exec(line.slice(Math.max(0, at - 64), at))?.[1] ?? "";
+    const absolute = dots === "" && at > 0 && line[at - 1] === "/" ? `/${token}` : token;
     let hit: string | null = null;
     // As written from the root of the file system, from where the seat's shell stands, or from the workspace.
-    const fromCwd = cwd && absolute === token ? [workspacePath(posix.normalize(posix.join(cwd, workspacePath(token, mount))), mount)] : [];
+    const fromCwd = cwd && absolute === token ? [workspacePath(posix.normalize(posix.join(cwd, dots + workspacePath(token, mount))), mount)] : [];
     for (const candidate of [workspacePath(absolute, mount), ...fromCwd, workspacePath(token, mount)]) {
       if (known.has(candidate)) { hit = candidate; break; }
     }
@@ -244,17 +248,51 @@ export function readLine(line: string): LineReading {
 
 const CD = /(?:^|&&|\|\||;|\n|\(|\{)\s*cd\s+(?:--\s+)?(?:"([^"\n]+)"|'([^'\n]+)'|([^\s;&|)<>]+))/g;
 
-/** Where a shell stands after a command, from where it stood: each `cd` in the command, read before any here-document. */
-export function folderAfter(cwd: string, command: string): string {
-  const heredoc = command.indexOf("<<");
+const HEREDOC = /(?<!<)<<(?!<)-?\s*(?:"([^"\n]+)"|'([^'\n]+)'|\\?([A-Za-z_][A-Za-z0-9_]*))/g;
+
+/** A command with the text of each here-document blanked out, every other character where it was. */
+export function withoutHeredocs(command: string): string {
+  const awaited: string[] = [];
+  return command.split("\n").map((line) => {
+    if (awaited.length === 0) {
+      for (const match of line.matchAll(HEREDOC)) awaited.push(match[1] ?? match[2] ?? match[3]!);
+      return line;
+    }
+    // The text runs to the line that is the closing word alone.
+    if (line.trim() === awaited[0]) awaited.shift();
+    return " ".repeat(line.length);
+  }).join("\n");
+}
+
+const RESET = /Shell cwd was reset to (\/[^\s"\\]*)/;
+
+/** One stretch of a command between two of its `cd`s, with the folder the shell stands in for it. */
+export interface Stretch { text: string; cwd: string }
+
+/**
+ * A command cut at each `cd` it makes (a here-document's text is not the command): `cd repo && make; cd ../scratch; ./run`
+ * builds in `repo` and runs in `scratch`. Returns the stretches that hold a command, and where the shell stands at the end.
+ */
+export function foldersIn(cwd: string, command: string): { parts: Stretch[]; after: string } {
+  const parts: Stretch[] = [];
   let now = cwd;
-  for (const match of (heredoc === -1 ? command : command.slice(0, heredoc)).matchAll(CD)) {
+  let from = 0;
+  for (const match of withoutHeredocs(command).matchAll(CD)) {
     const target = match[1] ?? match[2] ?? match[3]!;
     if (target === "-" || target.startsWith("~") || /[$`*?]/.test(target)) continue;
+    parts.push({ text: command.slice(from, match.index), cwd: now });
+    from = match.index + match[0].length;
     now = posix.normalize(target.startsWith("/") ? target : posix.join(now, target));
     if (now.length > 1 && now.endsWith("/")) now = now.slice(0, -1);
   }
-  return now;
+  parts.push({ text: command.slice(from), cwd: now });
+  const working = parts.filter((part) => /[A-Za-z0-9]/.test(part.text));
+  return { parts: working.length > 0 ? working : [{ text: "", cwd: now }], after: now };
+}
+
+/** Where a shell stands after a command, from where it stood. */
+export function folderAfter(cwd: string, command: string): string {
+  return foldersIn(cwd, command).after;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -296,7 +334,7 @@ export interface EnvironmentOptions {
 
 interface Seen { at: number; turn: number; edited: number | null }
 interface Span { start: number; end: number | null }
-interface Call extends Span { paths: Set<string>; cwd: string }
+interface Call extends Span { paths: Set<string>; cwds: string[] }
 interface SeatState { seen: Map<string, Seen>; pending: Map<string, Note>; calls: Call[]; turns: Span[]; turn: number; cwd: string }
 
 /** More known files than this in what a command printed make it a listing, not a reading of each. */
@@ -355,14 +393,19 @@ export class Environment {
     if (!mine) return;
     this.turnStarted(seat, turn, at);
     const reading = readLine(line);
-    if (reading.ends) for (const call of mine.calls) if (call.end === null) call.end = at;
+    if (reading.ends) {
+      for (const call of mine.calls) if (call.end === null) call.end = at;
+      // Claude Code says so when a command left its shell outside the folders it may work in and it put the shell back.
+      const reset = RESET.exec(line)?.[1];
+      if (reset !== undefined) mine.cwd = reset;
+    }
     const named = new Set<string>();
     for (const command of reading.starts) {
-      // A file is named from where the shell stands once the command's own `cd`s have run.
-      const cwd = folderAfter(reading.fresh ? this.mount : mine.cwd, command);
-      if (!reading.fresh) mine.cwd = cwd;
-      const paths = new Set(pathsIn(command, this.known, this.mount, this.byEnding, cwd));
-      mine.calls.push({ start: at, end: null, paths, cwd });
+      // A file is named from where the shell stands at that point of the command, after the `cd`s before it.
+      const walk = foldersIn(reading.fresh ? this.mount : mine.cwd, command);
+      if (!reading.fresh) mine.cwd = walk.after;
+      const paths = new Set(walk.parts.flatMap((part) => pathsIn(part.text, this.known, this.mount, this.byEnding, part.cwd)));
+      mine.calls.push({ start: at, end: null, paths, cwds: [...new Set(walk.parts.map((part) => part.cwd))] });
       for (const path of paths) named.add(path);
     }
     if (mine.calls.length > KEPT_CALLS) mine.calls.splice(0, mine.calls.length - KEPT_CALLS);
@@ -398,10 +441,10 @@ export class Environment {
       const naming = having((state) => state.calls.some((call) => then(call) && call.paths.has(change.path)));
       const running = having((state) => state.calls.some(then));
       const working = having((state) => state.turns.some(then));
-      // A command that names no file (git, a build script) changes what is under the folder it runs in:
+      // A command that names no file (git, a build script) changes what is under a folder it runs in:
       // the seat whose shell stood deepest in a folder that holds the file. The workspace's own root holds everything and says nothing.
       const where = containerPath(change.path, this.mount);
-      const depth = (state: SeatState) => Math.max(-1, ...state.calls.filter((call) => then(call) && call.cwd !== this.mount && where.startsWith(`${call.cwd}/`)).map((call) => call.cwd.split("/").length));
+      const depth = (state: SeatState) => Math.max(-1, ...state.calls.filter(then).flatMap((call) => call.cwds.filter((cwd) => cwd !== this.mount && where.startsWith(`${cwd}/`)).map((cwd) => cwd.split("/").length)));
       const deepest = Math.max(-1, ...running.map((seat) => depth(this.state.get(seat)!)));
       const inside = deepest === -1 ? [] : running.filter((seat) => depth(this.state.get(seat)!) === deepest);
       const candidates = naming.length > 0 ? naming : inside.length > 0 ? inside : running.length > 0 ? running : working;
@@ -547,22 +590,40 @@ const give = (notes, how) => fs.appendFileSync(dir + '/delivered.ndjson', notes.
 const event = input.hook_event_name;
 const tool = input.tool_input || {};
 // A shell command writes when it redirects into a file, edits in place, moves or removes, or has git rewrite the tree.
+// Output thrown away (> /dev/null) writes nothing.
+const NOWHERE = /[0-9&]?>{1,2}\s*\/dev\/(?:null|stdout|stderr)\b/g;
 const WRITES = /(^|[^0-9&>])>{1,2}(?![&>])|\btee\b|\bsed\s+(-[A-Za-z]*i|--in-place)|\bperl\s+-[A-Za-z]*i|\b(mv|cp|rm|patch|truncate|install)\s|\bgit\s+(apply|am|checkout|restore|reset|stash|merge|rebase|pull|cherry-pick|revert|clean)\b/;
 const CD = /(?:^|&&|\|\||;|\n|\(|\{)\s*cd\s+(?:--\s+)?(?:"([^"\n]+)"|'([^'\n]+)'|([^\s;&|)<>]+))/g;
+// Each file a command names, read from the folder the shell stands in at that point of the command.
+const HEREDOC = /(?<!<)<<(?!<)-?\s*(?:"([^"\n]+)"|'([^'\n]+)'|\\?([A-Za-z_][A-Za-z0-9_]*))/g;
 function named(command, cwd) {
-  const heredoc = command.indexOf('<<');
+  // A here-document's text is not the command: blanked out, every other character where it was.
+  const awaited = [];
+  const plain = command.split('\n').map((line) => {
+    if (awaited.length === 0) {
+      for (const m of line.matchAll(HEREDOC)) awaited.push(m[1] || m[2] || m[3]);
+      return line;
+    }
+    if (line.trim() === awaited[0]) awaited.shift();
+    return ' '.repeat(line.length);
+  }).join('\n');
+  const files = new Set();
+  const take = (text, folder) => {
+    for (const m of text.matchAll(/[A-Za-z0-9_@+.\/-]+/g)) {
+      const token = m[0].replace(/[.,:;]+$/, '');
+      if (token) files.add(path.normalize(token.startsWith('/') ? token : path.join(folder, token)));
+    }
+  };
   let now = cwd;
-  for (const m of (heredoc === -1 ? command : command.slice(0, heredoc)).matchAll(CD)) {
+  let from = 0;
+  for (const m of plain.matchAll(CD)) {
     const target = m[1] || m[2] || m[3];
     if (target === '-' || target.startsWith('~') || /[$\x60*?]/.test(target)) continue;
+    take(command.slice(from, m.index), now);
+    from = m.index + m[0].length;
     now = path.normalize(target.startsWith('/') ? target : path.join(now, target));
   }
-  const files = new Set();
-  for (const m of command.matchAll(/[A-Za-z0-9_@+.\/-]+/g)) {
-    const token = m[0].replace(/[.,:;]+$/, '');
-    if (!token) continue;
-    files.add(path.normalize(token.startsWith('/') ? token : path.join(now, token)));
-  }
+  take(command.slice(from), now);
   return files;
 }
 if (event === 'PreToolUse') {
@@ -571,7 +632,7 @@ if (event === 'PreToolUse') {
   if (['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(input.tool_name)) {
     const target = tool.file_path || tool.notebook_path;
     mine = target ? waiting.filter((note) => note.file === target) : [];
-  } else if (input.tool_name === 'Bash' && typeof tool.command === 'string' && WRITES.test(tool.command)) {
+  } else if (input.tool_name === 'Bash' && typeof tool.command === 'string' && WRITES.test(tool.command.replace(NOWHERE, ' '))) {
     const files = named(tool.command, typeof input.cwd === 'string' && input.cwd ? input.cwd : '/workspace');
     mine = waiting.filter((note) => files.has(note.file));
     what = 'command';

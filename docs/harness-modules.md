@@ -114,7 +114,9 @@ and by default nothing tells a seat that a file changed under it.
   which file, who changed it, and in which turn it last had the file. The author is the seat
   that had a command running at the moment the file was written; with several running, the one
   whose command named the file, or else the one whose shell stood in a folder that holds it (git
-  and build scripts name no files); otherwise the note names the seats that were working. A file a
+  and build scripts name no files; a command that changes folder is in each folder it passes
+  through, and a here-document's text is not read as the command); otherwise the note names the
+  seats that were working. A file a
   seat only read stops being its concern after six of its turns; a file it changed stays its
   own. The levels add up, each one a time at which the seat is told:
   - `on-wake`: with its next wake, whatever caused the wake.
@@ -123,7 +125,8 @@ and by default nothing tells a seat that a file changed under it.
     a seat gets at most one every two minutes.
   - `on-action`: also inside a Claude Code seat's turn, through a hook. A write to a file that
     changed under the seat (an edit tool on it, or a shell command that names it and redirects
-    into it, edits it in place, or has git rewrite it) is held once: nothing is written, and the
+    into a file, edits in place, or has git rewrite the tree; output thrown away to `/dev/null`
+    is not a write) is held once: nothing is written, and the
     seat is told who changed the file. Other changes arrive after its next tool call. Seats of
     other harnesses are told as with `on-event`.
 - `--env-audience all` tells every other seat about every change, new files included. The

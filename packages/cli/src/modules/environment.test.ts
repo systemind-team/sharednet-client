@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  ENV_HOOK, Environment, containerPath, describeNote, diffSnapshots, editsIn, endings, envLineForAnother, envMessage, fileKey, folderAfter,
-  hookNotes, hostPath, parseEnvAudience, parseEnvPush, parseEnvWatch, pathsIn, readLine, renderNotes, sameBytes, snapshot, snapshotRoots, workspacePath,
+  ENV_HOOK, Environment, containerPath, describeNote, diffSnapshots, editsIn, endings, envLineForAnother, envMessage, fileKey, folderAfter, foldersIn,
+  hookNotes, hostPath, parseEnvAudience, parseEnvPush, parseEnvWatch, pathsIn, readLine, renderNotes, sameBytes, snapshot, snapshotRoots, withoutHeredocs, workspacePath,
 } from "./environment.ts";
 
 const made: string[] = [];
@@ -121,6 +121,9 @@ describe("what a turn's record shows", () => {
     expect(pathsIn("cat NOTES.md util/b.c", all, "/workspace", byEnding, "/workspace/project").sort()).toEqual(["NOTES.md", "project/src/util/b.c"]);
     // A bare name counts as an ending only with an extension: `test` is a word.
     expect(pathsIn("make test", all, "/workspace", byEnding)).toEqual([]);
+    // ./ and ../ are written from where the shell stands.
+    expect(pathsIn("C=./src/a.c; sh ./test", all, "/workspace", byEnding, "/workspace/other")).toEqual(["other/src/a.c"]);
+    expect(pathsIn("sh ./test && cat ../other/src/a.c", all, "/workspace", byEnding, "/workspace/project").sort()).toEqual(["other/src/a.c", "project/test"]);
   });
   it("follows a command's cd, and leaves a here-document's text alone", () => {
     expect(folderAfter("/workspace", "cd candidates/cc-1/repo && make")).toBe("/workspace/candidates/cc-1/repo");
@@ -128,6 +131,19 @@ describe("what a turn's record shows", () => {
     expect(folderAfter("/workspace/a", "cd /tmp && cd - ; cd $HOME; cd ~/x")).toBe("/tmp");
     expect(folderAfter("/workspace", "cat > run.sh <<'EOF'\ncd /somewhere/else\nEOF")).toBe("/workspace");
     expect(folderAfter("/workspace", "echo cd nowhere")).toBe("/workspace");
+    // A command that changes folder twice is in both: each stretch with the folder it runs in.
+    expect(foldersIn("/workspace", "cd a/repo && ./compile.sh; cd ../scratch; ./run in.flac")).toEqual({
+      parts: [{ text: " && ./compile.sh", cwd: "/workspace/a/repo" }, { text: "; ./run in.flac", cwd: "/workspace/a/scratch" }],
+      after: "/workspace/a/scratch",
+    });
+    expect(foldersIn("/workspace/a", "make")).toEqual({ parts: [{ text: "make", cwd: "/workspace/a" }], after: "/workspace/a" });
+    expect(foldersIn("/workspace", "cd a")).toEqual({ parts: [{ text: "", cwd: "/workspace/a" }], after: "/workspace/a" });
+    // A cd after a here-document is the command's again; one inside it, or in a here-string, is text.
+    const script = "cd a/repo && python3 - <<'EOF'\nimport os\ncd /not/a/command\nEOF\ncd ../scratch && sh run.sh <<< 'cd /nor/this'";
+    expect(withoutHeredocs(script)).toHaveLength(script.length);
+    expect(withoutHeredocs(script)).not.toContain("/not/a/command");
+    expect(foldersIn("/workspace", script).parts.map((part) => part.cwd)).toEqual(["/workspace/a/repo", "/workspace/a/scratch"]);
+    expect(folderAfter("/workspace", "cat > a.txt <<A; cat > b.txt <<-'B'\ncd /one\nA\ncd /two\n\tB\ncd c")).toBe("/workspace/c");
   });
   it("knows which lines start a tool call and which end one, for Claude Code and for Codex", () => {
     expect(readLine(bash("cat a.c"))).toEqual({ starts: ["cat a.c"], ends: false, fresh: false });
@@ -238,6 +254,23 @@ describe("who is told about a change", () => {
     expect(next).toMatchObject([{ seat: "cc-3", by: null, candidates: ["cc-1", "cc-2"] }]);
   });
 
+  it("places a command in every folder it changes into: a build in one folder, then a run from another", () => {
+    const env = new Environment(seats, { audience: "affected" });
+    env.know(["candidates/cc-1/repo/executable", "candidates/cc-1/repo/main.c", "candidates/cc-2/repo/executable", "candidates/cc-1/scratch/in.flac"]);
+    // cc-1 built both files before, so they are its own; cc-2 is at work in its own folder all along.
+    ran(env, "cc-1", 1, "cd /workspace/candidates/cc-1/repo && sh compile.sh", 1_000, 2_000);
+    env.observe([{ path: "candidates/cc-1/repo/executable", kind: "changed", mtimeMs: 1_500 }, { path: "candidates/cc-1/repo/main.c", kind: "changed", mtimeMs: 1_500 }], 0, 3_000);
+    env.sawLine("cc-2", 2, bash("cd /workspace/candidates/cc-2/repo && sleep 300"), 50_000);
+    // The build is in repo, the command ends in scratch: git rewrote main.c, which the command never names.
+    ran(env, "cc-1", 2, "cd /workspace/candidates/cc-1/repo && git checkout -q FETCH_HEAD && sh compile.sh; cd ../scratch; cmp out.wav ref.wav", 60_000, 64_000);
+    expect(env.folder("cc-1")).toBe("/workspace/candidates/cc-1/scratch");
+    expect(env.observe([{ path: "candidates/cc-1/repo/main.c", kind: "changed", mtimeMs: 62_000 }], 55_000, 65_000)).toEqual([]);
+    // The file is named as ./executable in one folder and ../repo/executable in the next.
+    ran(env, "cc-1", 3, "cd ../repo && sh compile.sh; C=./executable; cd /workspace/candidates/cc-1/scratch; ../repo/executable -i in.flac out.wav", 160_000, 164_000);
+    expect(env.observe([{ path: "candidates/cc-1/repo/executable", kind: "changed", mtimeMs: 162_000 }], 155_000, 165_000)).toEqual([]);
+    expect(env.waiting("cc-1")).toEqual([]);
+  });
+
   it("tells a seat when a shared file changes and no longer matches the copy the seat holds", () => {
     const matching = new Set<string>();
     const env = new Environment(seats, { audience: "affected", shared: ["best/"], identical: (a, b) => matching.has(`${a} ${b}`) });
@@ -307,6 +340,11 @@ describe("who is told about a change", () => {
     env.sawLine("cx-1", 1, codexEnd(), 2_300);
     expect(env.interest("cx-1")).toEqual([{ path: "other/src/a.c", turn: 1, edited: false }]);
     expect(env.folder("cx-1")).toBe("/workspace");
+    // A command that ends outside the workspace: Claude Code puts the shell back and says so in the result.
+    env.sawLine("cc-1", 2, bash("cd /tmp && ls"), 3_000);
+    expect(env.folder("cc-1")).toBe("/tmp");
+    env.sawLine("cc-1", 2, result("a.txt\nShell cwd was reset to /workspace"), 3_100);
+    expect(env.folder("cc-1")).toBe("/workspace");
   });
 
   it("counts every file a command names, and takes many files in what a command printed for a listing", () => {
@@ -418,6 +456,9 @@ describe("the hook inside a Claude Code seat's turn", () => {
       ["sed -i s/a/b/ src/main.c", "/workspace/candidates/cc-1/repo"],
       ["git checkout -- main.c", "/workspace/candidates/cc-1/repo/src"],
       ["python3 gen.py | tee /workspace/candidates/cc-1/repo/src/main.c", "/tmp"],
+      // The write is in the folder the command stands in at that point, not the one it ends in.
+      ["cd /workspace/candidates/cc-1/repo && sed -i s/a/b/ src/main.c; cd /tmp; ls", "/workspace"],
+      ["python3 - <<'EOF'\nprint('cd /tmp')\nEOF\ncd /workspace/candidates/cc-1/repo/src && git checkout -- main.c", "/tmp"],
     ] as const) {
       const { dir, script, given } = await prepared([note]);
       const held = JSON.parse(run(script, dir, preBash(command, cwd)).stdout);
@@ -426,8 +467,10 @@ describe("the hook inside a Claude Code seat's turn", () => {
       expect(await given()).toEqual([["n1", "held-edit"]]);
     }
     const { dir, script, given } = await prepared([note]);
-    // A reading, a write to another seat's copy of the same name, and a redirect of an error stream are not held.
+    // A reading, a write to another seat's copy of the same name, a redirect of an error stream and output thrown away are not held.
     for (const [command, cwd] of [
+      ["sh check.sh src/main.c >/dev/null 2>&1; echo rc=$?", "/workspace/candidates/cc-1/repo"],
+      ["cd /workspace/candidates/cc-2/repo && sed -i s/a/b/ src/main.c; cd /workspace/candidates/cc-1/repo; ls", "/workspace"],
       ["cat src/main.c | head -40", "/workspace/candidates/cc-1/repo"],
       ["cat > src/main.c <<'EOF'\nx\nEOF", "/workspace/candidates/cc-2/repo"],
       ["grep -n main src/main.c 2>&1", "/workspace/candidates/cc-1/repo"],
