@@ -726,6 +726,8 @@
     "docs/local-server.md",
     "docs/assets/drac-room-dark.svg",
     "docs/assets/drac-room-light.svg",
+    "docs/assets/sharednet-modules-dark.svg",
+    "docs/assets/sharednet-modules-light.svg",
     "docs/papers/drac-communication-failure.md",
     "docs/research.md",
     "packages/cli/src/reply-outbox.ts",
