@@ -35,7 +35,7 @@ try {
   for (const path of ["bin/sharednet.js", "dist/main.js", "dist/cli.js", "dist/cli.d.ts", "LICENSE", "package.json"]) {
     assert(files.includes(path), `Missing packaged entry: ${path}`);
   }
-  assert(files.every((path) => /^(?:bin\/sharednet\.js|dist\/(?:server\/|protocol\/)?[\w-]+\.(?:js|d\.ts)|package\.json|README\.md|LICENSE)$/.test(path)), "Unexpected tarball contents");
+  assert(files.every((path) => /^(?:bin\/sharednet\.js|dist\/(?:server\/|protocol\/|modules\/)?[\w-]+\.(?:js|d\.ts)|package\.json|README\.md|LICENSE)$/.test(path)), "Unexpected tarball contents");
   const tarball = join(artifacts, pack.filename);
   const consumer = join(scratch, "consumer");
   await mkdir(consumer);
