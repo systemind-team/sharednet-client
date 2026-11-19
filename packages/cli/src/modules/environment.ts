@@ -9,10 +9,14 @@
  *   interest  a seat's files are the workspace paths its turns have named, in a command or in what
  *             a command printed, read from where the seat's shell was standing at the time
  *   attribute a change is by the seat that had a command running when the file was written; with
- *             several running, by the one whose command named the file; otherwise the author is
- *             unknown and the note names the seats that were working
+ *             several running, by the one whose command named the file, or else the one whose
+ *             shell stood in a folder that holds it (git and build scripts name no files);
+ *             otherwise the author is unknown and the note names the seats that were working
  *   push      a seat is told about a change, by someone else, to a file it has an interest in
  *             (`--env-audience affected`) or to any file (`all`)
+ *   copies    a folder mounted beside the workspace (`--env-watch`) is shared: where each seat
+ *             works on its own copy of the files and lands into the shared one, a seat is told
+ *             when a shared file changes and no longer matches the copy it holds
  *
  * The levels of `--env-push` add up, each one a time at which a seat is told:
  *
@@ -23,6 +27,7 @@
  *
  * Off by default. Every change and every delivery is logged in `environment.ndjson`.
  */
+import { readFileSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { join, posix } from "node:path";
 import { localError } from "../errors.ts";
@@ -112,6 +117,27 @@ export async function snapshotRoots(roots: readonly WatchRoot[], limit = SNAPSHO
     for (const [relative, state] of await snapshot(root.host, limit - all.size)) all.set(fileKey(root.mount, relative), state);
   }
   return all;
+}
+
+/** Where a watched file is on this machine, or null for a name no watched folder holds. */
+export function hostPath(roots: readonly WatchRoot[], key: string, workspace = "/workspace"): string | null {
+  const where = containerPath(key, workspace);
+  const root = [...roots].sort((a, b) => b.mount.length - a.mount.length).find((candidate) => where.startsWith(`${candidate.mount}/`));
+  return root ? join(root.host, where.slice(root.mount.length + 1)) : null;
+}
+
+/** Whether two watched files hold the same bytes now. Files over 2 MB, and any that cannot be read, count as different. */
+export function sameBytes(roots: readonly WatchRoot[], a: string, b: string): boolean {
+  const one = hostPath(roots, a);
+  const other = hostPath(roots, b);
+  if (one === null || other === null) return false;
+  try {
+    const size = statSync(one).size;
+    if (size !== statSync(other).size || size > 2_000_000) return false;
+    return readFileSync(one).equals(readFileSync(other));
+  } catch {
+    return false;
+  }
 }
 
 export function diffSnapshots(before: Snapshot, after: Snapshot): Change[] {
@@ -246,6 +272,8 @@ export interface Note {
   /** Why this seat: it changed the file itself earlier, it only read it, or the audience is everyone. */
   interest: "edited" | "read" | "all";
   seenTurn: number | null;
+  /** The seat's own copy of a shared file, when that copy is why it is told. */
+  copy?: string;
 }
 
 export type Delivery = "wake" | "post" | "note" | "held-edit";
@@ -260,11 +288,15 @@ export interface EnvironmentOptions {
   interestTurns?: number;
   /** Where the seats see the workspace, and where each seat's shell starts. */
   mount?: string;
+  /** The shared folders, as the start of their files' names (`best/`): a seat may hold its own copy of a file in one. */
+  shared?: readonly string[];
+  /** Whether two files hold the same bytes now; left out, a copy always counts as different. */
+  identical?: (a: string, b: string) => boolean;
 }
 
 interface Seen { at: number; turn: number; edited: number | null }
 interface Span { start: number; end: number | null }
-interface Call extends Span { paths: Set<string> }
+interface Call extends Span { paths: Set<string>; cwd: string }
 interface SeatState { seen: Map<string, Seen>; pending: Map<string, Note>; calls: Call[]; turns: Span[]; turn: number; cwd: string }
 
 /** More known files than this in what a command printed make it a listing, not a reading of each. */
@@ -330,7 +362,7 @@ export class Environment {
       const cwd = folderAfter(reading.fresh ? this.mount : mine.cwd, command);
       if (!reading.fresh) mine.cwd = cwd;
       const paths = new Set(pathsIn(command, this.known, this.mount, this.byEnding, cwd));
-      mine.calls.push({ start: at, end: null, paths });
+      mine.calls.push({ start: at, end: null, paths, cwd });
       for (const path of paths) named.add(path);
     }
     if (mine.calls.length > KEPT_CALLS) mine.calls.splice(0, mine.calls.length - KEPT_CALLS);
@@ -366,20 +398,39 @@ export class Environment {
       const naming = having((state) => state.calls.some((call) => then(call) && call.paths.has(change.path)));
       const running = having((state) => state.calls.some(then));
       const working = having((state) => state.turns.some(then));
-      const candidates = naming.length > 0 ? naming : running.length > 0 ? running : working;
+      // A command that names no file (git, a build script) changes what is under the folder it runs in:
+      // the seat whose shell stood deepest in a folder that holds the file. The workspace's own root holds everything and says nothing.
+      const where = containerPath(change.path, this.mount);
+      const depth = (state: SeatState) => Math.max(-1, ...state.calls.filter((call) => then(call) && call.cwd !== this.mount && where.startsWith(`${call.cwd}/`)).map((call) => call.cwd.split("/").length));
+      const deepest = Math.max(-1, ...running.map((seat) => depth(this.state.get(seat)!)));
+      const inside = deepest === -1 ? [] : running.filter((seat) => depth(this.state.get(seat)!) === deepest);
+      const candidates = naming.length > 0 ? naming : inside.length > 0 ? inside : running.length > 0 ? running : working;
       const by = candidates.length === 1 ? candidates[0]! : null;
       if (by !== null) {
         // The author has made the file its own: it is told when someone else changes it later.
         const own = this.state.get(by)!;
         own.seen.set(change.path, { at: own.seen.get(change.path)?.at ?? at, turn: own.seen.get(change.path)?.turn ?? own.turn, edited: change.mtimeMs ?? at });
       }
+      const sharedRoot = (this.options.shared ?? []).find((prefix) => change.path.startsWith(prefix));
       for (const seat of this.seats) {
         if (seat === by) continue;
         const mine = this.state.get(seat)!;
-        const seen = mine.seen.get(change.path);
-        // With the author unknown, a seat whose command named the file, or that was just working with it, is taken to be the author.
-        if (by === null && candidates.includes(seat) && (naming.includes(seat) || (seen !== undefined && seen.at >= from - this.ownMs))) continue;
-        const interested = seen !== undefined && (seen.edited !== null || mine.turn - seen.turn <= this.interestTurns);
+        const lasting = (seen: Seen | undefined): seen is Seen => seen !== undefined && (seen.edited !== null || mine.turn - seen.turn <= this.interestTurns);
+        let seen = mine.seen.get(change.path);
+        // With the author unknown, a seat whose command named the file or ran in its folder, or that was just working with it, is taken to be the author.
+        if (by === null && candidates.includes(seat) && (naming.includes(seat) || inside.includes(seat) || (seen !== undefined && seen.at >= from - this.ownMs))) continue;
+        let copy: string | undefined;
+        if (!lasting(seen) && sharedRoot !== undefined) {
+          // The seat's own copy of the shared file: the same path under another folder, the one it had last.
+          const ending = `/${change.path.slice(sharedRoot.length)}`;
+          for (const [path, held] of mine.seen) {
+            if (path === change.path || path.startsWith(sharedRoot) || !`/${path}`.endsWith(ending) || !lasting(held)) continue;
+            if (copy === undefined || held.at > mine.seen.get(copy)!.at) copy = path;
+          }
+          if (copy !== undefined && change.kind !== "deleted" && this.options.identical?.(change.path, copy)) copy = undefined;
+          if (copy !== undefined) seen = mine.seen.get(copy);
+        }
+        const interested = lasting(seen);
         if (this.options.audience === "affected" && !interested) continue;
         const last = this.told.get(`${seat}\n${change.path}`);
         if (last !== undefined && at - last < this.repeatMs) continue;
@@ -394,6 +445,7 @@ export class Environment {
           at: change.mtimeMs ?? at,
           interest: interested ? (seen!.edited !== null ? "edited" : "read") : "all",
           seenTurn: interested ? seen!.turn : null,
+          ...(copy !== undefined ? { copy } : {}),
         };
         mine.pending.set(change.path, note);
         if (!earlier) added.push(note);
@@ -431,7 +483,9 @@ const VERB = { changed: "changed", new: "is new", deleted: "was deleted" } as co
 /** One change, in one sentence, for the seat it goes to. With now left out, the age is the mark {ago}. */
 export function describeNote(note: Note, now: number | null): string {
   const who = note.by ?? (note.candidates.length > 0 ? `${note.candidates.join(" or ")} (working at the time)` : "no seat that was working (a check, a probe, or something a seat left running)");
-  const mine = note.interest === "edited" ? `you edited it in turn ${note.seenTurn}` : note.interest === "read" ? `you last had it in turn ${note.seenTurn}` : null;
+  const had = note.interest === "edited" ? `you edited in turn ${note.seenTurn}` : `you last had in turn ${note.seenTurn}`;
+  const mine = note.copy !== undefined ? `it no longer matches your copy ${note.copy}, which ${had}`
+    : note.interest === "edited" ? `you edited it in turn ${note.seenTurn}` : note.interest === "read" ? `you last had it in turn ${note.seenTurn}` : null;
   return `${note.path} ${VERB[note.kind]} ${now === null ? "{ago}" : ago(now - note.at)}, by ${who}${mine ? `; ${mine}` : ""}`;
 }
 

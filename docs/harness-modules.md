@@ -113,7 +113,8 @@ and by default nothing tells a seat that a file changed under it.
   of each). When a file a seat has an interest in is changed by someone else, the seat is told
   which file, who changed it, and in which turn it last had the file. The author is the seat
   that had a command running at the moment the file was written; with several running, the one
-  whose command named the file; otherwise the note names the seats that were working. A file a
+  whose command named the file, or else the one whose shell stood in a folder that holds it (git
+  and build scripts name no files); otherwise the note names the seats that were working. A file a
   seat only read stops being its concern after six of its turns; a file it changed stays its
   own. The levels add up, each one a time at which the seat is told:
   - `on-wake`: with its next wake, whatever caused the wake.
@@ -128,7 +129,10 @@ and by default nothing tells a seat that a file changed under it.
 - `--env-audience all` tells every other seat about every change, new files included. The
   default, `affected`, tells only the seats with an interest in the file.
 - `--env-watch <folder>:<path in the containers>` adds a folder that is mounted into the seats
-  beside the workspace. It can be given more than once.
+  beside the workspace. It can be given more than once. Such a folder is taken to be shared:
+  where each seat works on its own copy of the files and lands into the shared one, a seat is
+  told when a shared file changes and no longer matches the copy it holds (the same path under
+  another folder, compared byte for byte), so the seat whose copy was just landed is not told.
 
 Every change and every delivery is logged in `environment.ndjson`: what changed, who was in a
 turn, who was told, and how (`wake`, `post`, `note`, `held-edit`). The option changes Delivery

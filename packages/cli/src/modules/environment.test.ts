@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ENV_HOOK, Environment, containerPath, describeNote, diffSnapshots, editsIn, endings, envLineForAnother, envMessage, fileKey, folderAfter,
-  hookNotes, parseEnvAudience, parseEnvPush, parseEnvWatch, pathsIn, readLine, renderNotes, snapshot, snapshotRoots, workspacePath,
+  hookNotes, hostPath, parseEnvAudience, parseEnvPush, parseEnvWatch, pathsIn, readLine, renderNotes, sameBytes, snapshot, snapshotRoots, workspacePath,
 } from "./environment.ts";
 
 const made: string[] = [];
@@ -87,6 +87,16 @@ describe("folders mounted beside the workspace", () => {
     const known = new Set(["PLAN.md", "best/src/a.c", "/notes/log.md"]);
     expect(pathsIn('{"command":"cat /workspace/best/src/a.c /notes/log.md"}', known).sort()).toEqual(["/notes/log.md", "best/src/a.c"]);
     expect(editsIn(JSON.stringify({ name: "Edit", input: { file_path: "/notes/log.md" } }))).toEqual(["/notes/log.md"]);
+    // A file's place on this machine, and whether two of them hold the same bytes.
+    expect(hostPath(roots, "best/src/a.c")).toBe(join(best, "src", "a.c"));
+    expect(hostPath(roots, "PLAN.md")).toBe(join(workspace, "PLAN.md"));
+    expect(hostPath(roots, "/elsewhere/x")).toBeNull();
+    await mkdir(join(workspace, "mine", "src"), { recursive: true });
+    await writeFile(join(workspace, "mine", "src", "a.c"), "a");
+    expect(sameBytes(roots, "best/src/a.c", "mine/src/a.c")).toBe(true);
+    await writeFile(join(workspace, "mine", "src", "a.c"), "b");
+    expect(sameBytes(roots, "best/src/a.c", "mine/src/a.c")).toBe(false);
+    expect(sameBytes(roots, "best/src/a.c", "mine/src/none.c")).toBe(false);
   });
 });
 
@@ -209,6 +219,45 @@ describe("who is told about a change", () => {
     env.turnStarted("cc-2", 3, 50_000);
     const added = env.observe(changed(62_200), 60_000, 65_000);
     expect(added.map((note) => [note.seat, note.by])).toEqual([["cc-3", "cc-1"]]);
+  });
+
+  it("takes the seat whose shell stood in the file's folder for the author of what git or a build rewrote there", () => {
+    const env = new Environment(seats, { audience: "affected" });
+    env.know(["candidates/cc-1/repo/src/a.c", "candidates/cc-2/repo/src/a.c", "NOTES.md"]);
+    ran(env, "cc-3", 1, "cat /workspace/candidates/cc-1/repo/src/a.c /workspace/NOTES.md", 1_000, 1_500);
+    env.turnEnded("cc-3", 2_000);
+    // Two seats run commands that name no file, each in its own folder.
+    ran(env, "cc-1", 2, "cd /workspace/candidates/cc-1/repo", 59_000, 59_100);
+    ran(env, "cc-1", 2, "git rebase --abort; git reset -q --hard origin/main", 60_000, 66_000);
+    ran(env, "cc-2", 2, "cd /workspace/candidates/cc-2/repo && sh compile.sh", 61_000, 69_000);
+    const added = env.observe([{ path: "candidates/cc-1/repo/src/a.c", kind: "changed", mtimeMs: 63_000 }, { path: "candidates/cc-1/repo/src/old.c", kind: "deleted" }], 60_000, 65_000);
+    expect(added.map((note) => [note.seat, note.path, note.by])).toEqual([["cc-3", "candidates/cc-1/repo/src/a.c", "cc-1"]]);
+    expect(env.waiting("cc-1")).toEqual([]);
+    // The workspace's own root holds every file: standing there says nothing about who wrote one.
+    const next = env.observe([{ path: "NOTES.md", kind: "changed", mtimeMs: 63_500 }], 65_000, 70_000);
+    expect(next).toMatchObject([{ seat: "cc-3", by: null, candidates: ["cc-1", "cc-2"] }]);
+  });
+
+  it("tells a seat when a shared file changes and no longer matches the copy the seat holds", () => {
+    const matching = new Set<string>();
+    const env = new Environment(seats, { audience: "affected", shared: ["best/"], identical: (a, b) => matching.has(`${a} ${b}`) });
+    env.know(["best/src/main.c", "candidates/cc-1/repo/src/main.c", "candidates/cc-2/repo/src/main.c"]);
+    // Two builders, each writing its own copy.
+    for (const [seat, at] of [["cc-1", 1_000], ["cc-2", 3_000]] as const) {
+      ran(env, seat, 1, `cd /workspace/candidates/${seat}/repo && cat > src/main.c <<'EOF'\nint main;\nEOF`, at, at + 500);
+      expect(env.observe([{ path: `candidates/${seat}/repo/src/main.c`, kind: "changed", mtimeMs: at + 200 }], at - 500, at + 900)).toEqual([]);
+      env.turnEnded(seat, at + 1_000);
+    }
+    // The third seat lands cc-2's copy into the shared folder: it now matches cc-2's and not cc-1's.
+    matching.add("best/src/main.c candidates/cc-2/repo/src/main.c");
+    ran(env, "cc-3", 4, "tools/promote cc-2 f012de2", 60_000, 62_000);
+    const added = env.observe([{ path: "best/src/main.c", kind: "changed", mtimeMs: 61_000 }], 58_000, 63_000);
+    expect(added).toMatchObject([{ seat: "cc-1", path: "best/src/main.c", by: "cc-3", interest: "edited", copy: "candidates/cc-1/repo/src/main.c" }]);
+    expect(describeNote(added[0]!, 66_000)).toBe("best/src/main.c changed 5 s ago, by cc-3; it no longer matches your copy candidates/cc-1/repo/src/main.c, which you edited in turn 1");
+    expect(env.waiting("cc-2")).toEqual([]);
+    // A file that is not in a shared folder has no copies: cc-1's own file changing tells nobody about cc-2's.
+    ran(env, "cc-1", 2, "cd /workspace/candidates/cc-1/repo && printf x >> src/main.c", 90_000, 90_500);
+    expect(env.observe([{ path: "candidates/cc-1/repo/src/main.c", kind: "changed", mtimeMs: 90_200 }], 88_000, 91_000)).toEqual([]);
   });
 
   it("leaves both out when two seats' commands named the file at once, and tells a third", () => {

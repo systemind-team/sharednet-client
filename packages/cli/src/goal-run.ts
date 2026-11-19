@@ -1,7 +1,7 @@
 import { compiledPrompt, COMPILED_HELP, type CompiledState } from "./compiled.ts";
 import { controlPaths, isTaskMessage, type Task } from "./board-controls.ts";
 import { DEFAULT_MODULES, describeModules, seatEnvironment, type HarnessModules } from "./modules/index.ts";
-import { ENV_HELP, ENV_HOOK, ENV_HOOK_DIR, ENV_HOOK_PATH, ENV_HOOKS, ENV_POST_GAP_MS, ENV_SCAN_MS, ENV_SETTLE_MS, Environment, diffSnapshots, envLineForAnother, envMessage, hookNotes, renderNotes, snapshotRoots, type Delivery, type Note } from "./modules/environment.ts";
+import { ENV_HELP, ENV_HOOK, ENV_HOOK_DIR, ENV_HOOK_PATH, ENV_HOOKS, ENV_POST_GAP_MS, ENV_SCAN_MS, ENV_SETTLE_MS, Environment, diffSnapshots, envLineForAnother, envMessage, fileKey, hookNotes, renderNotes, sameBytes, snapshotRoots, type Delivery, type Note } from "./modules/environment.ts";
 import { PROBE_HELP, probeMessage } from "./modules/information.ts";
 import { SBAR_HELP, renderRequests, requestsFor } from "./modules/protocol.ts";
 import { ACTIVITY_HELP, TASK_JUDGE_HELP, renderActivity } from "./modules/state.ts";
@@ -882,8 +882,15 @@ export async function runGoal(
   // Who is in a turn now: the activity view reads it, so it is the runner's record, not a seat's word.
   const busy = new Set<string>();
   // The workspace as a participant (modules/environment.ts); null unless --env-push is on.
-  const watch = modules.environment.push !== "off" ? new Environment(plan.agents.map((agent) => agent.name), { audience: modules.environment.audience }) : null;
   const watchRoots = [{ host: plan.workspace, mount: CONTAINER_WORKSPACE }, ...modules.environment.watch];
+  const watch = modules.environment.push !== "off"
+    ? new Environment(plan.agents.map((agent) => agent.name), {
+        audience: modules.environment.audience,
+        // A folder mounted beside the workspace is shared; a seat may hold its own copy of a file in it.
+        shared: modules.environment.watch.map((root) => fileKey(root.mount, "")),
+        identical: (a, b) => sameBytes(watchRoots, a, b),
+      })
+    : null;
   const envInTurn = (seat: { driver: string } | null) => modules.environment.push === "on-action" && seat?.driver === "claude-code";
   const envPosts = modules.environment.push === "on-event" || modules.environment.push === "on-action";
   if (input.harnessMode && turnPolicy !== "legacy") throw localError("invalid_arguments", "--turn-policy cooperative-v1 cannot override a frozen --harness-mode.");
@@ -1131,7 +1138,7 @@ export async function runGoal(
     const given = async (seat: SeatRecord, notes: Note[], how: Delivery) => {
       if (!watch || notes.length === 0) return;
       watch.delivered(seat.name, notes.map((note) => note.id), dependencies.now().getTime());
-      await logEnv({ event: "delivered", seat: seat.name, how, turn: seat.turns, notes: notes.map((note) => ({ id: note.id, path: note.path, kind: note.kind, by: note.by, interest: note.interest })) });
+      await logEnv({ event: "delivered", seat: seat.name, how, turn: seat.turns, notes: notes.map((note) => ({ id: note.id, path: note.path, kind: note.kind, by: note.by, interest: note.interest, ...(note.copy !== undefined ? { copy: note.copy } : {}) })) });
     };
     const handed = new Map<string, string>();
     const collectInTurn = async (seat: SeatRecord) => {
@@ -1247,7 +1254,7 @@ export async function runGoal(
         watch.know(after.keys());
         if (changes.length > 0) {
           const added = watch.observe(changes, since, now);
-          await logEnv({ event: "changes", changes: changes.slice(0, 200), total: changes.length, in_turn: [...busy], notes: added.map((note) => ({ id: note.id, seat: note.seat, path: note.path, by: note.by, interest: note.interest })) });
+          await logEnv({ event: "changes", changes: changes.slice(0, 200), total: changes.length, in_turn: [...busy], notes: added.map((note) => ({ id: note.id, seat: note.seat, path: note.path, by: note.by, interest: note.interest, ...(note.copy !== undefined ? { copy: note.copy } : {}) })) });
         }
         before = after;
         since = now;
