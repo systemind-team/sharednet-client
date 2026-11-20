@@ -200,6 +200,14 @@ wake template and source commit too when freezing a study protocol.
   home (session, sign-in, guest seat in the Room) and anything it installs outside
   `/workspace`. Put what the agents must share in the workspace, for example a virtual
   environment in `/workspace/.venv`.
+- **Or each agent has its own fork (`--workspace-layout forks`).** Then `/workspace` in a
+  container is that agent's own clone, your directory is the trunk (its own git repository,
+  made one if it is not; commit what you have first), and nothing an agent writes reaches the
+  others or your directory until it lands. An agent commits and runs `sharednet land "<what
+  changed>"`; the runner merges the commit into the trunk, refuses it if it conflicts with what
+  landed meanwhile, and with `--land-check '<command>'` accepts it only if the command passes in
+  a clean copy of the result. What has not landed when the Room ends is not in your directory;
+  it is kept in the record. See [harness modules](harness-modules.md#workspace).
 - **Checks run in a container of their own.** It has the image and the workspace, and nothing
   an agent installed or holds, so a check sees only what was delivered to the workspace. Your
   SharedNet account key stays outside every container.
@@ -260,6 +268,7 @@ sensitive even though credential files are excluded.
 | `checks.ndjson` | every check: when, why it ran (schedule or claim), the exit code, the output |
 | `wakes.ndjson` | every turn: which seat, woken by what, the span of messages it was handed, exit code, tokens |
 | `workspace.git` | the workspace each time it changed, tagged with the Room sequence it follows (`git --git-dir=runs/rom_…/workspace.git log`); `.env*` and `.sharednet/` are never included |
+| `landings.ndjson`, `forks/<seat>/`, `landing/<seat>/` | with `--workspace-layout forks`: every landing asked for and its outcome, each agent's fork as it was at the end, and the requests and bundles the landings travelled in |
 | `agents/<seat>/turn-NNN.jsonl` | each turn's raw stream from the harness |
 | `agents/<seat>/home/` | the agent's own session files: Codex in `.codex/sessions/`, Claude Code in `.claude/projects/` |
 | `gateway/` | with `--isolate`: the gateway's access logs, `sharednet.log` and one per model API, each request with the container address it came from |

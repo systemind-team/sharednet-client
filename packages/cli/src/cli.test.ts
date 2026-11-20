@@ -360,6 +360,23 @@ describe("reach: forming a group from the account CLI", () => {
     expect(taken.stderr.join(" ")).not.toContain("--disallow-tools");
   });
 
+  it("takes the workspace layout and its landing check, and refuses a layout it does not know, a check with nothing to land, and a compiled Room", async () => {
+    const run = (...options: string[]) => harness(["goal", "run", "no-such-goal-file.md", "--agent", "claude-code", "--until", "after: 1h", ...options], []);
+    const layout = await run("--workspace-layout", "branches");
+    expect(layout.stderr.join(" ")).toContain("--workspace-layout is shared or forks");
+    expect(layout.requests).toEqual([]);
+    expect((await run("--land-check", "./compile.sh")).stderr.join(" ")).toContain("--land-check needs --workspace-layout forks");
+    expect((await run("--workspace-layout", "shared", "--land-check", "./compile.sh")).stderr.join(" ")).toContain("--land-check needs --workspace-layout forks");
+    expect((await run("--type", "compiled", "--workspace-layout", "forks")).stderr.join(" ")).toContain("The module options are for plain board Rooms");
+    // Accepted, the run goes on to the goal file, which does not exist.
+    for (const options of [["--workspace-layout", "shared"], ["--workspace-layout", "forks"], ["--workspace-layout", "forks", "--land-check", "./compile.sh && ./executable -version"]]) {
+      const taken = await run(...options);
+      expect(taken.exitCode).not.toBe(0);
+      expect(taken.stderr.join(" ")).not.toContain("--workspace-layout");
+      expect(taken.stderr.join(" ")).not.toContain("--land-check");
+    }
+  });
+
   it("takes the workspace push and its audience, and refuses a level it does not know, an audience with no push, and a compiled Room", async () => {
     const run = (...options: string[]) => harness(["goal", "run", "no-such-goal-file.md", "--agent", "claude-code", "--until", "after: 1h", ...options], []);
     const level = await run("--env-push", "always");

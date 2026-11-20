@@ -42,6 +42,9 @@ export interface EnvironmentModule { push: EnvPush; audience: EnvAudience; watch
 export const ENV_MARK = "[env]";
 export const ENV_HELP = `The workspace itself tells you when a file you have read or changed is changed by someone else: with a wake, or in a line that starts with ${ENV_MARK}, or inside your turn. No model writes these; they come from the files. When one names a file you rely on, look at the file again before you build on what you remember of it.`;
 
+/** The same, where each seat works in its own fork and the trunk changes by landings (`--workspace-layout forks`). */
+export const ENV_HELP_FORKS = `The trunk tells you when a landing changes a file you have read or changed in your fork: with a wake, or in a line that starts with ${ENV_MARK}, or inside your turn. No model writes these; they come from the landings. When one names a file you rely on, run \`git pull\` before you build on your copy of it.`;
+
 export function parseEnvPush(raw: string | undefined): EnvPush {
   if (raw === undefined) return "off";
   if (raw === "off" || raw === "on-wake" || raw === "on-event" || raw === "on-action") return raw;
@@ -312,9 +315,12 @@ export interface Note {
   seenTurn: number | null;
   /** The seat's own copy of a shared file, when that copy is why it is told. */
   copy?: string;
+  /** In a forked workspace: the landing that brought the change to the trunk (the start of its commit's name). */
+  landing?: string;
 }
 
-export type Delivery = "wake" | "post" | "note" | "held-edit";
+/** How a note left the queue: said with a wake, in a Room line, inside a turn, by holding a write; or not said, because the seat's fork already held the landing. */
+export type Delivery = "wake" | "post" | "note" | "held-edit" | "pulled";
 
 export interface EnvironmentOptions {
   audience: EnvAudience;
@@ -449,50 +455,69 @@ export class Environment {
       const inside = deepest === -1 ? [] : running.filter((seat) => depth(this.state.get(seat)!) === deepest);
       const candidates = naming.length > 0 ? naming : inside.length > 0 ? inside : running.length > 0 ? running : working;
       const by = candidates.length === 1 ? candidates[0]! : null;
-      if (by !== null) {
-        // The author has made the file its own: it is told when someone else changes it later.
-        const own = this.state.get(by)!;
-        own.seen.set(change.path, { at: own.seen.get(change.path)?.at ?? at, turn: own.seen.get(change.path)?.turn ?? own.turn, edited: change.mtimeMs ?? at });
-      }
-      const sharedRoot = (this.options.shared ?? []).find((prefix) => change.path.startsWith(prefix));
-      for (const seat of this.seats) {
-        if (seat === by) continue;
-        const mine = this.state.get(seat)!;
-        const lasting = (seen: Seen | undefined): seen is Seen => seen !== undefined && (seen.edited !== null || mine.turn - seen.turn <= this.interestTurns);
-        let seen = mine.seen.get(change.path);
-        // With the author unknown, a seat whose command named the file or ran in its folder, or that was just working with it, is taken to be the author.
-        if (by === null && candidates.includes(seat) && (naming.includes(seat) || inside.includes(seat) || (seen !== undefined && seen.at >= from - this.ownMs))) continue;
-        let copy: string | undefined;
-        if (!lasting(seen) && sharedRoot !== undefined) {
-          // The seat's own copy of the shared file: the same path under another folder, the one it had last.
-          const ending = `/${change.path.slice(sharedRoot.length)}`;
-          for (const [path, held] of mine.seen) {
-            if (path === change.path || path.startsWith(sharedRoot) || !`/${path}`.endsWith(ending) || !lasting(held)) continue;
-            if (copy === undefined || held.at > mine.seen.get(copy)!.at) copy = path;
-          }
-          if (copy !== undefined && change.kind !== "deleted" && this.options.identical?.(change.path, copy)) copy = undefined;
-          if (copy !== undefined) seen = mine.seen.get(copy);
+      added.push(...this.tell(change, by, candidates, { naming, inside, from }, at));
+    }
+    return added;
+  }
+
+  /**
+   * A landing on the trunk of a forked workspace: the files it changed, and the seat that landed
+   * it. The author is known, so nothing is worked out from times: every other seat with an
+   * interest in a file is told, and the file is the lander's own from now on.
+   */
+  landed(by: string, changes: readonly Change[], at: number, landing: string): Note[] {
+    return changes.flatMap((change) => this.tell({ ...change, mtimeMs: at }, by, [by], { naming: [], inside: [], from: at }, at, landing));
+  }
+
+  /** One change and its author, as far as it is known: who is told. Returns the notes this adds. */
+  private tell(change: Change, by: string | null, candidates: readonly string[], near: { naming: readonly string[]; inside: readonly string[]; from: number }, at: number, landing?: string): Note[] {
+    const added: Note[] = [];
+    const { naming, inside, from } = near;
+    if (by !== null) {
+      // The author has made the file its own: it is told when someone else changes it later.
+      const own = this.state.get(by)!;
+      own.seen.set(change.path, { at: own.seen.get(change.path)?.at ?? at, turn: own.seen.get(change.path)?.turn ?? own.turn, edited: change.mtimeMs ?? at });
+    }
+    const sharedRoot = (this.options.shared ?? []).find((prefix) => change.path.startsWith(prefix));
+    for (const seat of this.seats) {
+      if (seat === by) continue;
+      const mine = this.state.get(seat)!;
+      const lasting = (seen: Seen | undefined): seen is Seen => seen !== undefined && (seen.edited !== null || mine.turn - seen.turn <= this.interestTurns);
+      let seen = mine.seen.get(change.path);
+      // With the author unknown, a seat whose command named the file or ran in its folder, or that was just working with it, is taken to be the author.
+      if (by === null && candidates.includes(seat) && (naming.includes(seat) || inside.includes(seat) || (seen !== undefined && seen.at >= from - this.ownMs))) continue;
+      let copy: string | undefined;
+      if (!lasting(seen) && sharedRoot !== undefined) {
+        // The seat's own copy of the shared file: the same path under another folder, the one it had last.
+        const ending = `/${change.path.slice(sharedRoot.length)}`;
+        for (const [path, held] of mine.seen) {
+          if (path === change.path || path.startsWith(sharedRoot) || !`/${path}`.endsWith(ending) || !lasting(held)) continue;
+          if (copy === undefined || held.at > mine.seen.get(copy)!.at) copy = path;
         }
-        const interested = lasting(seen);
-        if (this.options.audience === "affected" && !interested) continue;
-        const last = this.told.get(`${seat}\n${change.path}`);
-        if (last !== undefined && at - last < this.repeatMs) continue;
-        const earlier = mine.pending.get(change.path);
-        const note: Note = {
-          id: earlier?.id ?? `n${(this.serial += 1)}`,
-          seat,
-          path: change.path,
-          kind: change.kind,
-          by: earlier && earlier.by !== by ? null : by,
-          candidates: [...new Set([...(earlier?.candidates ?? []), ...candidates])].filter((name) => name !== seat),
-          at: change.mtimeMs ?? at,
-          interest: interested ? (seen!.edited !== null ? "edited" : "read") : "all",
-          seenTurn: interested ? seen!.turn : null,
-          ...(copy !== undefined ? { copy } : {}),
-        };
-        mine.pending.set(change.path, note);
-        if (!earlier) added.push(note);
+        if (copy !== undefined && change.kind !== "deleted" && this.options.identical?.(change.path, copy)) copy = undefined;
+        if (copy !== undefined) seen = mine.seen.get(copy);
       }
+      const interested = lasting(seen);
+      if (this.options.audience === "affected" && !interested) continue;
+      // A landing is one event and is always told; a file that keeps being written is not announced again at once.
+      const last = this.told.get(`${seat}\n${change.path}`);
+      if (landing === undefined && last !== undefined && at - last < this.repeatMs) continue;
+      const earlier = mine.pending.get(change.path);
+      const note: Note = {
+        id: earlier?.id ?? `n${(this.serial += 1)}`,
+        seat,
+        path: change.path,
+        kind: change.kind,
+        by: earlier && earlier.by !== by ? null : by,
+        candidates: [...new Set([...(earlier?.candidates ?? []), ...candidates])].filter((name) => name !== seat),
+        at: change.mtimeMs ?? at,
+        interest: interested ? (seen!.edited !== null ? "edited" : "read") : "all",
+        seenTurn: interested ? seen!.turn : null,
+        ...(copy !== undefined ? { copy } : {}),
+        ...(landing !== undefined ? { landing } : {}),
+      };
+      mine.pending.set(change.path, note);
+      if (!earlier) added.push(note);
     }
     return added;
   }
@@ -529,8 +554,13 @@ export function describeNote(note: Note, now: number | null): string {
   const had = note.interest === "edited" ? `you edited in turn ${note.seenTurn}` : `you last had in turn ${note.seenTurn}`;
   const mine = note.copy !== undefined ? `it no longer matches your copy ${note.copy}, which ${had}`
     : note.interest === "edited" ? `you edited it in turn ${note.seenTurn}` : note.interest === "read" ? `you last had it in turn ${note.seenTurn}` : null;
-  return `${note.path} ${VERB[note.kind]} ${now === null ? "{ago}" : ago(now - note.at)}, by ${who}${mine ? `; ${mine}` : ""}`;
+  const when = now === null ? "{ago}" : ago(now - note.at);
+  if (note.landing !== undefined) return `${note.path} ${VERB[note.kind]} on the trunk ${when}, in a landing by ${who} (${note.landing})${mine ? `; ${mine}` : ""}`;
+  return `${note.path} ${VERB[note.kind]} ${when}, by ${who}${mine ? `; ${mine}` : ""}`;
 }
+
+/** What a seat of a forked workspace does about a landing: the change is on the trunk, not in its fork. */
+export const LANDING_ADVICE = "It is on the trunk and not in your fork yet: run `git pull` before you build on your copy of it.";
 
 export const NOTE_LIMIT = 12;
 
@@ -539,7 +569,8 @@ export function renderNotes(notes: readonly Note[], now: number): string | null 
   if (notes.length === 0) return null;
   const shown = notes.slice(0, NOTE_LIMIT).map((note) => `- ${describeNote(note, now)}`);
   const rest = notes.length > NOTE_LIMIT ? [`- and ${notes.length - NOTE_LIMIT} more files`] : [];
-  return ["Changed in the workspace by others since you last saw these files:", ...shown, ...rest].join("\n");
+  const landings = notes.every((note) => note.landing !== undefined);
+  return [landings ? "Landed on the trunk by others since you last had these files (`git pull` brings them into your fork):" : "Changed in the workspace by others since you last saw these files:", ...shown, ...rest].join("\n");
 }
 
 /** The Room line that tells one seat, and wakes it when it is idle. */
@@ -557,8 +588,8 @@ export function envLineForAnother(content: string, seat: string): boolean {
 }
 
 /** What the hook in a seat's container reads: the notes still waiting. The hook fills in each one's age when it gives it. */
-export function hookNotes(notes: readonly Note[], mount = "/workspace"): Array<{ id: string; file: string; at: number; text: string }> {
-  return notes.map((note) => ({ id: note.id, file: containerPath(note.path, mount), at: note.at, text: describeNote(note, null) }));
+export function hookNotes(notes: readonly Note[], mount = "/workspace"): Array<{ id: string; file: string; at: number; text: string; advice?: string }> {
+  return notes.map((note) => ({ id: note.id, file: containerPath(note.path, mount), at: note.at, text: describeNote(note, null), ...(note.landing !== undefined ? { advice: LANDING_ADVICE } : {}) }));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -586,6 +617,8 @@ try { done = new Set(fs.readFileSync(dir + '/delivered.ndjson', 'utf8').split('\
 const age = (ms) => (ms < 90000 ? Math.max(1, Math.round(ms / 1000)) + ' s ago' : Math.round(ms / 60000) + ' min ago');
 const waiting = pending.filter((note) => !done.has(note.id)).map((note) => ({ ...note, text: String(note.text).replace('{ago}', age(Date.now() - note.at)) }));
 if (waiting.length === 0) process.exit(0);
+// What to do about the notes: the runner's own words for a forked workspace, or else to look at the file again.
+const advice = (notes, otherwise) => { const one = notes.find((note) => typeof note.advice === 'string'); return one ? one.advice : otherwise; };
 const give = (notes, how) => fs.appendFileSync(dir + '/delivered.ndjson', notes.map((note) => JSON.stringify({ id: note.id, how, at: new Date().toISOString() }) + '\n').join(''));
 const event = input.hook_event_name;
 const tool = input.tool_input || {};
@@ -639,12 +672,12 @@ if (event === 'PreToolUse') {
   }
   if (mine.length === 0) process.exit(0);
   give(mine, 'held-edit');
-  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'SharedNet workspace: ' + mine.map((note) => note.text).join('; ') + '. This ' + what + ' was held once and nothing was written. Look at the file as it is now, then repeat or revise the ' + what + '.' } }));
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'SharedNet workspace: ' + mine.map((note) => note.text).join('; ') + '. This ' + what + ' was held once and nothing was written. ' + advice(mine, 'Look at the file as it is now, then repeat or revise the ' + what + '.') } }));
   process.exit(0);
 }
 if (event === 'PostToolUse') {
   give(waiting, 'note');
-  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: 'SharedNet workspace, changed by others while you work: ' + waiting.map((note) => note.text).join('; ') + '. Look at a file again before you build on what you remember of it.' } }));
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: 'SharedNet workspace, changed by others while you work: ' + waiting.map((note) => note.text).join('; ') + '. ' + advice(waiting, 'Look at a file again before you build on what you remember of it.') } }));
 }
 `;
 

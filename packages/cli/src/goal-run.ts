@@ -1,11 +1,12 @@
 import { compiledPrompt, COMPILED_HELP, type CompiledState } from "./compiled.ts";
 import { controlPaths, isTaskMessage, type Task } from "./board-controls.ts";
 import { DEFAULT_MODULES, describeModules, seatEnvironment, type HarnessModules } from "./modules/index.ts";
-import { ENV_HELP, ENV_HOOK, ENV_HOOK_DIR, ENV_HOOK_PATH, ENV_HOOKS, ENV_POST_GAP_MS, ENV_SCAN_MS, ENV_SETTLE_MS, Environment, diffSnapshots, envLineForAnother, envMessage, fileKey, hookNotes, renderNotes, sameBytes, snapshotRoots, type Delivery, type Note } from "./modules/environment.ts";
+import { ENV_HELP, ENV_HELP_FORKS, ENV_HOOK, ENV_HOOK_DIR, ENV_HOOK_PATH, ENV_HOOKS, ENV_POST_GAP_MS, ENV_SCAN_MS, ENV_SETTLE_MS, Environment, diffSnapshots, envLineForAnother, envMessage, fileKey, hookNotes, renderNotes, sameBytes, snapshotRoots, type Delivery, type Note } from "./modules/environment.ts";
 import { PROBE_HELP, probeMessage } from "./modules/information.ts";
 import { SBAR_HELP, renderRequests, requestsFor } from "./modules/protocol.ts";
 import { ACTIVITY_HELP, TASK_JUDGE_HELP, renderActivity } from "./modules/state.ts";
 import { reachable, topologyHelp } from "./modules/topology.ts";
+import { CONTAINER_FORKS, CONTAINER_LAND, CONTAINER_LAND_CHECKS, CONTAINER_TRUNK, LAND_CHECK_LIMIT_S, LAND_POLL_MS, Trunk, forkSetup, forksHelp, pendingLandings, prepareTrunk, readLandRequest, type LandResult, type TrunkInfo } from "./modules/workspace.ts";
 import { TASK_HELP, MENTION_HELP, TASK_PROFILE, TASK_HOOK, TASK_HOOK_SETTINGS } from "./task-guard.ts";
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
@@ -25,6 +26,9 @@ import { mentions } from "./triggers.ts";
  * sandbox: its own processes, its own home, its own seat. The containers share
  * one thing, the workspace, mounted at /workspace in each. The checks run in
  * one more container, which has the workspace and nothing an Agent installed.
+ * With `--workspace-layout forks` they share no folder: each has its own fork of
+ * the workspace at /workspace, and the workspace is the trunk, which changes
+ * only when the runner lands a seat's commit on it (modules/workspace.ts).
  * The owner's account key never enters any of them.
  * Isolated (`--isolate`), the containers sit on an internal network whose one
  * way out is a gateway the runner starts: it reaches SharedNet and the drivers'
@@ -547,8 +551,9 @@ const COOPERATIVE_TURNS = [
 const COOPERATIVE_REMINDER = "Continue under the cooperative-turn policy: complete one bounded work unit, publish actionable results with sharednet say, then finish your response and end your turn. If blocked, request what you need and yield; do not poll or wait. A handoff is not DONE.";
 
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
-export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules }): string {
+export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules; trunkBranch?: string }): string {
   const modules = input.modules ?? DEFAULT_MODULES;
+  const forked = modules.workspace.layout === "forks";
   const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
   const single = input.seats.length === 1;
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
@@ -566,8 +571,10 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
     ...(claims.length > 0 ? [`Say ${claims.join(" or ")} in the Room only when you believe the goal is met: saying it runs the check.`] : []),
     "",
     single
-      ? `You work in this directory (${CONTAINER_WORKSPACE}) in your own container. Use the SharedNet Room to record concise progress and the final completion claim:`
-      : `You share this directory (${CONTAINER_WORKSPACE}) with the others, and only this one: each of you works in its own container, so what you install elsewhere is yours alone. Talk to them only through the Room, with the sharednet command:`,
+      ? `You work in this directory (${CONTAINER_WORKSPACE})${forked ? ", your own fork of the trunk (a git clone)," : ""} in your own container. Use the SharedNet Room to record concise progress and the final completion claim:`
+      : forked
+        ? `You work in this directory (${CONTAINER_WORKSPACE}), which is yours alone: your own fork of the team's trunk (a git clone), in your own container. Each of the others has its own. Talk to them only through the Room, with the sharednet command:`
+        : `You share this directory (${CONTAINER_WORKSPACE}) with the others, and only this one: each of you works in its own container, so what you install elsewhere is yours alone. Talk to them only through the Room, with the sharednet command:`,
     "  sharednet read --last 30 --json    what has been said",
     '  sharednet say "…" --json          say something; keep it short',
     ...(input.roomType === "compiled" ? [COMPILED_HELP] : []),
@@ -586,6 +593,7 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
         : "Agree in the Room who does what, do your part, and end your turn when there is nothing more to do now.",
     ...(input.mentionGate ? [MENTION_HELP] : []),
     ...(input.taskGate ? [TASK_HELP] : []),
+    ...(forked ? [forksHelp({ branch: input.trunkBranch ?? "main", landCheck: modules.workspace.landCheck, single })] : []),
     ...moduleHelp(input.seat.name, input.seats.map((seat) => seat.name), modules),
   ].join("\n");
 }
@@ -598,7 +606,7 @@ export function moduleHelp(seat: string, names: readonly string[], modules: Harn
     ...topologyHelp(seat, names, modules.topology),
     ...(modules.messageSchema === "sbar" ? [SBAR_HELP] : []),
     ...(modules.probe ? [PROBE_HELP] : []),
-    ...(modules.environment.push !== "off" ? [ENV_HELP] : []),
+    ...(modules.environment.push !== "off" ? [modules.workspace.layout === "forks" ? ENV_HELP_FORKS : ENV_HELP] : []),
   ];
 }
 
@@ -835,6 +843,8 @@ export interface GoalRunInput {
   codexModel?: CodexModel;
   /** The module slots (modules/index.ts); left out, every slot keeps today's behaviour. */
   modules?: HarnessModules;
+  /** The trunk of a forked workspace, when the caller has made it ready already; left out, the run makes it ready. */
+  trunk?: TrunkInfo;
 }
 
 export interface GoalRunDependencies {
@@ -882,7 +892,9 @@ export async function runGoal(
   // Who is in a turn now: the activity view reads it, so it is the runner's record, not a seat's word.
   const busy = new Set<string>();
   // The workspace as a participant (modules/environment.ts); null unless --env-push is on.
-  const watchRoots = [{ host: plan.workspace, mount: CONTAINER_WORKSPACE }, ...modules.environment.watch];
+  // Forked, /workspace is each seat's own fork, which is nobody else's business: the trunk speaks through its landings.
+  const forked = modules.workspace.layout === "forks";
+  const watchRoots = [...(forked ? [] : [{ host: plan.workspace, mount: CONTAINER_WORKSPACE }]), ...modules.environment.watch];
   const watch = modules.environment.push !== "off"
     ? new Environment(plan.agents.map((agent) => agent.name), {
         audience: modules.environment.audience,
@@ -917,6 +929,18 @@ export async function runGoal(
   await mkdir(input.out, { recursive: true });
   const wakeLog = join(input.out, "wakes.ndjson");
   await writeFile(wakeLog, "");
+  // A forked workspace: the trunk is the workspace's own repository, and each seat has a folder for its fork and one for its landings.
+  const trunkInfo = forked ? input.trunk ?? await prepareTrunk(plan.workspace, input.out) : null;
+  const forksRoot = join(input.out, "forks");
+  const landRoot = join(input.out, "landing");
+  const landChecks = join(input.out, "landing-checks");
+  if (forked) {
+    for (const agent of plan.agents) {
+      await mkdir(join(forksRoot, agent.name), { recursive: true });
+      await mkdir(join(landRoot, agent.name), { recursive: true });
+    }
+    await mkdir(landChecks, { recursive: true });
+  }
 
   /** An Agent's container: the shared workspace, this CLI, and a Codex seat's login; idle until a turn runs in it. */
   const startContainer = (seat: SeatRecord) => docker([
@@ -925,8 +949,14 @@ export async function runGoal(
     "--name",
     containerName(input.roomId, seat.name),
     ...(isolated ? ["--network", names.network] : ["--add-host", "host.docker.internal:host-gateway"]),
-    "--volume",
-    `${plan.workspace}:${CONTAINER_WORKSPACE}`,
+    ...(forked
+      ? [
+          "--volume", `${join(forksRoot, seat.name)}:${CONTAINER_WORKSPACE}`,
+          "--volume", `${plan.workspace}:${CONTAINER_TRUNK}:ro`,
+          "--volume", `${forksRoot}:${CONTAINER_FORKS}:ro`,
+          "--volume", `${join(landRoot, seat.name)}:${CONTAINER_LAND}`,
+        ]
+      : ["--volume", `${plan.workspace}:${CONTAINER_WORKSPACE}`]),
     "--volume",
     `${plan.cli.root}:${CONTAINER_CLI}:ro`,
     ...(seat.driver === "codex" && plan.codexAuth?.kind === "login" ? ["--volume", `${plan.codexAuth.file}:${CONTAINER_CODEX_AUTH}:ro`] : []),
@@ -935,7 +965,7 @@ export async function runGoal(
     "infinity",
   ]);
   /** The checks' container: the image and the shared workspace, and nothing an Agent installed or holds. */
-  const startChecks = () => docker(["run", "--detach", "--name", checks, ...(isolated ? ["--network", names.network] : []), "--volume", `${plan.workspace}:${CONTAINER_WORKSPACE}`, plan.image, "sleep", "infinity"]);
+  const startChecks = () => docker(["run", "--detach", "--name", checks, ...(isolated ? ["--network", names.network] : []), "--volume", `${plan.workspace}:${CONTAINER_WORKSPACE}`, ...(forked ? ["--volume", `${landChecks}:${CONTAINER_LAND_CHECKS}`] : []), plan.image, "sleep", "infinity"]);
   /** An isolated run's internal network and its gateway, the network's one way out; up before any Agent starts. */
   const startGateway = async () => {
     const created = await docker(["network", "create", "--internal", names.network]);
@@ -1016,6 +1046,7 @@ export async function runGoal(
       ...(seat && options.through !== undefined ? ["-e", `SHAREDNET_TURN_THROUGH=${options.through}`] : []),
       ...(seat ? seatEnvironment(modules) : []),
       ...(envInTurn(seat) ? ["-e", `SHAREDNET_ENV_DIR=${ENV_HOOK_DIR}`] : []),
+      ...(seat && trunkInfo ? ["-e", `SHAREDNET_LAND_DIR=${CONTAINER_LAND}`, "-e", `SHAREDNET_TRUNK_BRANCH=${trunkInfo.branch}`] : []),
       ...(controls && input.taskGate ? ["-e", "SHAREDNET_TASK_GATE=1", "-e", `SHAREDNET_TASK_FILE=${controls.tasks}`, "-e", `SHAREDNET_TASK_AUDIT=${join(controls.root, "shell-blocks.tsv")}`, "-e", "SHAREDNET_TASK_PROFILE=/etc/profile.d/sharednet-task.sh"] : []),
       // Isolated, a seat holds a placeholder where its harness wants a key, and its requests go to the gateway, which signs them.
       ...(seat?.driver === "claude-code" && plan.claudeAuth
@@ -1093,6 +1124,13 @@ export async function runGoal(
               : `mkdir -p ${home}`,
           ]);
       if (prepared.code !== 0) throw localError("container_failed", `${seat.name}'s home could not be made: ${prepared.stderr.trim()}`);
+      if (forked) {
+        // The trunk and the other forks belong to other users as the container sees them, and git reads them all the same; the fork and its landings are the seat's.
+        const owned = await docker(["exec", "--user", "root", container, "sh", "-c", `git config --system --add safe.directory '*' && chown ${user} ${CONTAINER_WORKSPACE} ${CONTAINER_LAND}`]);
+        if (owned.code !== 0) throw localError("container_failed", `--workspace-layout forks needs git in the image, and ${seat.name}'s container could not be made ready for its fork: ${owned.stderr.trim()}`);
+        const cloned = await exec(seat, ["sh", "-c", forkSetup(seat.name)]);
+        if (cloned.code !== 0) throw localError("container_failed", `${seat.name}'s fork of the trunk could not be made: ${cloned.stderr.trim()}`);
+      }
       // The driver's own marker names the seat's runtime on the Web; the invite travels by environment.
       const marker: Record<string, string> = seat.driver === "codex" ? { CODEX_SESSION_ID: `goal-${seat.name}` } : { CLAUDECODE: "1" };
       const joined = await exec(seat, ["sharednet", "join", input.roomId, "--name", seat.name, "--json"], {
@@ -1133,12 +1171,53 @@ export async function runGoal(
       ? { url: `http://${GATEWAY_ALIAS}:${GATEWAY_PORTS.openai}${api.path}`, custom: api.custom }
       : api.custom ? { url: `${api.origin}${api.path}`, custom: true } : null;
 
+    // The trunk of a forked workspace. A landing check runs in the checks' container, in a clean copy of the commit the trunk would move to.
+    const landings = { landed: 0, refused: 0 };
+    const trunk: Trunk | null = trunkInfo
+      ? new Trunk(plan.workspace, trunkInfo.branch, {
+          now: () => dependencies.now().getTime(),
+          ...(modules.workspace.landCheck !== null
+            ? {
+                check: async (commit, seatName, n) => {
+                  const copy = `${seatName}-${n}`;
+                  await trunk!.export(commit, join(landChecks, copy));
+                  const inside = `${CONTAINER_LAND_CHECKS}/${copy}`;
+                  // The copy is made on this machine and built in the container, as the checks' user; it goes when the check is over.
+                  await docker(["exec", "--user", "root", checks, "chown", "-R", user, inside]);
+                  const ran = await docker(["exec", "--user", user, "--workdir", inside, checks, "timeout", String(LAND_CHECK_LIMIT_S), "sh", "-c", modules.workspace.landCheck!]);
+                  await docker(["exec", "--user", "root", checks, "rm", "-rf", inside]);
+                  const output = `${ran.stdout}${ran.stderr}`;
+                  return { code: ran.code, output: `${ran.code === 124 ? `The check did not end within ${LAND_CHECK_LIMIT_S} s.\n` : ""}${[...output].slice(-4_000).join("")}` };
+                },
+              }
+            : {}),
+        })
+      : null;
+    let trunkFiles: string[] = trunk ? await trunk.files() : [];
+
     // The workspace as a participant: its log, what has been given to whom, and what a turn's hook gave.
     const logEnv = (record: Record<string, unknown>) => appendFile(join(input.out, "environment.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), ...record })}\n`);
     const given = async (seat: SeatRecord, notes: Note[], how: Delivery) => {
       if (!watch || notes.length === 0) return;
       watch.delivered(seat.name, notes.map((note) => note.id), dependencies.now().getTime());
       await logEnv({ event: "delivered", seat: seat.name, how, turn: seat.turns, notes: notes.map((note) => ({ id: note.id, path: note.path, kind: note.kind, by: note.by, interest: note.interest, ...(note.copy !== undefined ? { copy: note.copy } : {}) })) });
+    };
+    // Forked: a landing a seat's fork already holds is no news to it. Asked in the seat's own container, of its own fork,
+    // just before the seat would be told; what is left is what the seat is still missing.
+    const stillNews = async (seat: SeatRecord): Promise<Note[]> => {
+      if (!watch) return [];
+      const waiting = watch.waiting(seat.name);
+      if (!trunk) return waiting;
+      const held = new Map<string, boolean>();
+      for (const note of waiting) {
+        if (note.landing === undefined || held.has(note.landing)) continue;
+        const asked = await docker(["exec", "--user", user, containerName(input.roomId, seat.name), "git", "-C", CONTAINER_WORKSPACE, "merge-base", "--is-ancestor", note.landing, "HEAD"]);
+        held.set(note.landing, asked.code === 0);
+      }
+      const pulled = waiting.filter((note) => note.landing !== undefined && held.get(note.landing));
+      if (pulled.length === 0) return waiting;
+      await given(seat, pulled, "pulled");
+      return watch.waiting(seat.name);
     };
     const handed = new Map<string, string>();
     const collectInTurn = async (seat: SeatRecord) => {
@@ -1231,7 +1310,7 @@ export async function runGoal(
         parts.push(renderActivity(records.map((record) => ({ name: record.name, member_id: record.member_id ?? null, busy: busy.has(record.name), turns: record.turns })), tasks, seat.name));
       }
       if (watch) {
-        const waiting = watch.waiting(seat.name);
+        const waiting = await stillNews(seat);
         const changed = renderNotes(waiting, dependencies.now().getTime());
         if (changed) { parts.push(changed); await given(seat, waiting, "wake"); }
       }
@@ -1242,7 +1321,7 @@ export async function runGoal(
     const envLoop = async () => {
       if (!watch) return;
       let before = await snapshotRoots(watchRoots);
-      watch.know(before.keys());
+      watch.know([...before.keys(), ...trunkFiles]);
       let since = dependencies.now().getTime();
       const lastPost = new Map<string, number>();
       while (!ended) {
@@ -1251,7 +1330,7 @@ export async function runGoal(
         const after = await snapshotRoots(watchRoots);
         const now = dependencies.now().getTime();
         const changes = diffSnapshots(before, after);
-        watch.know(after.keys());
+        watch.know([...after.keys(), ...trunkFiles]);
         if (changes.length > 0) {
           const added = watch.observe(changes, since, now);
           await logEnv({ event: "changes", changes: changes.slice(0, 200), total: changes.length, in_turn: [...busy], notes: added.map((note) => ({ id: note.id, seat: note.seat, path: note.path, by: note.by, interest: note.interest, ...(note.copy !== undefined ? { copy: note.copy } : {}) })) });
@@ -1267,17 +1346,55 @@ export async function runGoal(
             const key = waiting.map((note) => `${note.id}@${note.at}`).join(",");
             if (handed.get(seat.name) === key) continue;
             handed.set(seat.name, key);
-            await docker(["exec", "--user", user, "--interactive", containerName(input.roomId, seat.name), "sh", "-c", `cat > ${ENV_HOOK_DIR}/pending.tmp && mv ${ENV_HOOK_DIR}/pending.tmp ${ENV_HOOK_DIR}/pending.json`], { input: JSON.stringify(hookNotes(waiting)) });
+            const news = await stillNews(seat);
+            if (news.length === 0) continue;
+            await docker(["exec", "--user", user, "--interactive", containerName(input.roomId, seat.name), "sh", "-c", `cat > ${ENV_HOOK_DIR}/pending.tmp && mv ${ENV_HOOK_DIR}/pending.tmp ${ENV_HOOK_DIR}/pending.json`], { input: JSON.stringify(hookNotes(news)) });
             continue;
           }
           if (!envPosts || seat.turns === 0) continue;
           if (now - waiting.at(-1)!.at < ENV_SETTLE_MS || now - (lastPost.get(seat.name) ?? Number.NEGATIVE_INFINITY) < ENV_POST_GAP_MS) continue;
+          const news = await stillNews(seat);
+          if (news.length === 0) continue;
           try {
-            await client.request("POST", `/rooms/${encodeURIComponent(input.roomId)}/owner-messages`, apiKey, { content: envMessage(seat.name, waiting, now), as: "runner" });
+            await client.request("POST", `/rooms/${encodeURIComponent(input.roomId)}/owner-messages`, apiKey, { content: envMessage(seat.name, news, now), as: "runner" });
             lastPost.set(seat.name, now);
-            await given(seat, waiting, "post");
+            await given(seat, news, "post");
           } catch (error) {
             log(`goal: a workspace change was not posted (${error instanceof CliError ? error.code : "error"})\n`);
+          }
+        }
+      }
+    };
+
+    // A forked workspace: the runner lands the seats' commits on the trunk, one at a time, in the order asked.
+    const landLoop = async () => {
+      if (!trunk) return;
+      const answered = new Set<string>();
+      const seatNames = records.map((seat) => seat.name);
+      while (!ended) {
+        await sleep(LAND_POLL_MS);
+        if (ended) break;
+        for (const pending of await pendingLandings(landRoot, seatNames, answered)) {
+          if (ended) break;
+          const seat = records.find((record) => record.name === pending.seat)!;
+          const started = dependencies.now();
+          const request = await readLandRequest(join(landRoot, seat.name), pending.n);
+          const result: LandResult = request
+            ? await trunk.land(seat.name, request, join(landRoot, seat.name, `${pending.n}.bundle`)).catch((error: unknown) => ({ landed: false as const, n: pending.n, reason: "error" as const, detail: error instanceof Error ? error.message : "the landing could not be made" }))
+            : { landed: false, n: pending.n, reason: "invalid", detail: "The request could not be read." };
+          answered.add(`${seat.name}/${pending.n}`);
+          landings[result.landed ? "landed" : "refused"] += 1;
+          await appendFile(join(input.out, "landings.ndjson"), `${JSON.stringify({ at: started.toISOString(), ms: dependencies.now().getTime() - started.getTime(), seat: seat.name, turn: seat.turns, sha: request?.sha ?? null, note: request?.note ?? null, ...result })}\n`);
+          // The answer goes into the seat's own folder as the seat's user, who owns it.
+          const answer = `${CONTAINER_LAND}/${pending.n}.result`;
+          await docker(["exec", "--user", user, "--interactive", containerName(input.roomId, seat.name), "sh", "-c", `cat > ${answer}.tmp && mv ${answer}.tmp ${answer}.json`], { input: JSON.stringify(result) });
+          if (!result.landed) continue;
+          log(`goal: ${seat.name} landed ${result.commit.slice(0, 9)} on ${trunk.branch}${request?.note ? `: ${request.note}` : ""}\n`);
+          trunkFiles = await trunk.files();
+          if (watch) {
+            // The landing is the change, and its author is known: the seats with an interest in its files are told.
+            const added = watch.landed(seat.name, result.files, dependencies.now().getTime(), result.commit.slice(0, 9));
+            await logEnv({ event: "landing", by: seat.name, landing: result.commit.slice(0, 9), changes: result.files.slice(0, 200), total: result.files.length, in_turn: [...busy], notes: added.map((note) => ({ id: note.id, seat: note.seat, path: note.path, by: note.by, interest: note.interest })) });
           }
         }
       }
@@ -1310,7 +1427,7 @@ export async function runGoal(
 
     // Every seat starts once. Subsequent wakes follow the configured routing policy.
     const seatLoop = async (seat: SeatRecord) => {
-      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules });
+      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules, ...(trunkInfo ? { trunkBranch: trunkInfo.branch } : {}) });
       openingPromptHashes[seat.name] = sha256(prompt);
       let wake: WakeShape | null = null;
       let failedInARow = 0;
@@ -1358,6 +1475,9 @@ export async function runGoal(
     const probing = probeLoop().catch((error: unknown) => {
       log(`goal: the probe stopped (${error instanceof Error ? error.message : "error"})\n`);
     });
+    const landing = landLoop().catch((error: unknown) => {
+      log(`goal: landings stopped (${error instanceof Error ? error.message : "error"})\n`);
+    });
 
     const watched = await goalWatch(
       client,
@@ -1383,6 +1503,7 @@ export async function runGoal(
     await Promise.all(seats);
     await probing;
     await environing;
+    await landing;
 
     // Each Agent's own trace is its home: Codex keeps sessions in ~/.codex, Claude Code in ~/.claude.
     for (const seat of records) {
@@ -1449,6 +1570,8 @@ export async function runGoal(
           task_gate: input.taskGate ?? false,
           message_routing: messageRouting,
           modules: describeModules(modules),
+          // A forked workspace: where the trunk started and ended, and how many landings were accepted and refused (landings.ndjson has each).
+          ...(trunk && trunkInfo ? { trunk: { branch: trunkInfo.branch, start: trunkInfo.head, end: await trunk.head(), ...landings } } : {}),
           harness: {
             mode: input.harnessMode?.name ?? null,
             spec_sha256: input.harnessMode?.specSha256 ?? null,

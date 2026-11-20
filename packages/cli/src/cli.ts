@@ -20,6 +20,7 @@ import { parseProbe } from "./modules/information.ts";
 import { parseMessageSchema } from "./modules/protocol.ts";
 import { parseTaskJudge } from "./modules/state.ts";
 import { parseTopology } from "./modules/topology.ts";
+import { parseLandCheck, parseWorkspaceLayout, prepareTrunk } from "./modules/workspace.ts";
 import { refreshIfNeeded, registerInstance, resolveApiKey, selectSession } from "./session.ts";
 import { deleteSession, getStoragePaths, type StoragePaths, type StoredSession } from "./storage.ts";
 import type { ProcessProbe } from "./process-identity.ts";
@@ -156,6 +157,8 @@ const optionValueNames = new Set([
   "probe-every",
   "env-push",
   "env-audience",
+  "workspace-layout",
+  "land-check",
   "disallow-tools",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate", "activity-view"]);
@@ -619,7 +622,7 @@ async function goalCommand(
  * is checked before the Room exists.
  */
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools", "env-push", "env-audience", "env-watch"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools", "env-push", "env-audience", "env-watch", "workspace-layout", "land-check"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
   const turnPolicy = option(parsed, "turn-policy") ?? "legacy";
@@ -657,6 +660,10 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
       const watch = parseEnvWatch(parsed.repeated.get("env-watch") ?? [], push).map((root) => ({ host: resolvePathFrom(dependencies.cwd, root.host), mount: root.mount }));
       return { push, audience: parseEnvAudience(option(parsed, "env-audience"), push), watch };
     })(),
+    workspace: (() => {
+      const layout = parseWorkspaceLayout(option(parsed, "workspace-layout"));
+      return { layout, landCheck: parseLandCheck(option(parsed, "land-check"), layout) };
+    })(),
   };
   if (!isDefaultModules(modules) && namedMode !== undefined) {
     throw localError("invalid_arguments", "--harness-mode fixes a frozen treatment; the module options are not part of one yet.");
@@ -667,7 +674,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--env-push off|on-wake|on-event|on-action [--env-audience affected|all] [--env-watch <folder>:<path in the containers>]...] [--disallow-tools <Tool,Tool>]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--env-push off|on-wake|on-event|on-action [--env-audience affected|all] [--env-watch <folder>:<path in the containers>]...] [--workspace-layout shared|forks [--land-check <command>]] [--disallow-tools <Tool,Tool>]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
@@ -755,6 +762,8 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     docker,
     dependencies.stderr,
   );
+  // A forked workspace's trunk is made ready before the Room exists: a workspace with uncommitted changes is refused here.
+  const trunk = modules.workspace.layout === "forks" ? await prepareTrunk(workspace, outputRoot) : undefined;
   const limited: ResolvedDependencies = { ...dependencies, fetch: withRequestLimit(dependencies.fetch) };
   return withSelectedSession(globals, limited, async (client, session) => {
     const created = await client.request<{ room?: { id?: string } }>(
@@ -806,6 +815,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           ...(harnessMode ? { harnessMode } : {}),
           ...(codeProvenance ? { codeProvenance } : {}),
           ...(isDefaultModules(modules) ? {} : { modules }),
+          ...(trunk ? { trunk } : {}),
           webSearch,
           ...(disallowedTools.length > 0 ? { disallowedTools } : {}),
           ...(turnLimitMs === undefined ? {} : { turnLimitMs }),
@@ -1004,7 +1014,7 @@ async function execute(
   }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/ack/watch/handed/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/serve-demo/watch/export, decision list/approve/deny, and local.",
+    "Use login, whoami, join/say/read/wait/ack/watch/handed/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, land, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/serve-demo/watch/export, decision list/approve/deny, and local.",
   );
 }
 

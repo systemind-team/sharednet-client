@@ -30,7 +30,7 @@ before any of these options existed. A run records what it used in `episode.json
 | Delivery | which posts a resumed seat is given, and what else comes with them | everything new at the start of the turn; more on `sharednet read` | `--mention-gate`, `--topology`, `--activity-view` |
 | Board | what a post is, and what a seat may publish | plain posts | `--task-gate`, `--task-judge`, `--message-schema`, `--type compiled` |
 | Stop | when the run ends | the first `--until` trigger to fire | `--until`, `--check-every`, `--quiet-checks` |
-| Workspace | where work lands, and what the workspace tells the seats | one shared `/workspace` that every seat writes to, and says nothing | `--workspace`, `--env-push`, `--env-audience`, `--env-watch` |
+| Workspace | where work lands, and what the workspace tells the seats | one shared `/workspace` that every seat writes to, and says nothing | `--workspace`, `--workspace-layout`, `--land-check`, `--env-push`, `--env-audience`, `--env-watch` |
 
 Options marked new below came with the modules; the others were there before and are listed so
 that every option has one place.
@@ -106,6 +106,38 @@ out of the Room. The all-member and verifier stops of the report have no option 
 `--workspace` names the folder every seat shares. Nothing stands between a seat and that folder,
 and by default nothing tells a seat that a file changed under it.
 
+- New: `--workspace-layout forks` gives each seat its own fork and makes the workspace the trunk.
+  The reference, `shared`, is the one folder every seat writes to.
+  - The trunk is the `--workspace` folder's own git repository, on the branch it is on. A folder
+    that is not a repository is made one, with what it holds as the first commit. A repository
+    with uncommitted changes is refused before the Room exists: a fork is a clone of what is
+    committed.
+  - A seat's `/workspace` is its fork, a clone made in its own container, with the seat's name on
+    its commits. It sees the trunk read-only at `/trunk` (the fork's `origin`) and the other
+    seats' forks read-only at `/forks/<name>`. Nothing a seat writes reaches another seat until
+    it lands.
+  - `sharednet land "<what changed>"` asks the runner to land the fork's last commit. The seat's
+    container cannot write the trunk, so the request and a git bundle of the commits go through
+    a folder of the seat's own; the runner reads the bundle into the trunk's repository, checking
+    every object, and never opens a repository a seat controls. A commit built on the trunk as it
+    is lands as it is. One that is not is merged; if the merge conflicts, the landing is refused
+    with the files' names, and the seat pulls, resolves and lands again. Landings are answered
+    one at a time, in the order asked.
+  - `--land-check <command>` is the gate: the command runs in the checks container, in a clean
+    copy of the commit the trunk would move to (a merge is checked as merged), and the landing
+    is accepted only if it exits 0. It may run for 10 minutes. `sharednet land` waits 100 s for
+    its answer; run again, it waits for the same landing.
+  - The trunk's files follow its branch, so checks, `--until check:` and the run's result all
+    read the trunk. Work that has not landed when the Room ends is not part of the result; it
+    stays in the record, under `forks/`.
+  - With `--env-push`, the trunk is what speaks: nothing is scanned, each landing tells the
+    seats that have an interest in a file it changed, and the author is the seat that landed,
+    not a guess from times. A seat whose fork already holds the landing is not told (the runner
+    asks in the seat's own container just before it would tell it).
+  - Every request and its outcome is in `landings.ndjson` (landed as `fast-forward` or `merge`,
+    or refused for `conflict`, `check`, `nothing`, `invalid`), and the run record's `trunk` has
+    the branch, where it started and ended, and the counts.
+
 - New: `--env-push on-wake|on-event|on-action` makes the workspace a participant. The runner
   scans it every five seconds, with no model behind it. For each seat it keeps the files the
   seat's turns have named, in a command or in what a command printed, read from the folder the
@@ -138,15 +170,15 @@ and by default nothing tells a seat that a file changed under it.
   another folder, compared byte for byte), so the seat whose copy was just landed is not told.
 
 Every change and every delivery is logged in `environment.ndjson`: what changed, who was in a
-turn, who was told, and how (`wake`, `post`, `note`, `held-edit`). The option changes Delivery
+turn, who was told, and how (`wake`, `post`, `note`, `held-edit`; `pulled` for a landing the
+seat's fork already held, which was not said). The option changes Delivery
 (what a seat is given) and Activation (an `[env]` line resumes an idle seat); it is listed here
 because the workspace is what speaks.
 
-Not yet: other layouts than one shared folder (a fork of the workspace that a seat merges back,
-or no shared folder at all and only a shared repository that each seat clones and lands into), a
-landing gate (a candidate is accepted only if a measure does not fall; tools built on `goal run`
-add their own), a note that says what a landing means for a seat's own copy, a model that says
-what a change means for the seat, and state that is not files.
+Not yet: a fork made on demand from a shared folder (today a run is all shared or all forks), a
+gate that compares a measure with the trunk's (the landing check passes or fails), a reviewer
+seat as the gate, forks that are light for a large repository (each is a full clone), a model
+that says what a change means for the seat, and state that is not files.
 
 ## Presets
 
@@ -175,6 +207,7 @@ with `index.ts` holding their defaults, the run record and the environment a sea
 | `protocol.ts` | `--message-schema` | Board |
 | `information.ts` | `--probe` | Team |
 | `environment.ts` | `--env-push`, `--env-audience`, `--env-watch` | Workspace |
+| `workspace.ts` | `--workspace-layout`, `--land-check`, and the seats' `sharednet land` | Workspace |
 
 ## Rules for adding an option
 
