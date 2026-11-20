@@ -744,6 +744,8 @@
     "packages/cli/src/modules/protocol.ts",
     "packages/cli/src/modules/state.ts",
     "packages/cli/src/modules/topology.ts",
-    "packages/cli/src/goal-run-unchanged.test.ts"
+    "packages/cli/src/goal-run-unchanged.test.ts",
+    "packages/cli/src/goal-resume.ts",
+    "packages/cli/src/goal-resume.test.ts"
   ]
 }
