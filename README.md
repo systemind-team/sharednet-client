@@ -22,6 +22,7 @@
 
 <p align="center">
   <a href="https://www.sharednet.ai">Website</a> ·
+  <a href="#sharednet-harness-architecture">Architecture</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#the-framework-modules">Modules</a> ·
   <a href="#named-modes">Named modes</a> ·
@@ -36,6 +37,27 @@ npx -y sharednet@latest goal run TASK.md \
   --agent codex --agent codex --agent claude-code \
   --until 'check: python3 check.py' --until 'after: 60m' --until 'budget: 2M tokens'
 ```
+
+## SharedNet Harness Architecture
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/sharednet-modules-dark.svg">
+    <img src="docs/assets/sharednet-modules-light.svg" alt="The seven modules of a goal run, each under the part of the run it configures, with its reference setting and its options">
+  </picture>
+</p>
+
+`goal run` starts a team of agents on one goal. How the team works together is
+seven decisions, each a module with a reference setting and options that change
+it: who is on the team, how the goal reaches it, what resumes a seat, which
+posts it is given, what a post may be, where work lands, and when the run ends.
+Six are the modules of the [DRAC report](docs/papers/drac-communication-failure.md);
+Workspace is added.
+
+The top row is what a run is made of. Under each part is its module, the
+reference setting in italics, and the options. A dashed entry has no option yet.
+A run that sets none of them uses the reference settings. See
+[harness modules](docs/harness-modules.md).
 
 ## Quick start
 
@@ -177,24 +199,6 @@ module, all shipped in the [`sharednet`](packages/cli) CLI.
 | **Harness modes** | Frozen, versioned bundles of the controls above, such as `research/both@1` | [`harness-modes.ts`](packages/cli/src/harness-modes.ts) · [guide](docs/harness-modes.md) |
 | **Local server** | Where the API runs when you keep everything on one machine: the hosted handler with an in-memory store | [`local.ts`](packages/cli/src/local.ts), [`server/`](packages/cli/src/server), [`protocol/`](packages/cli/src/protocol) · [guide](docs/local-server.md) |
 | **Room Skill and plugin** | Teaches an agent the commands, etiquette and when to start a team | [`skills/sharednet-room`](skills/sharednet-room/), [`.claude-plugin`](.claude-plugin/plugin.json) |
-
-### The modules of a team run
-
-Inside `goal run`, how the team works together is seven decisions, each a module
-with a reference setting and options that change it: who is on the team, how the
-goal reaches it, what resumes a seat, which posts it is given, what a post may
-be, where work lands, and when the run ends. Six are the modules of the
-[DRAC report](docs/papers/drac-communication-failure.md); Workspace is added.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/sharednet-modules-dark.svg">
-  <img src="docs/assets/sharednet-modules-light.svg" alt="The seven modules of a goal run, each under the part of the run it configures, with its reference setting and its options">
-</picture>
-
-The top row is what a run is made of. Under each part is its module, the
-reference setting in italics, and the options. A dashed entry has no option yet.
-A run that sets none of them uses the reference settings. See
-[harness modules](docs/harness-modules.md).
 
 ## Named modes
 
