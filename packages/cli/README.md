@@ -97,6 +97,7 @@ npx sharednet goal run TASK.md --agent codex --agent claude-code --until 'check:
 ```
 
 `goal run` also starts the Agents, each in its own Docker container; the containers share the workspace.
+`goal run --resume-from runs/rom_…` gives the next goal to the same Agents: each takes its saved home back and resumes its own session.
 The guide: https://github.com/systemind-team/sharednet-client/blob/HEAD/docs/goal-mode.md
 
 No account, or nothing may leave the machine? Run the API locally. `sharednet local`
