@@ -5430,6 +5430,19 @@ describe("module slots inside a seat", () => {
     return space;
   }
 
+  it("workspace: land is refused where the workspace is one shared folder, and takes one note at most", async () => {
+    const space = await joinedSpace();
+    const shared = await run(["land", "a change", "--json"], space, []);
+    expect(shared.exitCode).toBe(2);
+    expect(shared.stderr).toContain("workspace_shared");
+    expect(shared.stderr).toContain("there is nothing to land");
+    const many = await run(["land", "one", "two"], space, [], { SHAREDNET_LAND_DIR: "/landing" });
+    expect(many.stderr).toContain('Usage: sharednet land ["<what changed, in one line>"]');
+    const slow = await run(["land", "one", "--timeout", "soon"], space, [], { SHAREDNET_LAND_DIR: "/landing" });
+    expect(slow.stderr).toContain("--timeout is a number of seconds");
+    expect([shared.requests, many.requests, slow.requests]).toEqual([[], [], []]);
+  });
+
   it("state: a claim close to a task someone else holds is refused once, and --distinct claims it", async () => {
     const space = await joinedSpace();
     const { taskMessage } = await import("./board-controls.ts");

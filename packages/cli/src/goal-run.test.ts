@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { ApiClient } from "./api-client.ts";
 import { resolveGoalRunHarnessMode } from "./harness-modes.ts";
 import { DEFAULT_MODULES } from "./modules/index.ts";
+import { requestLanding } from "./modules/workspace.ts";
 import {
   AGENT_DOCKERFILE,
   DEFAULT_IMAGE,
@@ -1196,7 +1197,7 @@ describe("module slots in a run", () => {
       OWNER_KEY,
       {
         plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, messageRouting: "mentions-only",
-        modules: { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "python3 probe.py", everyMs: 60_000 }, environment: DEFAULT_MODULES.environment },
+        modules: { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "python3 probe.py", everyMs: 60_000 }, environment: DEFAULT_MODULES.environment, workspace: DEFAULT_MODULES.workspace },
         disallowedTools: ["ScheduleWakeup"],
       },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
@@ -1215,7 +1216,7 @@ describe("module slots in a run", () => {
     expect(turns[0]!.args.slice(turns[0]!.args.indexOf("--disallowedTools"), turns[0]!.args.indexOf("--disallowedTools") + 2)).toEqual(["--disallowedTools", "ScheduleWakeup"]);
     expect(posts).toContainEqual({ content: "@all [probe] 2 differences: -buildconf exits 1", as: "runner" });
     expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).disallowed_tools).toEqual(["ScheduleWakeup"]);
-    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).modules).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "python3 probe.py", every_ms: 60_000 }, environment: null });
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).modules).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "python3 probe.py", every_ms: 60_000 }, environment: null, workspace: null });
   });
 });
 
@@ -1330,5 +1331,179 @@ describe("the workspace as a participant", () => {
     const settings = JSON.parse(run.turns[0]!.args[run.turns[0]!.args.indexOf("--settings") + 1]!);
     expect(Object.keys(settings.hooks)).toEqual(["PreToolUse", "PostToolUse"]);
     expect(run.turns[0]!.args).toContain("SHAREDNET_ENV_DIR=/tmp/sharednet-env");
+  });
+});
+
+describe("a forked workspace", () => {
+  const until = async (condition: () => boolean | Promise<boolean>) => {
+    for (let attempt = 0; attempt < 1_000; attempt += 1) {
+      if (await condition()) return;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+    }
+    throw new Error("the condition never held");
+  };
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+
+  /** Seat 1 reads src/a.c; seat 2 changes it in its own fork, commits and lands. `pulled` is whether seat 1's fork holds the landing when the runner asks. */
+  async function scenario(pulled: boolean) {
+    const out = await temporary();
+    const workspace = await temporary();
+    await mkdir(join(workspace, "src"));
+    await writeFile(join(workspace, "src", "a.c"), "int a;\n");
+    const plan: RunPlan = { image: DEFAULT_IMAGE, agents: parseAgents(["claude-code", "claude-code"]), workspace, cli: { root: "/opt/cli", entry: "src/main.ts" }, codexAuth: null, claudeAuth: "ANTHROPIC_API_KEY" };
+    const seat1 = containerName(ROOM, "claude-code-1");
+    const fork = (seat: string) => join(out, "forks", seat);
+    const done = JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", content: "ok" }] } });
+    const read = JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "/workspace/src/a.c" } }] } });
+    let oneRead = false;
+    let landed: Record<string, unknown> | null = null;
+    const checked: string[] = [];
+    const waits: Record<string, number> = {};
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    const { docker, calls } = fakeDocker(async (call, command) => {
+      const mine = call.args.includes(seat1);
+      const seat = mine ? "claude-code-1" : "claude-code-2";
+      const script = command[0] === "sh" && command[1] === "-c" ? command[2]! : "";
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: mine ? "i_ClaudeOne01" : "i_ClaudeTwo02" }) };
+      // The runner asks a seat's own fork whether it holds a landing already.
+      if (command[0] === "git" && command.includes("merge-base")) return { code: pulled ? 0 : 1 };
+      // What a seat's container does to have its fork, done here on this machine: a clone of the trunk, with the seat's name.
+      if (script.includes("git clone")) {
+        git(out, "clone", "--quiet", "--no-hardlinks", workspace, fork(seat));
+        git(fork(seat), "config", "user.name", seat);
+        git(fork(seat), "config", "user.email", `${seat}@sharednet.invalid`);
+        return {};
+      }
+      // The runner's answer, written into the seat's own folder.
+      const answer = /cat > \/landing\/(\d+)\.result\.tmp/.exec(script)?.[1];
+      if (answer !== undefined) { await writeFile(join(out, "landing", seat, `${answer}.result.json`), call.input ?? ""); return {}; }
+      // The landing check, in the checks' container: it sees a clean copy of the result.
+      if (command[0] === "timeout" && command[2] === "sh") {
+        const copy = call.args[call.args.indexOf("--workdir") + 1]!.replace("/landing-checks/", "");
+        checked.push(`${copy}: ${command.join(" ")} on ${(await readFile(join(out, "landing-checks", copy, "src", "a.c"), "utf8")).trim().replace(/\n/g, " ")}`);
+        return { stdout: "built\n" };
+      }
+      if (call.args.includes("claude") && mine) { oneRead = true; return { lines: [read, done] }; }
+      if (call.args.includes("claude")) {
+        // Seat 2 changes the file seat 1 read, in its own fork, commits, and lands.
+        await until(() => oneRead);
+        await writeFile(join(fork(seat), "src", "a.c"), "int a;\nint b;\n");
+        git(fork(seat), "commit", "--quiet", "-am", "add b");
+        landed = await requestLanding("add b", { env: { SHAREDNET_LAND_DIR: join(out, "landing", seat), SHAREDNET_FORK: fork(seat), SHAREDNET_TRUNK_BRANCH: "main" }, waitMs: 10_000 });
+        return { lines: [done] };
+      }
+      if (command[0] === "sharednet" && command[1] === "wait") {
+        const n = (waits[seat] = (waits[seat] ?? 0) + 1);
+        if (mine && n === 1) {
+          await until(() => landed !== null);
+          return { stdout: JSON.stringify({ wake_id: "wk_one", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: "landed b", sender: { member_id: "i_ClaudeTwo02", name: "claude-code-2" } }] }) };
+        }
+        return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 3, through: 3, events: [{ kind: "closed" }], messages: [] }) };
+      }
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["after 900h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) {
+          const over = calls.filter(call => call.args.includes("claude")).length >= 3;
+          return { room: { id: ROOM, state: over ? "closed" : "open", goal: over ? { ...goal, ended_by: { trigger: "after 900h", at: new Date(tick).toISOString() } } : goal }, memberships: [] };
+        }
+        if (method === "GET" && path.startsWith(`/rooms/${ROOM}/wait`)) { await new Promise((resolveWait) => setTimeout(resolveWait, 2)); return { items: [] }; }
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: new Date(tick).toISOString() } } } };
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    await runGoal(
+      client, "sni_owner-seat", OWNER_KEY,
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, modules: { ...DEFAULT_MODULES, environment: { push: "on-wake", audience: "affected", watch: [] }, workspace: { layout: "forks", landCheck: "./compile.sh" } } },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => { await new Promise((resolveWait) => setTimeout(resolveWait, 1)); } },
+    );
+    const turns = calls.filter(call => call.args.includes(seat1) && call.args.includes("claude"));
+    const env = (await readFile(join(out, "environment.ndjson"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    return { out, workspace, calls, turns, env, seat1, fork, landed: landed as Record<string, unknown> | null, checked };
+  }
+
+  it("gives each seat its own fork, lands a checked commit on the trunk, and tells the seat that had the file", async () => {
+    const { out, workspace, calls, turns, env, seat1, fork, landed, checked } = await scenario(false);
+
+    // Each seat's container: its own fork at /workspace, the trunk read-only, the others' forks read-only, its landings.
+    const started = calls.find(call => call.args[0] === "run" && call.args.includes(seat1))!.args;
+    const volumes = started.flatMap((arg, index) => (arg === "--volume" ? [started[index + 1]!] : []));
+    expect(volumes).toEqual([`${fork("claude-code-1")}:/workspace`, `${workspace}:/trunk:ro`, `${join(out, "forks")}:/forks:ro`, `${join(out, "landing", "claude-code-1")}:/landing`, "/opt/cli:/opt/sharednet:ro"]);
+    // The checks' container keeps the trunk at /workspace, and has the place the clean copies go.
+    const checks = calls.find(call => call.args[0] === "run" && call.args.includes(containerName(ROOM)))!.args;
+    expect(checks).toContain(`${workspace}:/workspace`);
+    expect(checks).toContain(`${join(out, "landing-checks")}:/landing-checks`);
+    expect(calls.filter(call => call.args.join(" ").includes("git config --system --add safe.directory '*' && chown node /workspace /landing"))).toHaveLength(2);
+    expect(turns[0]!.args).toContain("SHAREDNET_LAND_DIR=/landing");
+    expect(turns[0]!.args).toContain("SHAREDNET_TRUNK_BRANCH=main");
+    expect(turns[0]!.args.at(-1)).toContain("which is yours alone: your own fork of the team's trunk");
+    expect(turns[0]!.args.at(-1)).toContain("only if this passes in a clean copy of the result: ./compile.sh");
+
+    // The landing: checked in a clean copy of the result, then the trunk and its files move.
+    expect(landed).toMatchObject({ landed: true, landing: 1, kind: "fast-forward", trunk: "main", files: 1 });
+    expect(checked).toEqual(["claude-code-2-1: timeout 600 sh -c ./compile.sh on int a; int b;"]);
+    expect(await readFile(join(workspace, "src", "a.c"), "utf8")).toBe("int a;\nint b;\n");
+    expect(git(workspace, "log", "-1", "--format=%an: %s")).toBe("claude-code-2: add b");
+    expect(await readdir(join(out, "landing-checks")).catch(() => ["gone"])).toEqual(expect.any(Array));
+    const record = (await readFile(join(out, "landings.ndjson"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    expect(record).toHaveLength(1);
+    expect(record[0]).toMatchObject({ seat: "claude-code-2", note: "add b", landed: true, n: 1, kind: "fast-forward", files: [{ path: "src/a.c", kind: "changed" }], check: { exit_code: 0 } });
+
+    // Seat 1 had read the file: its next wake says what landed, and whose landing it was.
+    expect(turns.at(-1)!.args.at(-1)).toMatch(/Landed on the trunk by others since you last had these files \(`git pull` brings them into your fork\):\n- src\/a\.c changed on the trunk \d+ (?:s|min) ago, in a landing by claude-code-2 \([0-9a-f]{9}\); you last had it in turn 1/);
+    expect(env.find(entry => entry.event === "landing")).toMatchObject({ by: "claude-code-2", changes: [{ path: "src/a.c", kind: "changed" }], notes: [{ seat: "claude-code-1", path: "src/a.c", by: "claude-code-2", interest: "read" }] });
+    // Nothing is found by scanning: a fork is nobody else's business.
+    expect(env.some(entry => entry.event === "changes")).toBe(false);
+    // Before it was told, the seat's own fork was asked whether it held the landing; it did not.
+    const asked = calls.filter(call => call.args.includes(seat1) && call.args.includes("merge-base"));
+    expect(asked.at(-1)!.args.slice(-7)).toEqual(["git", "-C", "/workspace", "merge-base", "--is-ancestor", git(workspace, "rev-parse", "HEAD").slice(0, 9), "HEAD"]);
+    expect(env.find(entry => entry.event === "delivered")).toMatchObject({ seat: "claude-code-1", how: "wake" });
+
+    const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
+    expect(episode.modules.workspace).toEqual({ layout: "forks", land_check: "./compile.sh" });
+    expect(episode.trunk).toMatchObject({ branch: "main", landed: 1, refused: 0, end: git(workspace, "rev-parse", "HEAD") });
+    expect(episode.trunk.start).not.toBe(episode.trunk.end);
+  });
+
+  it("says nothing about a landing to a seat whose fork already holds it", async () => {
+    const { turns, env } = await scenario(true);
+    expect(turns.at(-1)!.args.at(-1)).not.toContain("Landed on the trunk");
+    expect(turns.at(-1)!.args.at(-1)).toContain("claude-code-2: landed b");
+    expect(env.find(entry => entry.event === "delivered")).toMatchObject({ seat: "claude-code-1", how: "pulled", notes: [{ path: "src/a.c", by: "claude-code-2" }] });
+    expect(env.filter(entry => entry.event === "delivered")).toHaveLength(1);
+  });
+
+  it("leaves a shared workspace's containers exactly as they were", async () => {
+    const out = await temporary();
+    const workspace = await temporary();
+    const plan: RunPlan = { image: DEFAULT_IMAGE, agents: parseAgents(["claude-code"]), workspace, cli: { root: "/opt/cli", entry: "src/main.ts" }, codexAuth: null, claudeAuth: "ANTHROPIC_API_KEY" };
+    const { docker, calls } = fakeDocker((_call, command) => {
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_ClaudeOne01" }) };
+      if (command[0] === "sharednet" && command[1] === "wait") return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 3, through: 3, events: [{ kind: "closed" }], messages: [] }) };
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["after 900h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    const client = {
+      async request(method: string, path: string) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) {
+          const over = calls.some(call => call.args.includes("claude"));
+          return { room: { id: ROOM, state: over ? "closed" : "open", goal: over ? { ...goal, ended_by: { trigger: "after 900h", at: new Date(tick).toISOString() } } : goal }, memberships: [] };
+        }
+        if (method === "GET" && path.startsWith(`/rooms/${ROOM}/wait`)) { await new Promise((resolveWait) => setTimeout(resolveWait, 2)); return { items: [] }; }
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    await runGoal(client, "sni_owner-seat", OWNER_KEY, { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true }, { docker, now: () => new Date((tick += 1_000)), sleep: async () => { await new Promise((resolveWait) => setTimeout(resolveWait, 1)); } });
+    const started = calls.find(call => call.args[0] === "run" && call.args.includes(containerName(ROOM, "claude-code-1")))!.args;
+    expect(started.flatMap((arg, index) => (arg === "--volume" ? [started[index + 1]!] : []))).toEqual([`${workspace}:/workspace`, "/opt/cli:/opt/sharednet:ro"]);
+    expect(calls.some(call => call.args.join(" ").includes("safe.directory"))).toBe(false);
+    expect(calls.find(call => call.args.includes("claude"))!.args.join(" ")).not.toContain("SHAREDNET_LAND_DIR");
+    // No repository is made of a shared workspace, and the record has no trunk.
+    expect(await readdir(workspace)).not.toContain(".git");
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).trunk).toBeUndefined();
+    expect(await readdir(out)).not.toContain("forks");
   });
 });

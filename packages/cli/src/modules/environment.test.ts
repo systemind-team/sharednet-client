@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ENV_HOOK, Environment, containerPath, describeNote, diffSnapshots, editsIn, endings, envLineForAnother, envMessage, fileKey, folderAfter, foldersIn,
-  hookNotes, hostPath, parseEnvAudience, parseEnvPush, parseEnvWatch, pathsIn, readLine, renderNotes, sameBytes, snapshot, snapshotRoots, withoutHeredocs, workspacePath,
+  LANDING_ADVICE, hookNotes, hostPath, parseEnvAudience, parseEnvPush, parseEnvWatch, pathsIn, readLine, renderNotes, sameBytes, snapshot, snapshotRoots, withoutHeredocs, workspacePath,
 } from "./environment.ts";
 
 const made: string[] = [];
@@ -398,6 +398,54 @@ describe("who is told about a change", () => {
   });
 });
 
+describe("a landing on the trunk of a forked workspace", () => {
+  const seats = ["cc-1", "cc-2", "cc-3"];
+  const start = (audience: "affected" | "all" = "affected") => {
+    const env = new Environment(seats, { audience });
+    env.know(["src/a.c", "src/b.c", "README.md"]);
+    return env;
+  };
+  const read = (env: Environment, seat: string, turn: number, file: string, at: number) => {
+    env.sawLine(seat, turn, bash(`cat ${file}`), at);
+    env.sawLine(seat, turn, result(), at + 100);
+  };
+
+  it("tells the seats that had the file, names the lander exactly, and never the lander itself", () => {
+    const env = start();
+    read(env, "cc-1", 2, "src/a.c", 1_000);
+    env.sawLine("cc-3", 4, edit("src/a.c"), 2_000);
+    // Every seat has a command running when the landing is made: times say nothing here, the landing does.
+    for (const seat of seats) env.sawLine(seat, 5, bash("cd /workspace/src && make"), 49_000);
+    const added = env.landed("cc-2", [{ path: "src/a.c", kind: "changed" }, { path: "src/new.c", kind: "new" }], 50_000, "3f2a1bc9d");
+    expect(added).toMatchObject([
+      { seat: "cc-1", path: "src/a.c", by: "cc-2", interest: "read", seenTurn: 2, at: 50_000, landing: "3f2a1bc9d" },
+      { seat: "cc-3", path: "src/a.c", by: "cc-2", interest: "edited", seenTurn: 4, landing: "3f2a1bc9d" },
+    ]);
+    expect(env.waiting("cc-2")).toEqual([]);
+    expect(describeNote(added[0]!, 60_000)).toBe("src/a.c changed on the trunk 10 s ago, in a landing by cc-2 (3f2a1bc9d); you last had it in turn 2");
+    expect(renderNotes(env.waiting("cc-3"), 60_000)).toBe("Landed on the trunk by others since you last had these files (`git pull` brings them into your fork):\n- src/a.c changed on the trunk 10 s ago, in a landing by cc-2 (3f2a1bc9d); you edited it in turn 4");
+    // The hook is told what to do about a landing: the change is not in the seat's fork yet.
+    expect(hookNotes(env.waiting("cc-1"))).toEqual([{ id: added[0]!.id, file: "/workspace/src/a.c", at: 50_000, text: "src/a.c changed on the trunk {ago}, in a landing by cc-2 (3f2a1bc9d); you last had it in turn 2", advice: LANDING_ADVICE }]);
+  });
+
+  it("makes the landed file the lander's own, and tells every landing, however close to the last", () => {
+    const env = start();
+    read(env, "cc-1", 2, "src/a.c", 1_000);
+    const first = env.landed("cc-2", [{ path: "src/a.c", kind: "changed" }], 50_000, "aaaaaaaaa");
+    env.delivered("cc-1", first.map((note) => note.id), 51_000);
+    // Ten seconds later another seat lands the same file: both the reader and the first lander are told.
+    const second = env.landed("cc-3", [{ path: "src/a.c", kind: "changed" }], 60_000, "bbbbbbbbb");
+    expect(second.map((note) => [note.seat, note.by, note.interest, note.landing])).toEqual([["cc-1", "cc-3", "read", "bbbbbbbbb"], ["cc-2", "cc-3", "edited", "bbbbbbbbb"]]);
+  });
+
+  it("with the audience all, tells every other seat about every landed file", () => {
+    const env = start("all");
+    const added = env.landed("cc-2", [{ path: "docs/new.md", kind: "new" }, { path: "src/b.c", kind: "deleted" }], 50_000, "ccccccccc");
+    expect(added.map((note) => [note.seat, note.path, note.kind, note.interest])).toEqual([["cc-1", "docs/new.md", "new", "all"], ["cc-3", "docs/new.md", "new", "all"], ["cc-1", "src/b.c", "deleted", "all"], ["cc-3", "src/b.c", "deleted", "all"]]);
+    expect(describeNote(added[2]!, 51_000)).toBe("src/b.c was deleted on the trunk 1 s ago, in a landing by cc-2 (ccccccccc)");
+  });
+});
+
 describe("what a seat is told", () => {
   const note = (path: string, by: string | null = "cc-2") => ({ id: `n-${path}`, seat: "cc-1", path, kind: "changed" as const, by, candidates: by ? [by] : [], at: 10_000, interest: "read" as const, seenTurn: 2 });
   it("renders a wake's part, a Room line for one seat, and the hook's notes", () => {
@@ -447,6 +495,20 @@ describe("the hook inside a Claude Code seat's turn", () => {
     expect(told.hookSpecificOutput.additionalContext).toMatch(/^SharedNet workspace, changed by others while you work: src\/b\.c changed 5 min ago, by cc-3\./);
     expect(run(script, dir, post).stdout).toBe("");
     expect(await given()).toEqual([["n1", "held-edit"], ["n2", "note"]]);
+  });
+
+  it("says what to do about a landing in the runner's words: the change is on the trunk, not in the fork", async () => {
+    const { dir, script } = await prepared([]);
+    const advice = "It is on the trunk and not in your fork yet: run `git pull` before you build on your copy of it.";
+    await writeFile(join(dir, "pending.json"), JSON.stringify([
+      { id: "n1", file: "/workspace/src/a.c", at: Date.now() - 10_000, text: "src/a.c changed on the trunk {ago}, in a landing by cc-2 (3f2a1bc9d)", advice },
+      { id: "n2", file: "/workspace/src/b.c", at: Date.now() - 10_000, text: "src/b.c changed on the trunk {ago}, in a landing by cc-2 (3f2a1bc9d)", advice },
+    ]));
+    const held = JSON.parse(run(script, dir, preEdit("/workspace/src/a.c")).stdout);
+    expect(held.hookSpecificOutput.permissionDecisionReason).toMatch(/in a landing by cc-2 \(3f2a1bc9d\)\. This edit was held once and nothing was written\. It is on the trunk and not in your fork yet: run `git pull` before you build on your copy of it\.$/);
+    expect(held.hookSpecificOutput.permissionDecisionReason).not.toContain("Look at the file as it is now");
+    const told = JSON.parse(run(script, dir, post).stdout);
+    expect(told.hookSpecificOutput.additionalContext).toMatch(/src\/b\.c changed on the trunk 1[0-2] s ago, in a landing by cc-2 \(3f2a1bc9d\)\. It is on the trunk and not in your fork yet/);
   });
 
   it("holds a shell command that writes a file that changed under the seat, read from where the shell stands, and lets a reading through", async () => {

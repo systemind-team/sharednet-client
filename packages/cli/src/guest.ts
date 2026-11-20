@@ -9,6 +9,7 @@ import { clearPendingReply, readPendingReply, writePendingReply, type PendingRep
 import { claimTask, controlEvent, controlPaths, latestForeignTaskSequence, noteRead, noteTasks, noteTasksSeen, pendingMentions, projectTasks, readMark, readThrough, recentTasks, taskMessage, withControlLock, type BoardMessage } from "./board-controls.ts";
 import { isDirected, sbarMissing, sbarRefusal } from "./modules/protocol.ts";
 import { closestHeldTask, duplicateRefusal } from "./modules/state.ts";
+import { LAND_WAIT_MS, requestLanding } from "./modules/workspace.ts";
 import { accountCredentialFrom, withCredentialLock } from "./login.ts";
 import { CliError, localError } from "./errors.ts";
 import { computeLocalInstanceKey } from "./instance-computation.ts";
@@ -1221,6 +1222,24 @@ async function task(args: string[], dependencies: GuestDependencies): Promise<un
     await noteTasks(paths, tasks, state.member_id);
     await controlEvent(paths, { kind: "task_done", task: done });
     return { room_id: state.room_id, task: done };
+  });
+}
+
+/**
+ * `land "<what changed>"`: in a forked workspace (`goal run --workspace-layout forks`), asks the
+ * runner to land the fork's last commit on the trunk and waits for the answer. It speaks to no
+ * service: the request travels through the folder the runner gave the seat.
+ */
+async function land(args: string[], dependencies: GuestDependencies): Promise<unknown> {
+  const parsed = parseGuestArguments(args);
+  assertOnlyOptions(parsed, ["timeout"]);
+  if (parsed.positionals.length > 1) throw localError("invalid_arguments", 'Usage: sharednet land ["<what changed, in one line>"] [--timeout <seconds>]');
+  const timeout = stringOption(parsed, "timeout");
+  if (timeout !== undefined && !/^\d{1,5}$/.test(timeout)) throw localError("invalid_arguments", "--timeout is a number of seconds.");
+  return requestLanding(parsed.positionals[0], {
+    env: dependencies.env,
+    ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
+    waitMs: timeout === undefined ? LAND_WAIT_MS : Number(timeout) * 1000,
   });
 }
 
@@ -4236,6 +4255,7 @@ async function wakeVerb(args: string[], dependencies: GuestDependencies): Promis
 export type GuestVerb =
   | "wake"
   | "task"
+  | "land"
   | "timer"
   | "serve"
   | "whoami"
@@ -4267,6 +4287,7 @@ export function isGuestVerb(value: string | undefined): value is GuestVerb {
   return (
     value === "wake" ||
     value === "task" ||
+    value === "land" ||
     value === "timer" ||
     value === "serve" ||
     value === "whoami" ||
@@ -4301,6 +4322,7 @@ export async function runGuestVerb(
 ): Promise<unknown> {
   if (verb === "wake") return wakeVerb(args, dependencies);
   if (verb === "task") return task(args, dependencies);
+  if (verb === "land") return land(args, dependencies);
   if (verb === "act" || verb === "open" || verb === "deliver") return compiledCommand(verb, args, dependencies);
   if (verb === "timer") return timer(args, dependencies);
   if (verb === "serve") return serve(args, dependencies);

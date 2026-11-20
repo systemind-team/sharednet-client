@@ -745,6 +745,8 @@
     "packages/cli/src/modules/modules.test.ts",
     "packages/cli/src/modules/protocol.ts",
     "packages/cli/src/modules/state.ts",
-    "packages/cli/src/modules/topology.ts"
+    "packages/cli/src/modules/topology.ts",
+    "packages/cli/src/modules/workspace.test.ts",
+    "packages/cli/src/modules/workspace.ts"
   ]
 }

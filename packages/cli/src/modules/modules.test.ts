@@ -107,14 +107,17 @@ describe("information slot", () => {
 });
 
 describe("the slots together", () => {
-  const all: HarnessModules = { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "p", everyMs: 60_000 }, environment: { push: "on-event", audience: "affected", watch: [{ host: "/runs/7/best", mount: "/workspace/best" }] } };
+  const all: HarnessModules = { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "p", everyMs: 60_000 }, environment: { push: "on-event", audience: "affected", watch: [{ host: "/runs/7/best", mount: "/workspace/best" }] }, workspace: { layout: "forks", landCheck: "./compile.sh" } };
   it("has today's behaviour as its default", () => {
     expect(isDefaultModules(DEFAULT_MODULES)).toBe(true);
     expect(isDefaultModules(all)).toBe(false);
     expect(seatEnvironment(DEFAULT_MODULES)).toEqual([]);
     expect(seatEnvironment(all)).toEqual(["-e", "SHAREDNET_TASK_JUDGE=lexical", "-e", "SHAREDNET_MESSAGE_SCHEMA=sbar"]);
-    expect(describeModules(all)).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "p", every_ms: 60_000 }, environment: { push: "on-event", audience: "affected", watch: ["/workspace/best"] } });
+    expect(describeModules(all)).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "p", every_ms: 60_000 }, environment: { push: "on-event", audience: "affected", watch: ["/workspace/best"] }, workspace: { layout: "forks", land_check: "./compile.sh" } });
     expect(describeModules(DEFAULT_MODULES).environment).toBeNull();
+    expect(describeModules(DEFAULT_MODULES).workspace).toBeNull();
+    // A forked workspace alone is not the default.
+    expect(isDefaultModules({ ...DEFAULT_MODULES, workspace: { layout: "forks", landCheck: null } })).toBe(false);
   });
   it("leaves the opening prompt exactly as it was when every slot is at its default", () => {
     const input = { seat: { driver: "claude-code" as const, model: null, name: "a" }, seats: [{ driver: "claude-code" as const, model: null, name: "a" }, { driver: "claude-code" as const, model: null, name: "b" }], roomId: "rom_x", goal: "g", goalSequence: 1, until: ["after 10m"] };
@@ -122,5 +125,21 @@ describe("the slots together", () => {
     expect(moduleHelp("a", ["a", "b"], DEFAULT_MODULES)).toEqual([]);
     const withAll = openingPrompt({ ...input, modules: all });
     for (const marker of ["--distinct", "who is doing what", "island 1", "SBAR", "[probe]", "[env]"]) expect(withAll).toContain(marker);
+  });
+  it("tells a seat of a forked workspace that the folder is its own, where the trunk is, and how to land", () => {
+    const seats = [{ driver: "claude-code" as const, model: null, name: "a" }, { driver: "claude-code" as const, model: null, name: "b" }];
+    const input = { seat: seats[0]!, seats, roomId: "rom_x", goal: "g", goalSequence: 1, until: ["after 10m"] };
+    const forked = openingPrompt({ ...input, modules: { ...DEFAULT_MODULES, workspace: { layout: "forks", landCheck: "./compile.sh" } }, trunkBranch: "work" });
+    expect(forked).toContain("which is yours alone: your own fork of the team's trunk");
+    expect(forked).not.toContain("You share this directory");
+    expect(forked).toContain("branch work");
+    expect(forked).toContain('sharednet land "<what changed, in one line>"');
+    expect(forked).toContain("only if this passes in a clean copy of the result: ./compile.sh");
+    // The workspace's notes speak of landings there.
+    const told = openingPrompt({ ...input, modules: { ...all, workspace: { layout: "forks", landCheck: null } } });
+    expect(told).toContain("The trunk tells you when a landing changes a file");
+    expect(told).not.toContain("The workspace itself tells you");
+    const alone = openingPrompt({ ...input, seats: [seats[0]!], modules: { ...DEFAULT_MODULES, workspace: { layout: "forks", landCheck: null } } });
+    expect(alone).toContain("your own fork of the trunk (a git clone), in your own container");
   });
 });
