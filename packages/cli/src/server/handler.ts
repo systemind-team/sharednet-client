@@ -1024,6 +1024,21 @@ export async function handleRequest(
       return jsonResponse(await repository.reopenRoom(auth.principalId, roomId), { status: 200 });
     }
 
+    // Its owner takes a seat of a goal Room up again for the Room's next goal, by API key: the same
+    // member, with a new token shown once; the old token stops working (decision 2026-11-21).
+    const memberTokenMatch = /^\/api\/v1\/rooms\/([^/]+)\/members\/([^/]+)\/token$/.exec(path);
+    if (memberTokenMatch) {
+      if (request.method !== "POST") return routeMethodNotAllowed("POST");
+      const repository = getRepository();
+      const auth = await authenticateApiKey(request, repository);
+      if (isResponse(auth)) return auth;
+      requireNoIdempotency(request);
+      const roomId = parsePublicId(memberTokenMatch[1], "rom");
+      const memberId = parsePublicId(memberTokenMatch[2], "i");
+      await optionalEmptyJson(request);
+      return jsonResponse(await repository.reissueMemberToken(auth.principalId, roomId, memberId), { status: 200, headers: NO_STORE_HEADERS });
+    }
+
     // People (decision 2026-10-25): an account invites a person it knows into
     // a Room it can see, finds people it has shared a Room with by name, and
     // leaves a Room it was brought into.

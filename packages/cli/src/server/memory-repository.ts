@@ -1310,6 +1310,42 @@ export class MemorySharedNetRepository implements SharedNetRepository {
     return { room: this.projectRoom(room) };
   }
 
+  async reissueMemberToken(principalId: PrincipalId, roomId: RoomId, memberId: InstanceId): Promise<{ room: Room; membership: RoomMember; member_token: SniSecret }> {
+    const room = this.ownedRoom(principalId, roomId);
+    if (room.state === "closed") throw new RepositoryError(409, "room_closed", "Room is closed.");
+    const membership = this.memberships.get(membershipKey(room.id, memberId));
+    const instance = this.instances.get(memberId);
+    if (!membership || membership.state !== "active" || !instance) throw new RepositoryError(404, "instance_not_found", "Instance was not found.");
+    const refused = () => new RepositoryError(403, "member_not_reissuable", "Only a seat this goal Room's own invite brought into being, that nobody has bound to an account and that sits in no other Room, can be taken up by the Room's owner.");
+    // A goal Room on a board: the owner's own run, whose seats it made.
+    if (room.kind === "direct" || (room.type ?? "board") !== "board" || room.goal === null) throw refused();
+    // The seat came into being by joining this Room through an invite of the owner's: not an Instance
+    // an API key registered, and still live.
+    const invite = membership.invite_id === null ? undefined : this.invites.get(membership.invite_id);
+    const owner = (id: PrincipalId) => this.mergedPrincipals.get(id) ?? id;
+    if (
+      membership.admitted_by !== "invite" || !invite || invite.room_id !== room.id || owner(invite.principal_id) !== principalId
+      || instance.admittedByInviteId !== invite.id || instance.issuedByKeyId !== null
+      || instance.status === "ended" || instance.status === "revoked" || isServiceRuntimeKind(instance.runtime_kind)
+    ) throw refused();
+    // Still nobody's: the anonymous Principal that invite made for it, never bound, with no other Instance.
+    const principal = this.principals.get(instance.principal_id);
+    if (!principal || principal.invited_by_principal_id !== invite.principal_id || this.mergedPrincipals.has(principal.id)) throw refused();
+    if ([...this.instances.values()].some((other) => other.id !== instance.id && other.principal_id === principal.id)) throw refused();
+    // It speaks in this Room alone, so a token for it reaches nothing else.
+    if ([...this.memberships.values()].some((other) => other.instance_id === instance.id && other.room_id !== room.id && other.state === "active")) throw refused();
+    // The new token replaces the old one, which stops working; a doorbell the old holder set is taken down with it.
+    const memberToken = generateSecret("sni");
+    this.instanceIdsByDigest.delete(instance.tokenDigest);
+    instance.tokenDigest = digestSecret(memberToken);
+    this.instanceIdsByDigest.set(instance.tokenDigest, instance.id);
+    const now = this.now();
+    instance.last_seen_at = now.toISOString();
+    instance.lease_expires_at = new Date(now.getTime() + PRESENCE_LEASE_MS).toISOString();
+    for (const key of [...this.doorbells.keys()]) if (key.startsWith(`${instance.id}|`)) this.doorbells.delete(key);
+    return { room: this.projectRoom(room), membership: this.projectMembership(membership, principalId), member_token: memberToken };
+  }
+
   async invitePerson(principalId: PrincipalId, roomId: RoomId, target: InvitePersonRequest): Promise<PersonInvite> {
     const room = this.roomVisibleTo(principalId, roomId);
     if (room.state === "closed") throw new RepositoryError(409, "room_closed", "Room is closed.");

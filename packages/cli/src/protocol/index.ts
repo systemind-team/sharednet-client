@@ -1198,6 +1198,7 @@ export type ErrorCode =
   | "invite_refused"
   | "owner_cannot_leave"
   | "room_not_compiled"
+  | "member_not_reissuable"
   | "artifact_not_found"
   | "artifact_too_large"
   | "artifact_quota_reached"
@@ -1267,6 +1268,7 @@ export const SAFE_ERROR_MESSAGES: Readonly<Record<ErrorCode, string>> = {
   invite_refused: "This person cannot be invited.",
   owner_cannot_leave: "A Room's owner closes it rather than leaving it.",
   room_not_compiled: "This Room is a plain board. Create a compiled Room to submit acts.",
+  member_not_reissuable: "Only a seat this goal Room's own invite brought into being, that nobody has bound to an account and that sits in no other Room, can be taken up by the Room's owner.",
   artifact_not_found: "File was not found.",
   artifact_too_large: "File is larger than this service accepts.",
   artifact_quota_reached: "This account is holding as many bytes as it may.",
@@ -1337,6 +1339,7 @@ export const ERROR_STATUS: Readonly<Record<ErrorCode, number>> = {
   invite_refused: 403,
   owner_cannot_leave: 409,
   room_not_compiled: 409,
+  member_not_reissuable: 403,
   artifact_not_found: 404,
   artifact_too_large: 413,
   artifact_quota_reached: 409,
@@ -2466,6 +2469,7 @@ export const ROUTE_CATALOGUE = [
   { method: "POST", path: "/api/v1/rooms/{room_id}/goal", auth: "api_key", operationId: "startGoal" },
   { method: "POST", path: "/api/v1/rooms/{room_id}/owner-messages", auth: "api_key", operationId: "postOwnerMessage" },
   { method: "POST", path: "/api/v1/rooms/{room_id}/close", auth: "api_key", operationId: "closeRoom" },
+  { method: "POST", path: "/api/v1/rooms/{room_id}/members/{member_id}/token", auth: "api_key", operationId: "reissueMemberToken" },
   { method: "POST", path: "/api/v1/rooms/{room_id}/people", auth: "api_key", operationId: "invitePerson" },
   { method: "POST", path: "/api/v1/rooms/{room_id}/leave", auth: "api_key", operationId: "leaveRoom" },
   { method: "GET", path: "/api/v1/people", auth: "api_key", operationId: "findPeople" },
@@ -3023,6 +3027,16 @@ export const OPENAPI_DOCUMENT = {
         security: [{ accountApiKey: [] }],
         responses: {
           "200": { description: "The closed Room; a goal Room says which trigger ended it" },
+          default: { description: "Error" },
+        },
+      },
+    },
+    "/api/v1/rooms/{room_id}/members/{member_id}/token": {
+      post: {
+        operationId: "reissueMemberToken",
+        security: [{ accountApiKey: [] }],
+        responses: {
+          "200": { description: "The seat with a new token, shown once; the token it had stops working. For the owner of an open goal Room, and only a seat that Room's own invite brought into being, that nobody has bound and that sits in no other Room" },
           default: { description: "Error" },
         },
       },
