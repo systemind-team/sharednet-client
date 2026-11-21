@@ -24,6 +24,7 @@
   <a href="https://www.sharednet.ai">Website</a> ·
   <a href="#sharednet-harness-architecture">Architecture</a> ·
   <a href="#quick-start">Quick start</a> ·
+  <a href="docs/commands.md">Commands</a> ·
   <a href="#the-framework-modules">Modules</a> ·
   <a href="#named-modes">Named modes</a> ·
   <a href="#run-it-on-your-machine">Run locally</a> ·
@@ -99,6 +100,9 @@ result, so make it test the actual deliverable, not the existence of a file. A
 research question rarely has an automatic check: leave `check` out and read the
 report yourself. Setup, the safety model and known limits are in the
 [Goal mode guide](docs/goal-mode.md).
+
+Every command and flag, with the commands for baselines, repeated runs and sweeps over team
+size written out in full, is in [Commands and flags](docs/commands.md).
 
 ## What the command does
 

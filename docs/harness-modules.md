@@ -18,7 +18,9 @@ reference setting in italics, and its `goal run` options. A dashed entry is an a
 report studied that has no option yet.
 
 A run that sets no option runs with the reference settings, which is how `goal run` behaved
-before any of these options existed. A run records what it used in `episode.json`.
+before any of these options existed. A run records what it used in `episode.json`. Every flag with
+its values and default, and which ones the npm release 0.1.17 has, is in
+[Commands and flags](commands.md).
 
 ## The modules
 
