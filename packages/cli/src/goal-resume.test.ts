@@ -358,7 +358,8 @@ describe("a run that resumes a swarm", () => {
     // codex-1: its saved home goes into its new container and is made its own before the sign-in is put back and before it joins.
     const one = containerName(ROOM, "codex-1");
     const order = calls.map((call) => call.args.join(" "));
-    const copied = order.findIndex((line) => line === `cp ${join(record, "agents", "codex-1", "home")} ${one}:/home/agents/codex-1`);
+    // The home's contents, so it lands in place even when something (a worker's memory install) made the folder first.
+    const copied = order.findIndex((line) => line === `cp ${join(record, "agents", "codex-1", "home")}/. ${one}:/home/agents/codex-1`);
     const owned = order.findIndex((line) => line.includes(one) && line.includes("chown -R node '/home/agents/codex-1'") && !line.includes("auth.json"));
     const signedIn = order.findIndex((line) => line.includes(one) && line.includes("cp /run/codex/auth.json '/home/agents/codex-1/.codex/auth.json'"));
     const joined = order.findIndex((line) => line.includes(one) && line.includes("sharednet join"));

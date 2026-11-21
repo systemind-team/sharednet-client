@@ -1127,7 +1127,8 @@ export async function runGoal(
       if (taken) {
         // The seat's home as its earlier run left it: its sessions, its harness's settings, skills and MCP servers,
         // and what it installed for itself. The record took the sign-ins out; they are put back just below, as for a new seat.
-        const restored = await docker(["cp", taken.home, `${container}:${home}`]);
+        // Its contents (`/.`), so the home lands in place whether or not something has made the folder already.
+        const restored = await docker(["cp", `${taken.home}/.`, `${container}:${home}`]);
         const owned = restored.code === 0 ? await docker(["exec", "--user", "root", container, "sh", "-c", `chown -R ${user} '${home}'`]) : restored;
         if (owned.code !== 0) {
           await docker(["exec", "--user", "root", container, "rm", "-rf", home]);
