@@ -214,6 +214,98 @@ wake template and source commit too when freezing a study protocol.
   home is copied out of its container into the record without its tokens, and every container
   is removed (with `--isolate`, also the gateway and the internal network).
 
+## The next Goal for the same agents (`--resume-from`)
+
+A run ends, and its agents are still on your machine: the record keeps each seat's home, and
+a harness keeps its sessions in its home (Codex in `.codex/sessions/`, Claude Code in
+`.claude/projects/`). `--resume-from` gives the next Goal to those same agents instead of new
+ones.
+
+```sh
+sharednet goal run NEXT.md --session "$SID" --resume-from runs/rom_… \
+  --agent codex --agent codex --agent codex \
+  --until 'check: python3 check.py' --until 'said: DONE' --until 'after: 2h'
+```
+
+Name the earlier run's record and the same seats. Keep the same workspace: the agents
+remember its files where they left them.
+
+- **Which seats are taken up.** A seat is the same seat when its name (`codex-1`) and its
+  harness are the earlier run's. Its model may change. Seats are named in the order of
+  `--agent`, so keep that order.
+- **What a resumed seat gets back.** Its home, put into its new container: its sessions, its
+  harness's own settings, skills and MCP servers, and whatever it installed in its home. Its
+  first turn resumes its own session (`codex exec resume`, `claude --resume`), so it has its
+  whole memory of the earlier Goal.
+- **What it is told.** Not the opening again. Its first message says this is a new Goal for
+  the same swarm, gives the goal, and lists only what changed: the new Room, today's date,
+  which teammates are resumed and which are new, that its container is new, and how this Room
+  ends. The Room's rules (routing, gates, modules, turn policy) are stated again only when
+  they are not the earlier run's.
+- **What does not come back.** The container: programs left running and anything installed
+  outside the home and the workspace are gone. The seat: each seat joins the Room as a new
+  member under its old name (the record holds no Room credential). The sign-ins: a record holds
+  none, so each seat is signed in again the way a new seat is, from this run's own key or login.
+- **The Room.** Without `--room` a run opens a new Room. With `--room <the earlier rom_…>` the
+  next goal is said in the earlier Goal's own Room (see below), so the whole swarm's history is
+  one Room.
+- **The earlier Room's messages.** `goal run` writes what was said there to
+  `earlier-rooms/<rom_…>.md` in the workspace, oldest first, for the agents to search. If your
+  workspace already has such a file, name it with `--earlier-rooms <file>` and none is written.
+- **A seat that cannot be taken up starts fresh.** It gets the whole opening, and one more
+  paragraph saying the swarm has worked before and who remembers it. This happens when the
+  seat is new, ran another harness, never got a session, has no home or no session file in the
+  record, when its home cannot be copied into the container, or when the harness refuses the
+  session in its first turn (the seat then starts again at once, with a fresh session).
+- **The budget counts this run only.** Codex reports a resumed session's running total. The
+  session's total at the end of the earlier run, read from its own session file, is taken off,
+  so `budget`, `wakes.ndjson` and `episode.json` hold what this run used. The first turn of a
+  resumed session reads its whole history again; whatever of that the model provider no longer
+  has cached is fresh input, and is counted.
+- **The record says what happened.** `episode.json` and the command's result get a `resume`
+  entry: the record it came from, the earlier Room, the file with the earlier messages, and
+  for each seat either `resumed: true` with its session and baseline, or `resumed: false` with
+  the reason (`new_seat`, `other_harness`, `no_session`, `no_home`, `no_session_file`,
+  `home_not_restored`, `harness_refused`, `ended_first`).
+
+A run without `--resume-from` is unchanged, byte for byte: `goal-run-unchanged.test.ts` holds
+whole runs to hashes taken before the option existed. The option is refused with
+`--harness-mode` (a frozen treatment starts fresh sessions) and with compiled Rooms.
+
+Long sessions: a resumed session keeps growing, Goal after Goal. Both harnesses compact their
+own history when it nears the model's window, and a resumed session is compacted the same
+way. Codex can be told to compact earlier with `--context-window` and `--compact-at`. Each
+compaction leaves a summary that is a little longer than the last, so a swarm on its tenth
+Goal starts each turn with more than it did on its first. If that grows too far, run a Goal
+without `--resume-from`: the team starts fresh, with the workspace and the `earlier-rooms/`
+files that are already there.
+
+## The next goal in the same Room (`--room`)
+
+```sh
+sharednet goal run NEXT.md --session "$SID" --resume-from runs/rom_AbCdEf1234 --room rom_AbCdEf1234 \
+  --agent codex --agent codex --until 'said: DONE' --until 'after: 2h'
+```
+
+`--room <room id>` says this run's goal in a Room of yours that already exists, instead of
+opening a new one. A Room holds one goal at a time; once its goal has ended, its owner may say
+the next one there. `goal run`:
+
+1. opens the Room again if it is closed (`POST /rooms/<id>/reopen`, by your key, as it closes
+   one): its seats, invites and log come back as they were;
+2. seats its runner in it, says the goal as the owner, and invites the Agents, who join as new
+   members under their seat names;
+3. watches the goal from its own message on: claims, checks, counts and wakes before it belong
+   to the earlier goal and do not count.
+
+With `--resume-from`, a resumed seat is told the Room is the same and where the new goal starts.
+The record goes to `runs/<rom_…>-goal-<n>` (n is the goal's message number), so the earlier
+goal's record is not overwritten; `--out` may not be the record `--resume-from` reads.
+
+Anything that stops the goal being said there (not your Room, a compiled or direct Room, a
+goal still running in it) is refused as `room_not_reusable`, before an Agent starts, so a
+caller can fall back to a new Room. Without `--room`, a run is what it was.
+
 ## Serve-backed runtime modes
 
 The two `runtime/serve-*@1` modes use a fixed three-Codex-agent path for testing the
@@ -262,6 +354,7 @@ sensitive even though credential files are excluded.
 | `workspace.git` | the workspace each time it changed, tagged with the Room sequence it follows (`git --git-dir=runs/rom_…/workspace.git log`); `.env*` and `.sharednet/` are never included |
 | `agents/<seat>/turn-NNN.jsonl` | each turn's raw stream from the harness |
 | `agents/<seat>/home/` | the agent's own session files: Codex in `.codex/sessions/`, Claude Code in `.claude/projects/` |
+| `episode.json` → `resume` | only with `--resume-from`: which seats were taken up again in their own sessions, and why each other seat started fresh |
 | `gateway/` | with `--isolate`: the gateway's access logs, `sharednet.log` and one per model API, each request with the container address it came from |
 
 ## Other ways to use it

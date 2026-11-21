@@ -1011,6 +1011,19 @@ export async function handleRequest(
       return jsonResponse(await repository.closeRoom(auth.principalId, roomId, end), { status: 200 });
     }
 
+    // Its owner opens a closed Room again, by API key as it closes one: seats, invites and the log
+    // come back as they were. A goal Room so opened can take its next goal (`startGoal`).
+    const reopenMatch = /^\/api\/v1\/rooms\/([^/]+)\/reopen$/.exec(path);
+    if (reopenMatch) {
+      if (request.method !== "POST") return routeMethodNotAllowed("POST");
+      const repository = getRepository();
+      const auth = await authenticateApiKey(request, repository);
+      if (isResponse(auth)) return auth;
+      requireNoIdempotency(request);
+      const roomId = parsePublicId(reopenMatch[1], "rom");
+      return jsonResponse(await repository.reopenRoom(auth.principalId, roomId), { status: 200 });
+    }
+
     // People (decision 2026-10-25): an account invites a person it knows into
     // a Room it can see, finds people it has shared a Room with by name, and
     // leaves a Room it was brought into.

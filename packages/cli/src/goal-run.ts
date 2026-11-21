@@ -9,12 +9,13 @@ import { TASK_HELP, MENTION_HELP, TASK_PROFILE, TASK_HOOK, TASK_HOOK_SETTINGS } 
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 
 import type { ApiClient } from "./api-client.ts";
 import { CliError, localError } from "./errors.ts";
 import { goalWatch, type GoalWatchResult } from "./goal.ts";
+import { earlierRoomFile, earlierRoomMarkdown, newcomerNote, planResume, resumePrompt, roomControls, usageSince, type FreshReason, type ResumeSource } from "./goal-resume.ts";
 import { assertGoalRunHarnessAgentCount, type GoalRunHarnessResolution } from "./harness-modes.ts";
 import { mentions } from "./triggers.ts";
 
@@ -547,7 +548,6 @@ const COOPERATIVE_REMINDER = "Continue under the cooperative-turn policy: comple
 
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
 export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules }): string {
-  const modules = input.modules ?? DEFAULT_MODULES;
   const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
   const single = input.seats.length === 1;
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
@@ -570,6 +570,19 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
     "  sharednet read --last 30 --json    what has been said",
     '  sharednet say "…" --json          say something; keep it short',
     ...(input.roomType === "compiled" ? [COMPILED_HELP] : []),
+    ...roomRules(input),
+  ].join("\n");
+}
+
+/**
+ * How a Room works, as the end of every opening states it: who a message wakes, how to take
+ * turns, the gates and the modules. A seat taken up again from an earlier run is told these only
+ * when they are not that run's (`--resume-from`).
+ */
+export function roomRules(input: { seat: AgentSpec; seats: readonly AgentSpec[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules }): string[] {
+  const modules = input.modules ?? DEFAULT_MODULES;
+  const single = input.seats.length === 1;
+  return [
     ...(input.messageRouting === "mentions" ? [
       "Messages mentioning known teammates wake only those teammates. No mention, @all, or unknown-only names broadcast. Explicit board reads still show all messages. Use exact teammate names from the roster.",
       "Do not run `sharednet wait` or `sharednet watch`: end your turn when waiting; the runner supplies messages routed to you.",
@@ -586,7 +599,7 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
     ...(input.mentionGate ? [MENTION_HELP] : []),
     ...(input.taskGate ? [TASK_HELP] : []),
     ...moduleHelp(input.seat.name, input.seats.map((seat) => seat.name), modules),
-  ].join("\n");
+  ];
 }
 
 /** What the module slots add to a seat's first prompt; nothing when every slot is at its default. */
@@ -746,6 +759,11 @@ export interface TurnReading {
 /** Reads a harness's JSON stream for what the runner needs: the session to resume, and the spend. */
 export class TurnReader {
   readonly reading: TurnReading = { sessionId: null, usage: null, failed: false };
+  /**
+   * Whether the harness took a session up in this turn: Codex says `thread.started`, Claude Code
+   * `system init`. A harness that is asked to resume a session it cannot find says neither.
+   */
+  started = false;
   private readonly driver: Driver;
 
   constructor(driver: Driver) {
@@ -762,11 +780,13 @@ export class TurnReader {
     const usage = (event.usage ?? null) as Record<string, unknown> | null;
     if (this.driver === "codex") {
       if (event.type === "thread.started" && typeof event.thread_id === "string") this.reading.sessionId = event.thread_id;
+      if (event.type === "thread.started") this.started = true;
       if (event.type === "turn.completed" && usage) this.reading.usage = codexUsage(usage);
       if (event.type === "turn.failed" || event.type === "error") this.reading.failed = true;
       return;
     }
     if (typeof event.session_id === "string") this.reading.sessionId = event.session_id;
+    if (event.type === "system" && event.subtype === "init") this.started = true;
     if (event.type === "result") {
       if (usage) {
         this.reading.usage = {
@@ -826,6 +846,13 @@ export interface GoalRunInput {
   codexModel?: CodexModel;
   /** The module slots (modules/index.ts); left out, every slot keeps today's behaviour. */
   modules?: HarnessModules;
+  /**
+   * `--resume-from`: the earlier run whose seats this run takes up again (goal-resume.ts). Left
+   * out, every seat starts a fresh session with the whole opening, as it always has.
+   * `earlierRooms` names a file in the workspace that already holds what was said earlier; null,
+   * goal run writes the earlier Room's messages into the workspace itself.
+   */
+  resume?: { source: ResumeSource; earlierRooms: string | null };
 }
 
 export interface GoalRunDependencies {
@@ -838,6 +865,17 @@ export interface GoalRunDependencies {
 export interface GoalRunResult extends GoalWatchResult {
   agents: SeatRecord[];
   tokens: number;
+  /** Only for a run with `--resume-from`: which seats were taken up again, and why the others were not. */
+  resume?: ResumeRecord;
+}
+
+/** What a resumed run's record says of each seat: its earlier session taken up, or a fresh one and why. */
+export interface ResumeRecord {
+  from: string;
+  room_id: string | null;
+  /** The file in the workspace that holds what was said earlier. */
+  earlier_rooms: string | null;
+  seats: Record<string, { resumed: true; session_id: string; baseline: Usage; prompt_sha256: string } | { resumed: false; reason: FreshReason }>;
 }
 
 /** Creates nothing outside its containers and the record; the Room and its goal already exist. */
@@ -896,6 +934,34 @@ export async function runGoal(
   await mkdir(input.out, { recursive: true });
   const wakeLog = join(input.out, "wakes.ndjson");
   await writeFile(wakeLog, "");
+
+  // `--resume-from`: which seats are taken up again, and where what was said earlier can be read.
+  // Without it, `resume` is null and nothing below this point is different from a run before the option.
+  const resume = input.resume ? await planResume(input.resume.source, plan.agents, codexSessionUsage) : null;
+  const resumeRecord: ResumeRecord | null = input.resume && resume
+    ? { from: input.resume.source.record, room_id: input.resume.source.roomId, earlier_rooms: input.resume.earlierRooms, seats: Object.fromEntries([...resume.fresh].map(([name, reason]) => [name, { resumed: false as const, reason }])) }
+    : null;
+  if (input.resume && resumeRecord && input.resume.earlierRooms === null) {
+    // The earlier Room has ended and these seats hold new seats in a new one: what was said there is kept as a file to search.
+    const file = earlierRoomFile(input.resume.source.roomId);
+    try {
+      const said = earlierRoomMarkdown(input.resume.source.roomId, await readFile(join(input.resume.source.record, "room.ndjson"), "utf8"));
+      await mkdir(join(plan.workspace, dirname(file)), { recursive: true });
+      await writeFile(join(plan.workspace, file), said);
+      // The Agents' user is the image's, not this machine's: readable whatever this process's umask is.
+      await chmod(join(plan.workspace, dirname(file)), 0o755);
+      await chmod(join(plan.workspace, file), 0o644);
+      resumeRecord.earlier_rooms = file;
+    } catch {
+      log(`goal: what was said in the earlier Room could not be written to ${file}; the resumed seats still have their own memory of it\n`);
+    }
+  }
+  /** A seat that was to be taken up again starts fresh after all; the record says why. */
+  const startFresh = (seat: SeatRecord, reason: FreshReason) => {
+    resume?.seats.delete(seat.name);
+    if (resumeRecord) resumeRecord.seats[seat.name] = { resumed: false, reason };
+    log(`goal: ${seat.name} starts a fresh session (${reason}); its earlier session was not resumed\n`);
+  };
 
   /** An Agent's container: the shared workspace, this CLI, and a Codex seat's login; idle until a turn runs in it. */
   const startContainer = (seat: SeatRecord) => docker([
@@ -972,8 +1038,10 @@ export async function runGoal(
   const account = (seat: SeatRecord, usage: Usage | null, sessionTotal: boolean) => {
     if (!usage) return 0;
     const before = seat.tokens;
+    // A session taken up from an earlier run had a total before this run began: only what comes after it is this run's.
+    const earlier = resume?.seats.get(seat.name)?.baseline;
     seat.usage = sessionTotal
-      ? usage
+      ? earlier ? usageSince(usage, earlier) : usage
       : { input: seat.usage.input + usage.input, cached: seat.usage.cached + usage.cached, output: seat.usage.output + usage.output };
     seat.tokens = freshTokens(seat.usage);
     return seat.tokens - before;
@@ -1055,6 +1123,18 @@ export async function runGoal(
         }
       }
       const home = `${CONTAINER_HOMES}/${seat.name}`;
+      const taken = resume?.seats.get(seat.name);
+      if (taken) {
+        // The seat's home as its earlier run left it: its sessions, its harness's settings, skills and MCP servers,
+        // and what it installed for itself. The record took the sign-ins out; they are put back just below, as for a new seat.
+        // Its contents (`/.`), so the home lands in place whether or not something has made the folder already.
+        const restored = await docker(["cp", `${taken.home}/.`, `${container}:${home}`]);
+        const owned = restored.code === 0 ? await docker(["exec", "--user", "root", container, "sh", "-c", `chown -R ${user} '${home}'`]) : restored;
+        if (owned.code !== 0) {
+          await docker(["exec", "--user", "root", container, "rm", "-rf", home]);
+          startFresh(seat, "home_not_restored");
+        }
+      }
       const prepared = seat.driver === "codex" && plan.codexAuth?.kind === "login"
         ? await docker([
             "exec", "--user", "root", container, "sh", "-c",
@@ -1164,7 +1244,7 @@ export async function runGoal(
           cut_by_end: cut,
         })}\n`,
       );
-      return failed;
+      return { failed, started: reader.started };
     };
 
     /** What the module slots add to a wake: what has been asked of the seat, and who is doing what. */
@@ -1211,14 +1291,52 @@ export async function runGoal(
     // Every seat starts once. Subsequent wakes follow the configured routing policy.
     const seatLoop = async (seat: SeatRecord) => {
       let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules });
-      openingPromptHashes[seat.name] = sha256(prompt);
+      // A seat taken up again resumes its own session with the new goal and what has changed; a seat
+      // that starts fresh in such a run gets the whole opening, and is told the swarm has worked before.
+      let taken = resume?.seats.get(seat.name) ?? null;
+      // The whole opening, kept for a seat whose session turns out not to be resumable.
+      let freshOpening: string | null = null;
+      if (input.resume && resume && resumeRecord) {
+        const names = records.map((record) => record.name);
+        const earlier = { earlierRoomId: input.resume.source.roomId, earlierRooms: resumeRecord.earlier_rooms, workspace: CONTAINER_WORKSPACE };
+        const opening = `${prompt}\n\n${newcomerNote({ seat: seat.name, seats: names, resumed: new Set(resume.seats.keys()), ...earlier, roomId: input.roomId, goalSequence: input.goalSequence })}`;
+        if (taken) {
+          const controls = roomControls({ mentionGate, taskGate, messageRouting, turnPolicy, modules: describeModules(modules), seats: names });
+          const again = resumePrompt({
+            seat: seat.name, seats: names, resumed: new Set(resume.seats.keys()), roomId: input.roomId, ...earlier,
+            goal: input.goal, goalSequence: input.goalSequence, until: input.until, today: dependencies.now().toISOString().slice(0, 10),
+            rules: controls === input.resume.source.controls ? null : roomRules({ seat, seats: records, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules }),
+          });
+          seat.session_id = taken.sessionId;
+          resumeRecord.seats[seat.name] = { resumed: true, session_id: taken.sessionId, baseline: taken.baseline, prompt_sha256: sha256(again) };
+          freshOpening = opening;
+          prompt = again;
+        } else prompt = opening;
+      }
+      if (!taken) openingPromptHashes[seat.name] = sha256(prompt);
       let wake: WakeShape | null = null;
       let failedInARow = 0;
       while (!ended) {
         busy.add(seat.name);
-        const failed = await runTurn(seat, prompt, wake).finally(() => busy.delete(seat.name));
+        const { failed, started } = await runTurn(seat, prompt, wake).finally(() => busy.delete(seat.name));
         if (wake?.wake_id) await exec(seat, ["sharednet", "ack", wake.wake_id, "--json"]);
         failedInARow = failed ? failedInARow + 1 : 0;
+        if (taken) {
+          // The first turn shows whether the harness took the session up. Codex names the session it runs:
+          // any other than the one asked for is a new one, which has not had the opening. A harness that
+          // names none refused. Either way the seat starts again, fresh, with the whole opening.
+          const took = started && (seat.driver !== "codex" || seat.session_id === taken.sessionId);
+          taken = null;
+          if (!took) {
+            startFresh(seat, ended ? "ended_first" : "harness_refused");
+            seat.session_id = null;
+            if (ended || freshOpening === null) break;
+            prompt = freshOpening;
+            openingPromptHashes[seat.name] = sha256(prompt);
+            failedInARow = 0;
+            continue;
+          }
+        }
         if (ended) break;
         if (failedInARow >= FAILED_TURNS_LIMIT) {
           log(`goal: ${seat.name} failed ${FAILED_TURNS_LIMIT} turns in a row and takes no more; see agents/${seat.name}/\n`);
@@ -1370,12 +1488,14 @@ export async function runGoal(
           },
           agents: records,
           totals: { ...(episode.totals as object), tokens: spend(), cached_tokens: records.reduce((sum, seat) => sum + seat.usage.cached, 0) },
+          // Only a run that was asked to resume a swarm says so: which seats were taken up again, and why the others were not.
+          ...(resumeRecord ? { resume: resumeRecord } : {}),
         },
         null,
         2,
       )}\n`,
     );
-    return { ...watched, agents: records, tokens: spend() };
+    return { ...watched, agents: records, tokens: spend(), ...(resumeRecord ? { resume: resumeRecord } : {}) };
   } finally {
     ended = true;
     await docker(["rm", "--force", ...containers]);

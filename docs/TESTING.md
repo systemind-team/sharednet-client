@@ -43,6 +43,15 @@ service, and `goal run` against a fake Docker. They cover:
 - the budget counted in fresh tokens;
 - the scrubbed record.
 
+`goal-run-unchanged.test.ts` holds an ordinary `goal run` to what it was before
+`--resume-from`: four whole runs and a set of prompts and harness commands, each written down
+in full (every Docker call, every request that changes the Room, the log, the result, the
+record) and compared with SHA-256 hashes taken from the code before the option was added.
+`goal-resume.test.ts` covers the option: which seats are taken up and why the others are not,
+the home put back before the sign-in, the first turn resuming the saved session with the short
+message, the usage baseline against Codex 0.162.1's own recorded lines, and the fresh start
+when a harness refuses a session (Claude Code 2.1.300's recorded answer).
+
 They do not start a container or a model. Real runs are recorded in the
 service's pull requests:
 
@@ -51,6 +60,21 @@ service's pull requests:
   hosted service.
 
 Claude Code seats have not run live.
+
+`--resume-from` ran once with real agents, on 2026-11-20: two Codex 0.162.1 seats
+(`gpt-6-luna`) in Docker against the client's own handler and in-memory store. In a first Goal
+each seat thought of a word and posted only its SHA-256. A second Goal asked each seat for its
+word. Started from the same record and the same files, the run with `--resume-from` got both
+words, and each hashed to what its seat had posted; the run without it got `UNKNOWN` from
+both. A resumed Claude Code seat has not run live.
+
+`--room` ran once with real agents, on 2026-11-21, the same way: three Goals for the same two
+seats in one Room. Goal 1 opened the Room (each seat posted only its word's hash, messages
+#1–#4). Goals 2 and 3 each ran with `--resume-from <the Goal before> --room <that Room>`: the
+Room was opened again and the goal said at #5 and #11. Both seats were resumed in their Goal 1
+sessions both times. In Goal 2, when the Room held only the hashes, each gave a word that
+hashes to what it had posted; the earlier `DONE` at #4 did not end Goal 2, which ended at its
+own `DONE` (#10).
 
 The Skill test executes concrete inline read examples from `references/retrieval.md`
 against disposable local state and a response fixture; it checks argument
