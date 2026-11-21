@@ -81,10 +81,37 @@ sharednet goal run TASK.md --agent codex --agent codex --agent codex \
 3. **Watch it** in the Dashboard, where the Room has the name of your directory. Read the
    result in your workspace, and the full record in `runs/rom_…/`.
 
-`--agent` takes `codex` or `claude-code`, optionally with a model: `--agent codex:gpt-6-luna`.
-Repeat it, up to 50 agents. Seats are named `codex-1`, `codex-2`, `claude-code-1`, and so
+`--agent` takes `codex`, `claude-code` or `gemini`, optionally with a model:
+`--agent codex:gpt-6-luna` or `--agent gemini:gemini-4-argon`.
+Repeat it, up to 128 agents. Seats are named `codex-1`, `codex-2`, `claude-code-1`, `gemini-1`, and so
 on. Each agent is a container of its own, started and seated one after another, so a large team
 takes longer to start and needs a machine that can hold that many containers at once.
+Teams above 50 seats run at most eight native agent turns at once. Other turns wait their
+turn; ending the goal cancels those still queued. The record names this limit as
+`max_active_turns`. This bounds active harness processes, not the host memory of all containers.
+
+Gemini uses `GEMINI_API_KEY` from the runner's environment. Its value enters only its agent's
+environment, never a command argument. The default Gemini image is `sharednet-goal-agents:2`
+and installs `@google/gemini-cli@0.70.0`; the separate image tag avoids reusing an older cached
+image without Gemini. Existing Codex and Claude runs retain their image tag. A custom image
+must provide a compatible `gemini` binary. Before the team starts, the runner checks
+`gemini --version` in a disposable container with no network or model credentials and a
+15-second timeout. A missing or broken binary refuses the run with `agent_runtime_missing`;
+workers with `PROMETHEUS_WORKER_IMAGE` must rebuild that image with the Gemini CLI.
+
+Gemini runs headlessly with `--output-format stream-json`, and every later turn uses the
+exact session UUID announced by the first turn. An exit with no matching session and final
+successful result counts as a failed turn. Gemini's `stats.input` is fresh input,
+`stats.cached` is cached input, and `stats.total_tokens - stats.input_tokens` counts all
+generated output for that process, including reasoning. `stats.output_tokens` alone counts
+only visible candidates and would undercharge reasoning. Missing or inconsistent totals
+fail the turn; resumed turns add the validated counts to the run. `--web-search off` excludes `google_web_search` and
+`web_fetch` in the seat's Gemini settings. Gemini with `--isolate` is refused before a
+container starts because that gateway does not yet support Google's model API.
+The [official headless reference](https://geminicli.com/docs/cli/headless/),
+[authentication guide](https://geminicli.com/docs/get-started/authentication/) and
+[pinned stream types](https://github.com/google-gemini/gemini-cli/blob/v0.70.0/packages/core/src/output/types.ts)
+define this harness contract.
 
 ## End conditions (`--until`)
 
@@ -155,7 +182,7 @@ hold back room for the reply out of the same window. `episode.json` records them
 
 `--image <image>` runs the agents and the checks in an image of your own, for example a
 benchmark's task image with the harness added. It needs `node` (22.18 or newer) on `PATH`, the
-harness of each driver you use (`codex`, `claude`), `sh` and `git`. `--agent-user <user>` names the
+harness of each driver you use (`codex`, `claude`, `gemini`), `sh` and `git`. `--agent-user <user>` names the
 user the agents and the checks run as in it (default `node`, the default image's user). The
 runner makes `/home/agents` for that user if the image has none.
 
@@ -218,7 +245,9 @@ wake template and source commit too when freezing a study protocol.
 
 A run ends, and its agents are still on your machine: the record keeps each seat's home, and
 a harness keeps its sessions in its home (Codex in `.codex/sessions/`, Claude Code in
-`.claude/projects/`). `--resume-from` gives the next Goal to those same agents instead of new
+`.claude/projects/`, Gemini in `.gemini/tmp/<project>/chats/`). Gemini 0.70.0 uses JSONL
+conversation files; legacy JSON files are also recognized, and the stored full session UUID
+must match. `--resume-from` gives the next Goal to those same agents instead of new
 ones.
 
 ```sh
@@ -235,7 +264,7 @@ remember its files where they left them.
   `--agent`, so keep that order.
 - **What a resumed seat gets back.** Its home, put into its new container: its sessions, its
   harness's own settings, skills and MCP servers, and whatever it installed in its home. Its
-  first turn resumes its own session (`codex exec resume`, `claude --resume`), so it has its
+  first turn resumes its own session (`codex exec resume`, `claude --resume`, `gemini --resume <UUID>`), so it has its
   whole memory of the earlier Goal.
 - **What it is told.** Not the opening again. Its first message says this is a new Goal for
   the same swarm, gives the goal, and lists only what changed: the new Room, today's date,

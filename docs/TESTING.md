@@ -61,6 +61,15 @@ service's pull requests:
 
 Claude Code seats have not run live.
 
+Gemini coverage is local and uses synthetic credentials only. `goal-run.test.ts` runs a
+disposable fake `gemini` executable twice through the actual headless command, checks explicit
+UUID resume, rejects missing or failed terminal events, and verifies fresh/cached usage.
+Its 128-seat Docker adapter rehearsal proves all homes and seats are prepared, no more than
+eight native turns run concurrently, queued turns are cancelled on goal end, and every
+container is cleaned up. It does not measure actual Docker memory or call a Google model.
+`goal-resume.test.ts` checks full UUID binding in Gemini's current JSONL and legacy JSON files.
+Gemini has not run live as part of these checks.
+
 `--resume-from` ran once with real agents, on 2026-11-20: two Codex 0.162.1 seats
 (`gpt-6-luna`) in Docker against the client's own handler and in-memory store. In a first Goal
 each seat thought of a word and posted only its SHA-256. A second Goal asked each seat for its

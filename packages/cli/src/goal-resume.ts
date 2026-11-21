@@ -129,7 +129,7 @@ export async function readResumeSource(directory: string): Promise<ResumeSource>
   if (!record(episode) || !Array.isArray(episode.agents)) throw refuse();
   const earlier = record(episode.resume) && record(episode.resume.seats) ? episode.resume.seats : {};
   const seats = episode.agents.flatMap((agent): EarlierSeat[] => {
-    if (!record(agent) || typeof agent.name !== "string" || (agent.driver !== "codex" && agent.driver !== "claude-code")) return [];
+    if (!record(agent) || typeof agent.name !== "string" || (agent.driver !== "codex" && agent.driver !== "claude-code" && agent.driver !== "gemini")) return [];
     const before = earlier[agent.name];
     return [{
       name: agent.name,
@@ -156,6 +156,20 @@ export async function readResumeSource(directory: string): Promise<ResumeSource>
 }
 
 async function sessionFile(home: string, driver: Driver, sessionId: string): Promise<string | null> {
+  if (driver === "gemini") {
+    const root = join(home, ".gemini", "tmp");
+    const files = await readdir(root, { recursive: true }).catch(() => [] as string[]);
+    // Gemini uses only eight UUID characters in its filename. Bind the full UUID in the
+    // JSONL metadata (0.70.0), or legacy JSON record, rather than trusting a colliding prefix.
+    for (const name of files.filter(name => /(?:^|\/)chats\/session-[^/]+\.jsonl?$/.test(name))) {
+      try {
+        const raw = await readFile(join(root, name), "utf8");
+        const metadata: unknown = JSON.parse(name.endsWith(".jsonl") ? raw.split("\n", 1)[0]! : raw);
+        if (record(metadata) && metadata.sessionId === sessionId) return join(root, name);
+      } catch { /* A partial or unrelated record cannot resume this seat. */ }
+    }
+    return null;
+  }
   const root = driver === "codex" ? join(home, ".codex", "sessions") : join(home, ".claude", "projects");
   const files = await readdir(root, { recursive: true }).catch(() => [] as string[]);
   // Codex names a session's file rollout-<time>-<id>.jsonl; Claude Code names it <id>.jsonl, under the directory it worked in.

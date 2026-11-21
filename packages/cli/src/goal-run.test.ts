@@ -21,6 +21,7 @@ import {
   containerName,
   discoverCodeProvenance,
   freshTokens,
+  geminiSetupCommand,
   gatewayTemplate,
   keyPlaceholders,
   isolationNames,
@@ -105,7 +106,7 @@ describe("--agent", () => {
       { name: "codex-2", driver: "codex", model: null },
       { name: "claude-code-1", driver: "claude-code", model: "claude-sonnet-5-5" },
     ]);
-    for (const raws of [[], ["gemini"], ["codex:bad model"], Array.from({ length: 51 }, () => "codex")]) {
+    for (const raws of [[], ["unknown"], ["codex:bad model"], Array.from({ length: 129 }, () => "codex")]) {
       expect(() => parseAgents(raws), raws.join(" ")).toThrow();
     }
   });
@@ -122,6 +123,138 @@ describe("--agent", () => {
     expect(seats.at(-2)).toEqual({ name: "codex-25", driver: "codex", model: null });
     expect(seats.at(-1)).toEqual({ name: "claude-code-25", driver: "claude-code", model: null });
     expect(new Set(seats.map((seat) => seat.name)).size).toBe(50);
+  });
+});
+
+describe("Gemini native turns", () => {
+  const session = "12345678-1234-4234-8234-123456789abc";
+  const init = { type: "init", session_id: session, model: "gemini-4-argon" };
+  const result = { type: "result", status: "success", stats: { total_tokens: 107, input_tokens: 100, input: 20, cached: 80, output_tokens: 7, tool_calls: 1 } };
+
+  it.each([32, 64, 128])("plans %i independently named Gemini agents", count => {
+    const agents = parseAgents(Array.from({ length: count }, () => "gemini:gemini-4-argon"));
+    expect(agents).toHaveLength(count);
+    expect(agents.at(-1)).toEqual({ name: `gemini-${count}`, driver: "gemini", model: "gemini-4-argon" });
+    expect(new Set(runContainers(ROOM, agents)).size).toBe(count + 1);
+  });
+
+  it("uses headless JSON and an explicit UUID on resume", () => {
+    const seat = parseAgents(["gemini:gemini-3.8-flash"])[0]!;
+    expect(turnCommand(seat, "first", null)).toEqual(["timeout", "1200", "gemini", "--approval-mode", "yolo", "--output-format", "stream-json", "--model", "gemini-3.8-flash", "--prompt", "first"]);
+    expect(turnCommand(seat, "next", session)).toContain(session);
+    for (const invalid of ["latest", "1", "", "wrong-session"]) expect(() => turnCommand(seat, "next", invalid)).toThrow(/UUID/u);
+    expect(AGENT_DOCKERFILE).toContain("@google/gemini-cli@0.70.0");
+  });
+
+  it("keeps assistant chunks, tools and fresh usage from the current process", () => {
+    const reader = new TurnReader("gemini", session);
+    for (const event of [init, { type: "message", role: "user", content: "ignored" }, { type: "message", role: "assistant", content: "Re", delta: true }, { type: "message", role: "assistant", content: "ady", delta: true }, { type: "tool_use", tool_id: "t1", tool_name: "run_shell_command", parameters: { command: "true" } }, { type: "tool_result", tool_id: "t1", status: "error", error: { type: "exit", message: "retryable tool failure" } }, { type: "error", severity: "warning", message: "warning" }, result]) reader.line(JSON.stringify(event));
+    reader.finish();
+    expect(reader.reading).toEqual({ sessionId: session, usage: { input: 20, cached: 80, output: 7 }, failed: false });
+    expect(reader.started).toBe(true);
+    expect(reader.completed).toBe(true);
+    expect(reader.text).toBe("Ready");
+    expect(reader.toolCalls).toBe(1);
+  });
+
+  it("counts generated reasoning tokens from the total rather than only visible candidates", () => {
+    const reader = new TurnReader("gemini");
+    reader.line(JSON.stringify(init));
+    reader.line(JSON.stringify({ ...result, stats: { total_tokens: 10_100, input_tokens: 100, input: 100, cached: 0, output_tokens: 10 } }));
+    reader.finish();
+    expect(reader.reading).toEqual({ sessionId: session, usage: { input: 100, cached: 0, output: 10_000 }, failed: false });
+    expect(freshTokens(reader.reading.usage)).toBe(10_100);
+  });
+
+  it.each([
+    [init],
+    [result],
+    [init, { ...result, status: "error", error: { type: "quota", message: "exhausted" } }],
+    [init, { type: "error", severity: "error", message: "failed" }, result],
+    [{ ...init, session_id: "87654321-1234-4234-8234-123456789abc" }, result],
+    [init, { ...result, stats: { ...result.stats, input: -1 } }],
+    [init, { ...result, stats: { ...result.stats, output_tokens: "7" } }],
+    [init, { ...result, stats: { input_tokens: 100, input: 20, cached: 80, output_tokens: 7 } }],
+    [init, { ...result, stats: { ...result.stats, total_tokens: 106 } }],
+    [init, { ...result, stats: { ...result.stats, total_tokens: "107" } }],
+    [init, { ...result, stats: { ...result.stats, cached: 101 } }],
+    [init, result, result],
+    [init, null, result],
+    [init, { type: "tool_use", tool_id: "missing", tool_name: "run_shell_command", parameters: {} }, result],
+    [init, { type: "tool_result", tool_id: "unknown", status: "success" }, result],
+    [init, { type: "unrecognized" }, result],
+  ])("refuses incomplete, mismatched and failed stream %j", (...events) => {
+    const reader = new TurnReader("gemini", session);
+    for (const event of events) reader.line(JSON.stringify(event));
+    reader.finish();
+    expect(reader.reading.failed).toBe(true);
+    expect(reader.completed).toBe(false);
+  });
+
+  it("requires a Gemini API key and refuses isolation before containers start", async () => {
+    const home = await temporary();
+    await writeFile(join(home, "package.json"), "{}");
+    const agents = parseAgents(Array.from({ length: 128 }, () => "gemini"));
+    const input = { agents, image: "candidate:1", workspace: home, home, entry: join(home, "main.ts") };
+    const { docker, calls } = fakeDocker(call => ({ stdout: call.args[0] === "run" ? "0.70.0\n" : "" }));
+    await expect(prepareRun({ ...input, env: {} }, docker, () => undefined)).rejects.toMatchObject({ code: "agent_auth_missing" });
+    const plan = await prepareRun({ ...input, env: { GEMINI_API_KEY: "synthetic-gemini-key" } }, docker, () => undefined);
+    expect(plan.geminiAuth).toBe("GEMINI_API_KEY");
+    expect(plan.agents).toHaveLength(128);
+    const defaultPlan = await prepareRun({ ...input, image: null, env: { GEMINI_API_KEY: "synthetic-gemini-key" } }, docker, () => undefined);
+    expect(defaultPlan.image).toBe("sharednet-goal-agents:2");
+    await expect(prepareRun({ ...input, isolate: true, env: { GEMINI_API_KEY: "synthetic-gemini-key" } }, docker, () => undefined)).rejects.toMatchObject({ code: "invalid_arguments" });
+    expect(calls.filter(call => call.args[0] === "run").every(call => call.args.includes("--version") && call.args.includes("none") && !call.args.includes("-e"))).toBe(true);
+  });
+
+  it.each([{ code: 127, stdout: "" }, { code: 0, stdout: "not a CLI version" }])("refuses a custom image without a working Gemini binary: %j", async response => {
+    const home = await temporary();
+    await writeFile(join(home, "package.json"), "{}");
+    const { docker, calls } = fakeDocker(call => call.args[0] === "run" ? response : {});
+    await expect(prepareRun({ agents: parseAgents(["gemini"]), image: "older-worker:1", workspace: home, home, entry: join(home, "main.ts"), env: { GEMINI_API_KEY: "synthetic-key" } }, docker, () => undefined)).rejects.toMatchObject({ code: "agent_runtime_missing" });
+    expect(calls.some(call => call.args.includes("--detach"))).toBe(false);
+  });
+
+  it("executes a disposable Gemini binary twice with its actual headless command and persisted session", async () => {
+    const home = await temporary();
+    const binary = join(home, "gemini");
+    await writeFile(binary, `#!${process.execPath}\nconst fs = require('node:fs');\nconst args=process.argv.slice(2);\nif(args[args.indexOf('--output-format')+1]!=='stream-json'||!args.includes('--prompt'))process.exit(42);\nconst path=process.env.HOME+'/synthetic-session';\nconst resumed=args.includes('--resume');\nif(resumed&&args[args.indexOf('--resume')+1]!==fs.readFileSync(path,'utf8'))process.exit(1);\nfs.writeFileSync(path,'${session}');\nfor(const event of [${JSON.stringify(init)},{type:'message',role:'assistant',content:resumed?'resumed':'first'},${JSON.stringify(result)}])process.stdout.write(JSON.stringify(event)+'\\n');\n`, { mode: 0o700 });
+    const seat = parseAgents(["gemini"])[0]!;
+    for (const previous of [null, session]) {
+      const command = turnCommand(seat, "synthetic prompt", previous, "live", 5);
+      const output = execFileSync(command[0]!, command.slice(1), { env: { PATH: `${home}:/usr/bin:/bin`, HOME: home }, encoding: "utf8", timeout: 6_000 });
+      const reader = new TurnReader("gemini", previous);
+      for (const line of output.trim().split("\n")) reader.line(line);
+      reader.finish();
+      expect(reader.reading.failed).toBe(false);
+      expect(reader.reading.sessionId).toBe(session);
+      expect(reader.text).toBe(previous ? "resumed" : "first");
+    }
+  });
+
+  it("removes Gemini sign-ins from the exported home while retaining its session", async () => {
+    const home = await temporary();
+    const folder = join(home, ".gemini");
+    await mkdir(folder);
+    for (const file of ["oauth_creds.json", "google_accounts.json", "gemini-credentials.json", "mcp-oauth-tokens.json", "a2a-oauth-tokens.json", ".env", "session.json"]) await writeFile(join(folder, file), "synthetic");
+    await scrubHome(home);
+    for (const file of ["oauth_creds.json", "google_accounts.json", "gemini-credentials.json", "mcp-oauth-tokens.json", "a2a-oauth-tokens.json", ".env"]) await expect(readFile(join(folder, file))).rejects.toThrow();
+    expect(await readFile(join(folder, "session.json"), "utf8")).toBe("synthetic");
+  });
+
+  it("writes auth and each run's web policy without changing the seat's own settings", async () => {
+    const home = await temporary();
+    await mkdir(join(home, ".gemini"));
+    const ownSettings = '{"model":{"name":"synthetic-model"}}';
+    await writeFile(join(home, ".gemini", "settings.json"), ownSettings);
+    for (const web of ["off", "live"] as const) {
+      const command = geminiSetupCommand(web);
+      execFileSync(process.execPath, command.slice(1), { env: { HOME: home }, timeout: 5_000 });
+      const settings = JSON.parse(await readFile(join(home, ".gemini", "sharednet-settings.json"), "utf8"));
+      expect(settings.security.auth.selectedType).toBe("gemini-api-key");
+      expect(settings.tools.exclude).toEqual(web === "off" ? ["google_web_search", "web_fetch"] : []);
+      expect(await readFile(join(home, ".gemini", "settings.json"), "utf8")).toBe(ownSettings);
+    }
   });
 });
 
@@ -369,6 +502,58 @@ describe("prepareRun", () => {
 });
 
 describe("runGoal", () => {
+  it.each([false, true])("bounds 128 native agent turns to eight and cancels pending work on end (cancel=%s)", async cancel => {
+    const out = await temporary();
+    const agents = parseAgents(Array.from({ length: 128 }, () => "gemini"));
+    let active = 0;
+    let peak = 0;
+    let started = 0;
+    let finished = 0;
+    let stopped = false;
+    let afterStop = 0;
+    const releases: Array<() => void> = [];
+    const { docker, calls } = fakeDocker(async (call, command) => {
+      if (call.args[0] === "stop" || call.args[0] === "rm") { stopped = true; for (const release of releases.splice(0)) release(); }
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: `i_Gemini${command.at(-2)!.split("-").at(-1)}` }) };
+      if (command[2] === "gemini") {
+        if (stopped) afterStop += 1;
+        started += 1;
+        active += 1;
+        peak = Math.max(peak, active);
+        if (cancel) await new Promise<void>(resolve => releases.push(resolve));
+        else await new Promise(resolve => setTimeout(resolve, 2));
+        active -= 1;
+        finished += 1;
+        return { lines: [JSON.stringify({ type: "init", session_id: "12345678-1234-4234-8234-123456789abc", model: "gemini-4-argon" }), JSON.stringify({ type: "result", status: "success", stats: { total_tokens: 16, input_tokens: 3, input: 1, cached: 2, output_tokens: 3 } })] };
+      }
+      if (command[0] === "sharednet" && command[1] === "wait") return { stdout: JSON.stringify({ fired: ["closed"], messages: [] }) };
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["said DONE", "after 2h"], started_at: "2026-11-21T00:00:00.000Z", ended_by: null };
+    const client = { async request(method: string, path: string, _token: string, body?: object) {
+      if (method === "GET" && path === `/rooms/${ROOM}`) return { room: { id: ROOM, state: "open", type: "board", goal }, memberships: [] };
+      if (method === "GET" && path.startsWith(`/rooms/${ROOM}/wait?`)) {
+        await new Promise(resolve => setTimeout(resolve, 2));
+        return { items: (cancel ? started >= 8 : finished === 128) ? [{ sequence: 2, content: "DONE", sender: { member_id: "i_synthetic", name: "someone" }, created_at: goal.started_at }] : [] };
+      }
+      if (method === "POST" && path.endsWith("/close")) return { room: { state: "closed", goal: { ...goal, ended_by: { ...body, at: goal.started_at } } } };
+      throw new Error(`Unexpected ${method} ${path}`);
+    } } as unknown as ApiClient;
+    const result = await runGoal(client, "sni_synthetic", OWNER_KEY, { plan: { image: "synthetic:1", agents, workspace: out, cli: { root: "/opt/synthetic", entry: "main.js" }, codexAuth: null, claudeAuth: null, geminiAuth: "GEMINI_API_KEY" }, roomId: ROOM, inviteToken: INVITE, goal: "bounded synthetic agents", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: false }, { docker, now: () => new Date(goal.started_at), sleep: async () => undefined });
+    expect(peak).toBe(8);
+    expect(started).toBe(cancel ? 8 : 128);
+    expect(afterStop).toBe(0);
+    expect(result.agents).toHaveLength(128);
+    expect(result.tokens).toBe((cancel ? 8 : 128) * 14);
+    expect(calls.filter(call => call.args[0] === "run")).toHaveLength(129);
+    expect(calls.at(-1)?.args).toEqual(["rm", "--force", ...runContainers(ROOM, agents)]);
+    const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
+    expect(episode.max_active_turns).toBe(8);
+    const joinCall = calls.find(call => call.args.includes("join"));
+    expect(joinCall?.env).toMatchObject({ GEMINI_CLI: "1" });
+    expect(calls.filter(call => call.args.includes("gemini")).every(call => call.args.includes("GEMINI_API_KEY"))).toBe(true);
+  });
+
   it("does not report a dirty source checkout as the clean client and runner commit", async () => {
     const root = await temporary();
     await mkdir(join(root, "src"));
