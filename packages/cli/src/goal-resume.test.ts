@@ -103,6 +103,21 @@ async function earlierRecord(episode: Record<string, unknown> = {}) {
 }
 
 describe("the record a run resumes from", () => {
+  it.each(["jsonl", "json"])("resumes only the full Gemini session id stored in its %s conversation", async format => {
+    const directory = await temporary();
+    const sessionId = "12345678-1234-4234-8234-123456789abc";
+    const chats = join(directory, "agents", "gemini-128", "home", ".gemini", "tmp", "synthetic-project", "chats");
+    await mkdir(chats, { recursive: true });
+    await writeFile(join(directory, "episode.json"), JSON.stringify({ room_id: EARLIER_ROOM, agents: [{ name: "gemini-128", driver: "gemini", session_id: sessionId }] }));
+    const filename = join(chats, `session-2026-11-21T00-00-12345678.${format}`);
+    await writeFile(filename, JSON.stringify({ sessionId, projectHash: "synthetic-project", messages: [] }) + "\n");
+    const source = await readResumeSource(directory);
+    const agents = [{ name: "gemini-128", driver: "gemini" as const, model: null }];
+    expect(source.seats).toHaveLength(1);
+    expect((await planResume(source, agents, codexSessionUsage)).seats.get("gemini-128")?.sessionId).toBe(sessionId);
+    await writeFile(filename, JSON.stringify({ sessionId: "12345678-aaaa-4234-8234-123456789abc", projectHash: "synthetic-project" }));
+    expect((await planResume(source, agents, codexSessionUsage)).fresh.get("gemini-128")).toBe("no_session_file");
+  });
   it("is refused unless it is a goal run's record", async () => {
     const empty = await temporary();
     await expect(readResumeSource(empty)).rejects.toMatchObject({ code: "invalid_arguments" });

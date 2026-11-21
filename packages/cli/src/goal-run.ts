@@ -35,7 +35,7 @@ import { mentions } from "./triggers.ts";
  * Agent is woken by one policy and the record says when and by what.
  */
 
-export type Driver = "codex" | "claude-code";
+export type Driver = "codex" | "claude-code" | "gemini";
 
 export interface AgentSpec {
   /** The seat's name in the Room: the driver and a number, `codex-1`. */
@@ -44,13 +44,14 @@ export interface AgentSpec {
   model: string | null;
 }
 
-const DRIVERS: readonly Driver[] = ["codex", "claude-code"];
-const MAX_AGENTS = 50;
+const DRIVERS: readonly Driver[] = ["codex", "claude-code", "gemini"];
+const MAX_AGENTS = 128;
+const GEMINI_SESSION = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** `--agent codex`, `--agent codex:gpt-6-luna`, `--agent claude-code:claude-sonnet-5-5`; repeat it for more seats. */
 export function parseAgents(raws: readonly string[]): AgentSpec[] {
   if (raws.length === 0) {
-    throw localError("invalid_arguments", "goal run needs at least one --agent: codex or claude-code, with :<model> to choose the model.");
+    throw localError("invalid_arguments", "goal run needs at least one --agent: codex, claude-code or gemini, with :<model> to choose the model.");
   }
   if (raws.length > MAX_AGENTS) throw localError("invalid_arguments", `goal run starts at most ${MAX_AGENTS} Agents.`);
   const counts = new Map<Driver, number>();
@@ -58,7 +59,7 @@ export function parseAgents(raws: readonly string[]): AgentSpec[] {
     const separator = raw.indexOf(":");
     const driver = (separator === -1 ? raw : raw.slice(0, separator)).trim() as Driver;
     const model = separator === -1 ? null : raw.slice(separator + 1).trim() || null;
-    if (!DRIVERS.includes(driver)) throw localError("invalid_arguments", `--agent ${raw}: the driver is codex or claude-code.`);
+    if (!DRIVERS.includes(driver)) throw localError("invalid_arguments", `--agent ${raw}: the driver is codex, claude-code or gemini.`);
     // A model name may carry a router's variant after a colon of its own, as in qwen/qwen3.8-27b:nitro.
     if (model !== null && !/^[A-Za-z0-9._/-][A-Za-z0-9._/:-]{0,99}$/.test(model)) throw localError("invalid_arguments", `--agent ${raw}: that is not a model name.`);
     const number = (counts.get(driver) ?? 0) + 1;
@@ -220,9 +221,11 @@ export async function discoverCodeProvenance(cli: { root: string; entry: string 
 
 /** The image the Agents run in when no --image is given; built on first use. */
 export const DEFAULT_IMAGE = "sharednet-goal-agents:1";
+/** A separate cache tag ensures a cached pre-Gemini image cannot silently omit its binary. */
+export const GEMINI_IMAGE = "sharednet-goal-agents:2";
 export const AGENT_DOCKERFILE = `FROM node:22-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends python3-pytest ripgrep && rm -rf /var/lib/apt/lists/*
-RUN npm install -g @openai/codex @anthropic-ai/claude-code && npm cache clean --force
+RUN npm install -g @openai/codex @anthropic-ai/claude-code @google/gemini-cli@0.70.0 && npm cache clean --force
 RUN mkdir -p /home/agents /workspace && chown node:node /home/agents /workspace
 USER node
 WORKDIR /workspace
@@ -404,6 +407,8 @@ export interface RunPlan {
   codexApi?: CodexApi;
   /** The variable that signs the Claude Code seats in, passed through by name. */
   claudeAuth: "CLAUDE_CODE_OAUTH_TOKEN" | "ANTHROPIC_API_KEY" | null;
+  /** Gemini's headless API key, passed by name only to Gemini seats. */
+  geminiAuth?: "GEMINI_API_KEY";
 }
 
 /** The package root of the CLI that is running: the directory with its package.json. */
@@ -424,12 +429,15 @@ export async function prepareRun(
   log: (line: string) => void,
   pause: (ms: number) => Promise<void> = (ms) => new Promise((resolvePause) => setTimeout(resolvePause, ms)),
 ): Promise<RunPlan> {
+  const gemini = input.agents.some((agent) => agent.driver === "gemini");
+  if (gemini && input.isolate) throw localError("invalid_arguments", "Gemini agents do not yet support --isolate; its gateway supports Codex and Claude Code.");
+  if (gemini && !input.env.GEMINI_API_KEY?.trim()) throw localError("agent_auth_missing", "A gemini Agent signs in with GEMINI_API_KEY; set it before starting the run.");
   if ((await docker(["info", "--format", "{{.ServerVersion}}"])).code !== 0) {
     throw localError("docker_unavailable", "goal run starts the Agents in Docker containers; start Docker, then run it again.");
   }
   const agentUser = input.agentUser ?? AGENT_USER;
   if (!AGENT_USER_PATTERN.test(agentUser)) throw localError("invalid_arguments", `--agent-user ${agentUser}: that is not a user name or uid.`);
-  const image = input.image ?? DEFAULT_IMAGE;
+  const image = input.image ?? (gemini ? GEMINI_IMAGE : DEFAULT_IMAGE);
   // Docker Desktop waking from idle can answer `info` before it can see its images: ask again before building.
   let present = false;
   for (let attempt = 0; attempt < 5 && !present; attempt += 1) {
@@ -475,7 +483,7 @@ export async function prepareRun(
     }
     isolation = { openai: codex.origin, anthropic: ANTHROPIC_ORIGIN };
   }
-  return { image, agentUser, isolation, agents: input.agents, workspace: input.workspace, cli: cliPackage(input.entry), codexAuth, claudeAuth, ...(codex.custom ? { codexApi: codex } : {}) };
+  return { image, agentUser, isolation, agents: input.agents, workspace: input.workspace, cli: cliPackage(input.entry), codexAuth, claudeAuth, ...(gemini ? { geminiAuth: "GEMINI_API_KEY" as const } : {}), ...(codex.custom ? { codexApi: codex } : {}) };
 }
 
 const OPENAI_ORIGIN = "https://api.openai.com";
@@ -663,8 +671,19 @@ export interface CodexModel {
 /** The provider Codex is given for a model API other than OpenAI's: Responses over HTTP, keyed from OPENAI_API_KEY. */
 const CODEX_PROVIDER = "goal_api";
 
+/** Run-specific settings have system precedence without overwriting the harness's own settings. */
+export function geminiSetupCommand(webSearch: WebSearch): string[] {
+  const settings = { security: { auth: { selectedType: "gemini-api-key" } }, tools: { exclude: webSearch === "off" ? ["google_web_search", "web_fetch"] : [] } };
+  const program = "const fs=require('node:fs');const folder=process.env.HOME+'/.gemini';fs.mkdirSync(folder,{recursive:true});fs.writeFileSync(folder+'/sharednet-settings.json',process.argv[1]);";
+  return ["node", "-e", program, JSON.stringify(settings)];
+}
+
 export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live", turnLimitSeconds = TURN_LIMIT_SECONDS, codexBase: CodexBase | null = null, model: CodexModel = {}, disallowedTools: readonly string[] = []): string[] {
   const limit = ["timeout", String(turnLimitSeconds)];
+  if (seat.driver === "gemini") {
+    if (sessionId !== null && !GEMINI_SESSION.test(sessionId)) throw localError("invalid_local_state", "A Gemini session must be an explicit UUID; latest and numeric session selectors are not accepted.");
+    return [...limit, "gemini", "--approval-mode", "yolo", "--output-format", "stream-json", ...(seat.model ? ["--model", seat.model] : []), ...(sessionId === null ? [] : ["--resume", sessionId]), "--prompt", prompt];
+  }
   if (seat.driver === "codex") {
     // Live web search, which Claude Code has by default: a goal is as often research as code.
     const search = webSearch === "live" ? 'web_search="live"' : 'web_search="disabled"';
@@ -764,10 +783,22 @@ export class TurnReader {
    * `system init`. A harness that is asked to resume a session it cannot find says neither.
    */
   started = false;
+  completed = false;
+  text = "";
+  toolCalls = 0;
   private readonly driver: Driver;
+  private readonly expectedSession: string | null;
+  private readonly pendingTools = new Set<string>();
+  private readonly seenTools = new Set<string>();
 
-  constructor(driver: Driver) {
+  constructor(driver: Driver, expectedSession: string | null = null) {
     this.driver = driver;
+    this.expectedSession = expectedSession;
+  }
+
+  /** A zero exit without a session and final success is not a completed Gemini turn. */
+  finish(): void {
+    if (this.driver === "gemini" && (!this.started || !this.completed)) this.reading.failed = true;
   }
 
   line(text: string): void {
@@ -775,6 +806,41 @@ export class TurnReader {
     try {
       event = JSON.parse(text) as Record<string, unknown>;
     } catch {
+      if (this.driver === "gemini") this.reading.failed = true;
+      return;
+    }
+    if (event === null || typeof event !== "object" || Array.isArray(event)) {
+      if (this.driver === "gemini") this.reading.failed = true;
+      return;
+    }
+    if (this.driver === "gemini") {
+      if (this.completed) { this.reading.failed = true; this.completed = false; return; }
+      if (event.type === "init") {
+        const id = event.session_id;
+        if (this.started || typeof id !== "string" || !GEMINI_SESSION.test(id) || (this.expectedSession !== null && id !== this.expectedSession)) this.reading.failed = true;
+        else { this.started = true; this.reading.sessionId = id; }
+      } else if (event.type === "message") {
+        if (!this.started || (event.role !== "assistant" && event.role !== "user") || typeof event.content !== "string") this.reading.failed = true;
+        else if (event.role === "assistant") this.text += event.content;
+      } else if (event.type === "tool_use") {
+        if (!this.started || typeof event.tool_name !== "string" || !event.tool_name || typeof event.tool_id !== "string" || !event.tool_id || this.seenTools.has(event.tool_id) || event.parameters === null || typeof event.parameters !== "object" || Array.isArray(event.parameters)) this.reading.failed = true;
+        else { this.toolCalls += 1; this.seenTools.add(event.tool_id); this.pendingTools.add(event.tool_id); }
+      } else if (event.type === "tool_result") {
+        if (!this.started || typeof event.tool_id !== "string" || !this.pendingTools.delete(event.tool_id) || (event.status !== "success" && event.status !== "error")) this.reading.failed = true;
+      } else if (event.type === "error") {
+        if (event.severity !== "warning" || typeof event.message !== "string") this.reading.failed = true;
+      } else if (event.type === "result") {
+        const stats = event.stats;
+        if (stats && typeof stats === "object" && !Array.isArray(stats)) {
+          const usage = stats as Record<string, unknown>;
+          const keys = ["input", "cached", "output_tokens"] as const;
+          if (keys.every(key => typeof usage[key] === "number" && Number.isSafeInteger(usage[key]) && usage[key] >= 0)) {
+            this.reading.usage = { input: usage.input as number, cached: usage.cached as number, output: usage.output_tokens as number };
+          }
+        }
+        this.completed = !this.reading.failed && this.started && this.pendingTools.size === 0 && event.status === "success" && event.error === undefined && this.reading.usage !== null;
+        if (!this.completed) this.reading.failed = true;
+      } else this.reading.failed = true;
       return;
     }
     const usage = (event.usage ?? null) as Record<string, unknown> | null;
@@ -1040,6 +1106,23 @@ export async function runGoal(
   };
 
   let ended = false;
+  // Large teams keep their independent homes and waits, while only eight paid harness
+  // processes run at once. The historical <=50-seat scheduling stays unchanged.
+  const maxActiveTurns = plan.agents.length > 50 ? 8 : null;
+  let activeTurns = 0;
+  const pendingTurns: Array<(start: boolean) => void> = [];
+  const cancelPendingTurns = () => { for (const resolve of pendingTurns.splice(0)) resolve(false); };
+  const acquireTurn = (): Promise<boolean> => {
+    if (ended) return Promise.resolve(false);
+    if (activeTurns < (maxActiveTurns ?? plan.agents.length)) { activeTurns += 1; return Promise.resolve(true); }
+    return new Promise(resolve => pendingTurns.push(resolve));
+  };
+  const releaseTurn = () => {
+    activeTurns -= 1;
+    if (ended) { cancelPendingTurns(); return; }
+    const next = pendingTurns.shift();
+    if (next) { activeTurns += 1; next(true); }
+  };
   const records: SeatRecord[] = plan.agents.map((agent) => ({
     ...agent,
     member_id: null,
@@ -1068,6 +1151,7 @@ export async function runGoal(
     const environment = [
       ...(home ? ["-e", `HOME=${home}`] : []),
       ...(home && seat?.driver === "codex" ? ["-e", `CODEX_HOME=${home}/.codex`] : []),
+      ...(seat?.driver === "gemini" ? ["-e", "GEMINI_API_KEY", "-e", "GEMINI_CLI_TRUST_WORKSPACE=true", "-e", `GEMINI_CLI_SYSTEM_SETTINGS_PATH=${home}/.gemini/sharednet-settings.json`] : []),
       "-e",
       `SHAREDNET_BASE_URL=${seatBase}`,
       ...(seat?.member_id ? ["-e", `SHAREDNET_SEAT=${seat.member_id}`] : []),
@@ -1198,7 +1282,9 @@ export async function runGoal(
           startFresh(seat, "home_not_restored");
         }
       }
-      const prepared = seat.driver === "codex" && plan.codexAuth?.kind === "login"
+      const prepared = seat.driver === "gemini"
+        ? await exec(seat, geminiSetupCommand(input.webSearch ?? "live"))
+        : seat.driver === "codex" && plan.codexAuth?.kind === "login"
         ? await docker([
             "exec", "--user", "root", container, "sh", "-c",
             `mkdir -p '${home}/.codex' && cp ${CONTAINER_CODEX_AUTH} '${home}/.codex/auth.json' && chown -R ${user} '${home}' && chmod 600 '${home}/.codex/auth.json'`,
@@ -1211,7 +1297,7 @@ export async function runGoal(
           ]);
       if (prepared.code !== 0) throw localError("container_failed", `${seat.name}'s home could not be made: ${prepared.stderr.trim()}`);
       // The driver's own marker names the seat's runtime on the Web; the invite travels by environment.
-      const marker: Record<string, string> = seat.driver === "codex" ? { CODEX_SESSION_ID: `goal-${seat.name}` } : { CLAUDECODE: "1" };
+      const marker: Record<string, string> = seat.driver === "codex" ? { CODEX_SESSION_ID: `goal-${seat.name}` } : seat.driver === "gemini" ? { GEMINI_CLI: "1" } : { CLAUDECODE: "1" };
       const earlier = earlierMembers.get(seat.name);
       const joined = (earlier === undefined ? null : await takeUp(seat, earlier, marker)) ?? await exec(seat, ["sharednet", "join", input.roomId, "--name", seat.name, "--json"], {
         env: { ...marker, SHAREDNET_INVITE_TOKEN: input.inviteToken },
@@ -1262,7 +1348,7 @@ export async function runGoal(
       await mkdir(directory, { recursive: true });
       const stream = join(directory, `turn-${number}.jsonl`);
       await writeFile(stream, "");
-      const reader = new TurnReader(seat.driver);
+      const reader = new TurnReader(seat.driver, seat.session_id);
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
       const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, codexBase, input.codexModel ?? {}, input.disallowedTools ?? []);
@@ -1275,6 +1361,7 @@ export async function runGoal(
         },
       });
       await writes;
+      reader.finish();
       if (result.stderr.trim()) await writeFile(join(directory, `turn-${number}.stderr.txt`), result.stderr);
       const reading = reader.reading;
       seat.session_id = reading.sessionId ?? seat.session_id;
@@ -1378,15 +1465,20 @@ export async function runGoal(
       let wake: WakeShape | null = null;
       let failedInARow = 0;
       while (!ended) {
+        if (maxActiveTurns !== null && !(await acquireTurn())) return;
+        if (ended) { if (maxActiveTurns !== null) releaseTurn(); return; }
         busy.add(seat.name);
-        const { failed, started } = await runTurn(seat, prompt, wake).finally(() => busy.delete(seat.name));
+        const { failed, started } = await runTurn(seat, prompt, wake).finally(() => {
+          busy.delete(seat.name);
+          if (maxActiveTurns !== null) releaseTurn();
+        });
         if (wake?.wake_id) await exec(seat, ["sharednet", "ack", wake.wake_id, "--json"]);
         failedInARow = failed ? failedInARow + 1 : 0;
         if (taken) {
           // The first turn shows whether the harness took the session up. Codex names the session it runs:
           // any other than the one asked for is a new one, which has not had the opening. A harness that
           // names none refused. Either way the seat starts again, fresh, with the whole opening.
-          const took = started && (seat.driver !== "codex" || seat.session_id === taken.sessionId);
+          const took = started && (seat.driver === "claude-code" || seat.session_id === taken.sessionId);
           taken = null;
           if (!took) {
             startFresh(seat, ended ? "ended_first" : "harness_refused");
@@ -1448,6 +1540,7 @@ export async function runGoal(
       },
     );
     ended = true;
+    cancelPendingTurns();
     // Stopping the containers ends every turn and every wait still running.
     await docker(["stop", "--time", "5", ...containers]);
     await Promise.all(seats);
@@ -1513,6 +1606,7 @@ export async function runGoal(
             compact_at: input.codexModel?.compactAt ?? null,
           } : {}),
           turn_limit_s: turnLimitSeconds,
+          ...(maxActiveTurns === null ? {} : { max_active_turns: maxActiveTurns }),
           turn_policy: turnPolicy,
           mention_gate: input.mentionGate ?? false,
           task_gate: input.taskGate ?? false,
@@ -1559,6 +1653,7 @@ export async function runGoal(
     return { ...watched, agents: records, tokens: spend(), ...(resumeRecord ? { resume: resumeRecord } : {}) };
   } finally {
     ended = true;
+    cancelPendingTurns();
     await docker(["rm", "--force", ...containers]);
     if (isolated) {
       await docker(["rm", "--force", names.gateway]);
@@ -1576,7 +1671,7 @@ async function sessionFileUsage(sessions: string, sessionId: string): Promise<Us
 
 /** A record is made to be handed on: the seat's token and the harness's sign-in leave it. */
 export async function scrubHome(home: string): Promise<void> {
-  for (const secret of [".config/sharednet", ".codex/auth.json", ".claude/.credentials.json"]) {
+  for (const secret of [".config/sharednet", ".codex/auth.json", ".claude/.credentials.json", ".gemini/oauth_creds.json", ".gemini/google_accounts.json", ".gemini/mcp-oauth-tokens.json", ".gemini/a2a-oauth-tokens.json", ".gemini/.env"]) {
     await rm(join(home, secret), { recursive: true, force: true });
   }
 }
