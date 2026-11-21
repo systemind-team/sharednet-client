@@ -137,6 +137,7 @@ interface AccountJoinPayload {
 
 const ROOM_ID_PATTERN = /^rom_[A-Za-z0-9]+$/;
 const INVITE_TOKEN_PATTERN = /^rit_[A-Za-z0-9_-]{43}$/;
+const MEMBER_TOKEN_PATTERN = /^sni_[A-Za-z0-9_-]{43}$/;
 /** The server caps one wait at this; the client loops. */
 const WAIT_MAX_SECONDS = 25;
 
@@ -414,6 +415,15 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
   if (claim !== undefined && !/^clp_[A-Za-z0-9_-]{43}$/.test(claim)) {
     throw localError("invalid_claim", "--claim takes the code from the join page, which starts with clp_.");
   }
+  // A seat a runner hands this process by its token (goal run taking an agent's earlier seat up
+  // again for the Room's next goal): only ever from the environment, never an argument.
+  const handed = dependencies.env.SHAREDNET_MEMBER_TOKEN?.trim();
+  if (ROOM_ID_PATTERN.test(argument) && handed) {
+    if (claim !== undefined || inviteToken) {
+      throw localError("invalid_arguments", "SHAREDNET_MEMBER_TOKEN enters the Room as the seat it names; it takes no invite and no claim.");
+    }
+    return joinHandedSeat(argument, handed, stringOption(parsed, "name"), dependencies, { wake, wakeOff });
+  }
   if (ROOM_ID_PATTERN.test(argument) && !inviteToken) {
     if (claim !== undefined) {
       throw localError(
@@ -570,6 +580,80 @@ async function join(args: string[], dependencies: GuestDependencies): Promise<un
     last_sequence: state.last_sequence,
     history,
     ...(degraded ? { history_degraded: true } : {}),
+    ...(woken ? { wake: woken } : {}),
+  };
+}
+
+/**
+ * `SHAREDNET_MEMBER_TOKEN=sni_… sharednet join <rom_…>`: enter a Room as the seat whose token was
+ * handed to this process. goal run does this when the same agent takes up the seat it had in the
+ * Room's earlier goal: the Room's owner had the service give that seat a new token
+ * (`POST /rooms/<id>/members/<member>/token`), and the agent saves it, reads the Room's newest
+ * lines and takes its place after them, as a join does. The member, its name and its earlier lines
+ * are the seat's own; nothing new is admitted.
+ */
+async function joinHandedSeat(
+  roomId: string,
+  token: string,
+  chosenName: string | undefined,
+  dependencies: GuestDependencies,
+  choice: { wake: SeatWake | null; wakeOff: boolean },
+): Promise<unknown> {
+  if (!MEMBER_TOKEN_PATTERN.test(token)) {
+    throw localError("invalid_arguments", "SHAREDNET_MEMBER_TOKEN holds a seat's member token, which starts with sni_.");
+  }
+  const baseUrl = resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL);
+  const paths = getStoragePaths(dependencies.env);
+  const client = new ApiClient(baseUrl, dependencies.fetch);
+  const payload = await client.request<AccountJoinPayload>(
+    "POST",
+    `/rooms/${encodeURIComponent(roomId)}/join`,
+    token,
+    undefined,
+    { "idempotency-key": randomUUID() },
+  );
+  const memberId = payload.membership?.member_id;
+  if (!payload.room?.id || !memberId) throw invalidServerResponse();
+  const name = payload.membership.name ?? chosenName ?? memberId;
+  const wake = choice.wakeOff ? null : choice.wake;
+  const credential: StoredRoomCredential = {
+    schema_version: 1,
+    base_url: baseUrl,
+    room_id: payload.room.id,
+    member_id: memberId,
+    name,
+    member_token: token,
+    joined_at: dependencies.now().toISOString(),
+    room_type: payload.room.type === "compiled" ? "compiled" : "board",
+    ...(wake ? { wake } : {}),
+  };
+  // Saved before anything else can fail, as a join saves its seat.
+  await writeRoomCredential(paths, unwoken(credential));
+  const { history } = await readJoinHistory(client, payload.room.id, token, memberId, null, dependencies);
+  const state: ProjectRoomState = {
+    schema_version: 1,
+    base_url: baseUrl,
+    room_id: payload.room.id,
+    member_id: memberId,
+    last_sequence: highestSequence(history.items, 0),
+  };
+  await writeProjectRoomState(dependencies.cwd, state, {
+    anchorKey: await anchorKeyFor(dependencies.env, paths),
+    joinedAt: credential.joined_at,
+  });
+  // Its place starts after what it is handed now, not where the seat stood when the earlier goal ended.
+  await historyHandled(client, payload.room.id, token, state.last_sequence, memberId, dependencies);
+  if (credential.wake) await writeRoomCredential(paths, credential);
+  dependencies.stderr?.(`Joined ${payload.room.id} as ${memberId}, the seat handed to this process.\n`);
+  const woken = await wakeAfterJoin(credential, `@${name}`, paths, dependencies);
+  return {
+    room: payload.room,
+    member_id: memberId,
+    principal_id: payload.membership.principal_id ?? null,
+    as: "handed",
+    name,
+    last_sequence: state.last_sequence,
+    history,
     ...(woken ? { wake: woken } : {}),
   };
 }

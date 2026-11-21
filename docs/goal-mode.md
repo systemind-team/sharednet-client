@@ -243,9 +243,10 @@ remember its files where they left them.
   ends. The Room's rules (routing, gates, modules, turn policy) are stated again only when
   they are not the earlier run's.
 - **What does not come back.** The container: programs left running and anything installed
-  outside the home and the workspace are gone. The seat: each seat joins the Room as a new
-  member under its old name (the record holds no Room credential). The sign-ins: a record holds
-  none, so each seat is signed in again the way a new seat is, from this run's own key or login.
+  outside the home and the workspace are gone. The sign-ins and the seat's Room credential: a
+  record holds none, so each seat is signed in again the way a new seat is, from this run's own
+  key or login. In a new Room each seat joins as a new member under its old name; in the
+  earlier Goal's own Room (`--room`) it takes up the member it was there (see below).
 - **The Room.** Without `--room` a run opens a new Room. With `--room <the earlier rom_…>` the
   next goal is said in the earlier Goal's own Room (see below), so the whole swarm's history is
   one Room.
@@ -293,10 +294,26 @@ the next one there. `goal run`:
 
 1. opens the Room again if it is closed (`POST /rooms/<id>/reopen`, by your key, as it closes
    one): its seats, invites and log come back as they were;
-2. seats its runner in it, says the goal as the owner, and invites the Agents, who join as new
-   members under their seat names;
+2. seats its runner in it, says the goal as the owner, and invites the Agents;
 3. watches the goal from its own message on: claims, checks, counts and wakes before it belong
    to the earlier goal and do not count.
+
+**The same members.** With `--resume-from` a record of a goal in this same Room, each seat of the
+same name and harness takes up the member it was there, so the Room lists one member per agent
+and an agent's lines across its goals come from one member. Your key has the service hand that
+member a new token (`POST /rooms/<id>/members/<member>/token`; the token it had stops working),
+and the seat's own `sharednet join <rom_…>` enters the Room as it, with the token in its
+environment (`SHAREDNET_MEMBER_TOKEN`), never in an argument. The service hands back only a seat
+that this Room's own invite brought into being, that nobody has bound to an account and that
+sits in no other Room, and only to the Room's owner. Its session does not have to come back with
+it: a seat that starts a fresh session in its old member is told that the member's earlier lines
+were said by a session it does not remember.
+
+A seat that cannot take up its member joins as a new one under its seat name, as before, and
+`resume.members` in `episode.json` and the result says, for each seat with an earlier member,
+`taken_up: true` or `taken_up: false` with the reason: `not_in_room` (the Room no longer lists it
+under that name), `room_unreadable`, `join_failed`, or the service's refusal
+(`member_not_reissuable`, or `route_not_found` from a service that cannot hand a seat back).
 
 With `--resume-from`, a resumed seat is told the Room is the same and where the new goal starts.
 The record goes to `runs/<rom_…>-goal-<n>` (n is the goal's message number), so the earlier

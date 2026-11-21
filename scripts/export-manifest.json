@@ -116,7 +116,8 @@
       "changes": [
         "Updated byte for byte to SharedNet 3d66c5ebdd3d (#183\u2013#191: the seat's place as two marks, hooks, timers, mentions, the doorbell, and the wake drivers); that source's sha256 is a143227d6f7e0ff9c81c6639330cd600e94cec4e8d626fa4a40d769336c07e7b.",
         "Port hosted runtime declarations and Muse detection from SharedNet #163; real handler coverage remains in the service repository.",
-        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary."
+        "Port compiled Room commands, per-seat obligations and canonical state export from SharedNet a145d587528d32bf0b658b3a3a4617990f5ae137; retain public package metadata and private real-handler test boundary.",
+        "`SHAREDNET_MEMBER_TOKEN=sni_\u2026 sharednet join <rom_\u2026>` enters a Room as the seat a runner hands over (goal run taking an agent's earlier member up again); added here first, not yet in the service repository's copy of the CLI"
       ]
     },
     "packages/cli/src/instance-computation.ts": {
@@ -274,7 +275,8 @@
         "Ported for `sharednet local` from the private service repository; licensed MIT here with the rest of this repository.",
         "protocol imports point at ../protocol/ inside the CLI package",
         "The default store no longer builds the Postgres runtime repository (not ported): without a store passed in, the handler answers 503 service_unavailable, as the service does without a database.",
-        "goal Rooms take their next goal: `POST /api/v1/rooms/<id>/reopen` by the owner's key, and a goal may follow one that has ended (also proposed to the service)"
+        "goal Rooms take their next goal: `POST /api/v1/rooms/<id>/reopen` by the owner's key, and a goal may follow one that has ended (also proposed to the service)",
+        "a goal Room's owner takes a seat up again for the Room's next goal: `POST /api/v1/rooms/<id>/members/<member>/token` by the owner's key, for a seat that Room's own invite made and nobody has bound (also proposed to the service)"
       ]
     },
     "packages/cli/src/server/memory-repository.ts": {
@@ -284,7 +286,8 @@
       "changes": [
         "Ported for `sharednet local` from the private service repository; licensed MIT here with the rest of this repository.",
         "protocol imports point at ../protocol/ inside the CLI package",
-        "goal Rooms take their next goal: `POST /api/v1/rooms/<id>/reopen` by the owner's key, and a goal may follow one that has ended (also proposed to the service)"
+        "goal Rooms take their next goal: `POST /api/v1/rooms/<id>/reopen` by the owner's key, and a goal may follow one that has ended (also proposed to the service)",
+        "a goal Room's owner takes a seat up again for the Room's next goal: `POST /api/v1/rooms/<id>/members/<member>/token` by the owner's key, for a seat that Room's own invite made and nobody has bound (also proposed to the service)"
       ]
     },
     "packages/cli/src/server/repository.ts": {
@@ -293,7 +296,8 @@
       "sourceSha256": "cb8d88f006ce5478dc39748d16e364d698b8bab698260dbd0d20942f8f4993c8",
       "changes": [
         "Ported for `sharednet local` from the private service repository; licensed MIT here with the rest of this repository.",
-        "protocol imports point at ../protocol/ inside the CLI package"
+        "protocol imports point at ../protocol/ inside the CLI package",
+        "a goal Room's owner takes a seat up again for the Room's next goal: `POST /api/v1/rooms/<id>/members/<member>/token` by the owner's key, for a seat that Room's own invite made and nobody has bound (also proposed to the service)"
       ]
     },
     "packages/cli/src/server/compiled.ts": {
@@ -442,7 +446,8 @@
         "protocol imports point at ../protocol/ inside the CLI package",
         "relative imports carry the .ts extension",
         "ids copied from real Rooms and accounts are replaced by synthetic ids of the same shape",
-        "goal Rooms take their next goal: `POST /api/v1/rooms/<id>/reopen` by the owner's key, and a goal may follow one that has ended (also proposed to the service)"
+        "goal Rooms take their next goal: `POST /api/v1/rooms/<id>/reopen` by the owner's key, and a goal may follow one that has ended (also proposed to the service)",
+        "a goal Room's owner takes a seat up again for the Room's next goal: `POST /api/v1/rooms/<id>/members/<member>/token` by the owner's key, for a seat that Room's own invite made and nobody has bound (also proposed to the service)"
       ]
     },
     "packages/cli/src/server/instance-directory.test.ts": {
@@ -505,7 +510,8 @@
       "sourceCommit": "590890a559f7212a67e130ebbe87fbcc19edd555",
       "sourceSha256": "c95c9012f075262e84d52b3a8cde7bd855923c9bbdbd48b10ae8e884e4db9e91",
       "changes": [
-        "Ported for `sharednet local` from the private service repository; licensed MIT here with the rest of this repository."
+        "Ported for `sharednet local` from the private service repository; licensed MIT here with the rest of this repository.",
+        "a goal Room's owner takes a seat up again for the Room's next goal: `POST /api/v1/rooms/<id>/members/<member>/token` by the owner's key, for a seat that Room's own invite made and nobody has bound (also proposed to the service)"
       ]
     },
     "packages/cli/src/protocol/envelope.ts": {

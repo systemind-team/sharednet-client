@@ -13,11 +13,15 @@ import type { AgentSpec, Driver, Usage } from "./goal-run.ts";
  * the same name and harness gets its home back, and its first turn resumes its own session with
  * the new goal, where a fresh seat would start a session with the whole opening.
  *
- * What comes back is the seat's home and the workspace. Its container is new, so are its seat in
- * the Room and the Room itself, and the record strips every sign-in from a home, so each is put
- * back the way a new seat gets one. A seat that cannot be taken up (new to the team, another
- * harness, no session kept, a harness that refuses the session) starts fresh, and the run's
- * record says which seats were resumed and why the others were not.
+ * What comes back is the seat's home and the workspace. Its container is new, and the record strips
+ * every sign-in from a home, so each is put back the way a new seat gets one. A seat that cannot be
+ * taken up (new to the team, another harness, no session kept, a harness that refuses the session)
+ * starts fresh, and the run's record says which seats were resumed and why the others were not.
+ *
+ * In a new Room each seat joins as a new member. When the next goal is said in the earlier run's
+ * own Room (`--room`), a seat of the same name and harness takes up the member it was there, so the
+ * Room keeps one member per agent and an agent's lines across its goals come from one member
+ * (`planMembers`); one that cannot joins as a new member, and the record says why.
  */
 
 /** Why a seat of a resumed run started a fresh session instead. */
@@ -43,6 +47,8 @@ interface EarlierSeat {
   name: string;
   driver: Driver;
   sessionId: string | null;
+  /** The member it was in the earlier run's Room, as that run's record names it. */
+  memberId: string | null;
   /** What the earlier run counted for the seat, and what that run itself had left out as earlier still. */
   usage: Usage;
   baseline: Usage;
@@ -78,6 +84,7 @@ export interface ResumePlan {
 
 const ZERO: Usage = { input: 0, cached: 0, output: 0 };
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const MEMBER_ID = /^i_[A-Za-z0-9]{6,40}$/;
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const count = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0);
@@ -128,6 +135,7 @@ export async function readResumeSource(directory: string): Promise<ResumeSource>
       name: agent.name,
       driver: agent.driver,
       sessionId: typeof agent.session_id === "string" && SESSION_ID.test(agent.session_id) ? agent.session_id : null,
+      memberId: typeof agent.member_id === "string" && MEMBER_ID.test(agent.member_id) ? agent.member_id : null,
       usage: usageOf(agent.usage),
       baseline: record(before) ? usageOf(before.baseline) : { ...ZERO },
     }];
@@ -179,6 +187,30 @@ export async function planResume(source: ResumeSource, agents: readonly AgentSpe
   return plan;
 }
 
+/**
+ * What a run in the earlier run's own Room did with each seat's earlier member: took it up, or
+ * joined as a new member and why (`not_in_room`: the Room no longer lists it under the seat's name;
+ * `room_unreadable`; `join_failed`; otherwise the service's refusal, such as `member_not_reissuable`,
+ * or `route_not_found` from a service that cannot hand a seat back).
+ */
+export type MemberTakeUp = { taken_up: true; member_id: string } | { taken_up: false; member_id: string; reason: string };
+
+/**
+ * The earlier member each seat of this run takes up, by seat name: only when this run's Room is the
+ * earlier run's, and only for a seat of the same name and harness that the record names a member
+ * for. Its session does not have to come back with it: the seat is the same agent of the swarm, and
+ * the Room shows it as one member either way.
+ */
+export function planMembers(source: ResumeSource, agents: readonly AgentSpec[], roomId: string): Map<string, string> {
+  const members = new Map<string, string>();
+  if (source.roomId === null || source.roomId !== roomId) return members;
+  for (const agent of agents) {
+    const earlier = source.seats.find((seat) => seat.name === agent.name);
+    if (earlier && earlier.driver === agent.driver && earlier.memberId !== null) members.set(agent.name, earlier.memberId);
+  }
+  return members;
+}
+
 /** Where goal run writes what was said in the earlier Room, inside the workspace. */
 export function earlierRoomFile(roomId: string | null): string {
   return `earlier-rooms/${roomId ?? "earlier-room"}.md`;
@@ -227,6 +259,8 @@ export function resumePrompt(input: {
   today: string;
   /** The Room's rules as an opening states them, when they are not the earlier run's; null when they are the same. */
   rules: readonly string[] | null;
+  /** In the same Room: the seat took up the member it was there, so it speaks from the same seat. */
+  sameSeat?: boolean;
 }): string {
   const others = input.seats.filter((name) => name !== input.seat);
   const same = others.filter((name) => input.resumed.has(name));
@@ -248,7 +282,7 @@ export function resumePrompt(input: {
     "",
     "What is different now:",
     input.earlierRoomId === input.roomId
-      ? `- The Room is the same, ${input.roomId}: the earlier goal has ended and this is its next one, at message #${input.goalSequence}. Everything before #${input.goalSequence} belongs to the earlier Goal. You speak in it from a new seat under the same name; the seat you spoke from before is no longer used.`
+      ? `- The Room is the same, ${input.roomId}: the earlier goal has ended and this is its next one, at message #${input.goalSequence}. Everything before #${input.goalSequence} belongs to the earlier Goal. ${input.sameSeat ? "You speak in it from the same seat as before: your earlier lines and this Goal's are one member's." : "You speak in it from a new seat under the same name; the seat you spoke from before is no longer used."}`
       : `- The Room is new: ${input.roomId}. ${input.earlierRoomId ? `The earlier Room, ${input.earlierRoomId},` : "The earlier Room"} has ended and nothing more is said there. \`sharednet\` now reads and speaks in the new Room, whose messages are numbered from #1 again.`,
     ...(input.earlierRooms ? [`- What was said earlier is in ${input.earlierRooms} in ${input.workspace}, oldest first. You were there; search the file when you need an exact line instead of reading it whole.`] : []),
     `- Today is ${input.today} (UTC).`,
@@ -266,7 +300,7 @@ export function resumePrompt(input: {
  * What a seat that starts fresh in a resumed run is told after its opening: that the swarm has
  * worked before, who remembers it, and where what was said then can be read.
  */
-export function newcomerNote(input: { seat: string; seats: readonly string[]; resumed: ReadonlySet<string>; earlierRoomId: string | null; earlierRooms: string | null; workspace: string; roomId?: string; goalSequence?: number }): string {
+export function newcomerNote(input: { seat: string; seats: readonly string[]; resumed: ReadonlySet<string>; earlierRoomId: string | null; earlierRooms: string | null; workspace: string; roomId?: string; goalSequence?: number; sameSeat?: boolean }): string {
   const same = input.seats.filter((name) => name !== input.seat && input.resumed.has(name));
   // In the same Room the earlier Goal is the part of this Room before the new goal's message.
   const room = input.earlierRoomId !== null && input.earlierRoomId === input.roomId
@@ -276,6 +310,8 @@ export function newcomerNote(input: { seat: string; seats: readonly string[]; re
     same.length > 0
       ? `This swarm has worked before, on an earlier Goal in ${room}. ${list(same)} ${same.length === 1 ? "is the same session that" : "are the same sessions that"} worked on it, resumed with what ${same.length === 1 ? "it remembers" : "they remember"}; you are a new session and start without that memory.`
       : `This swarm has worked before, on an earlier Goal in ${room}. None of its sessions is here: every agent of this Goal is a new session.`,
+    // A new session in the seat the earlier one had: that seat's earlier lines are not its memory.
+    ...(input.sameSeat ? [`You speak from the seat ${input.seat} had in the earlier Goal: its lines before #${input.goalSequence ?? 1} were said from it by a session you do not remember.`] : []),
     ...(input.earlierRooms ? [`What was said then is in ${input.earlierRooms} in ${input.workspace}, oldest first.`] : []),
   ].join(" ");
 }

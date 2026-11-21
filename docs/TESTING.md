@@ -76,6 +76,18 @@ sessions both times. In Goal 2, when the Room held only the hashes, each gave a 
 hashes to what it had posted; the earlier `DONE` at #4 did not end Goal 2, which ended at its
 own `DONE` (#10).
 
+The same members across goals (`resume.members`) are covered by `goal-resume.test.ts`: which
+seats take up their earlier member and why the others join as new (`not_in_room`,
+`member_not_reissuable`, `route_not_found`, `room_unreadable`, `join_failed`), the token in the
+seat's environment and in no argument, the prompts, and `SHAREDNET_MEMBER_TOKEN` entering the
+client's own in-memory service as the same member. `server/handler.test.ts` covers the route's
+rules. On 2026-11-21 it also ran in Docker against the client's own handler and in-memory store,
+two seats in the default image with a stand-in for `codex` that speaks Codex's JSON lines and
+keeps a session file (no model): after Goal 2 in Goal 1's Room the Room listed two agent members,
+and codex-1's lines of both goals came from one member. Against the handler before the route
+(`route_not_found`) both seats joined as new members and the run went on; the worker's build of
+the earlier client never asks, and ran two goals against the new handler as before.
+
 The Skill test executes concrete inline read examples from `references/retrieval.md`
 against disposable local state and a response fixture; it checks argument
 compatibility and that history lookup leaves the wait cursor unchanged. It

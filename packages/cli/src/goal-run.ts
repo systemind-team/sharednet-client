@@ -15,7 +15,7 @@ import { dirname, join, relative } from "node:path";
 import type { ApiClient } from "./api-client.ts";
 import { CliError, localError } from "./errors.ts";
 import { goalWatch, type GoalWatchResult } from "./goal.ts";
-import { earlierRoomFile, earlierRoomMarkdown, newcomerNote, planResume, resumePrompt, roomControls, usageSince, type FreshReason, type ResumeSource } from "./goal-resume.ts";
+import { earlierRoomFile, earlierRoomMarkdown, newcomerNote, planMembers, planResume, resumePrompt, roomControls, usageSince, type FreshReason, type MemberTakeUp, type ResumeSource } from "./goal-resume.ts";
 import { assertGoalRunHarnessAgentCount, type GoalRunHarnessResolution } from "./harness-modes.ts";
 import { mentions } from "./triggers.ts";
 
@@ -876,6 +876,11 @@ export interface ResumeRecord {
   /** The file in the workspace that holds what was said earlier. */
   earlier_rooms: string | null;
   seats: Record<string, { resumed: true; session_id: string; baseline: Usage; prompt_sha256: string } | { resumed: false; reason: FreshReason }>;
+  /**
+   * Only for a run in the earlier run's own Room (`--room`): for each seat the record names a member
+   * for, whether it took that member up or joined as a new one, and why.
+   */
+  members?: Record<string, MemberTakeUp>;
 }
 
 /** Creates nothing outside its containers and the record; the Room and its goal already exist. */
@@ -956,6 +961,16 @@ export async function runGoal(
       log(`goal: what was said in the earlier Room could not be written to ${file}; the resumed seats still have their own memory of it\n`);
     }
   }
+  // In the earlier run's own Room, each seat of the same name and harness takes up the member it was
+  // there, so the Room keeps one member per agent. Without `--room` this is empty and nothing changes.
+  const earlierMembers = input.resume ? planMembers(input.resume.source, plan.agents, input.roomId) : new Map<string, string>();
+  if (resumeRecord && input.resume?.source.roomId === input.roomId) resumeRecord.members = {};
+  /** A seat that was to take up its earlier member joins as a new one after all; the record says why. */
+  const joinsNew = (name: string, memberId: string, reason: string) => {
+    earlierMembers.delete(name);
+    if (resumeRecord?.members) resumeRecord.members[name] = { taken_up: false, member_id: memberId, reason };
+    log(`goal: ${name} joins as a new member; its earlier member ${memberId} was not taken up (${reason})\n`);
+  };
   /** A seat that was to be taken up again starts fresh after all; the record says why. */
   const startFresh = (seat: SeatRecord, reason: FreshReason) => {
     resume?.seats.delete(seat.name);
@@ -1090,6 +1105,54 @@ export async function runGoal(
     // The Agents' `sharednet` is this CLI, so they speak the version that started them.
     const entry = `${CONTAINER_CLI}/${plan.cli.entry}`;
     const wrapper = `#!/bin/sh\nexec node ${entry.endsWith(".ts") ? "--experimental-strip-types --no-warnings " : ""}${entry} "$@"\n`;
+    const memberOf = (result: DockerResult) => {
+      try {
+        return (JSON.parse(result.stdout) as { member_id?: string }).member_id ?? null;
+      } catch {
+        return null;
+      }
+    };
+    // The earlier members as the Room lists them now: a seat takes up only its own, under its own name.
+    if (earlierMembers.size > 0) {
+      const listed = await client
+        .request<{ memberships?: Array<{ member_id?: string; name?: string | null; state?: string }> }>("GET", `/rooms/${encodeURIComponent(input.roomId)}`, memberToken)
+        .then((view) => view?.memberships ?? [], () => null);
+      for (const [name, memberId] of [...earlierMembers]) {
+        if (listed?.some((member) => member.member_id === memberId && member.name === name && (member.state ?? "active") === "active")) continue;
+        joinsNew(name, memberId, listed === null ? "room_unreadable" : "not_in_room");
+      }
+    }
+    /**
+     * The seat's earlier member, taken up: the owner's key has the service hand that member a new
+     * token (the old one stops working), and the seat's own CLI enters the Room as it, the token
+     * passed by environment as an invite is. Null when that cannot be done: the seat then joins as new.
+     */
+    const takeUp = async (seat: SeatRecord, memberId: string, marker: Record<string, string>): Promise<DockerResult | null> => {
+      let token: string | null = null;
+      let reason = "invalid_server_response";
+      try {
+        const handed = await client.request<{ membership?: { member_id?: string }; member_token?: string }>(
+          "POST",
+          `/rooms/${encodeURIComponent(input.roomId)}/members/${encodeURIComponent(memberId)}/token`,
+          apiKey,
+        );
+        if (handed?.membership?.member_id === memberId && typeof handed.member_token === "string") token = handed.member_token;
+      } catch (error) {
+        // An older service has no such route (`route_not_found`); a seat that is not the run's own is `member_not_reissuable`.
+        reason = error instanceof CliError ? error.code : "error";
+      }
+      if (token !== null) {
+        const entered = await exec(seat, ["sharednet", "join", input.roomId, "--name", seat.name, "--json"], { env: { ...marker, SHAREDNET_MEMBER_TOKEN: token } });
+        if (entered.code === 0 && memberOf(entered) === memberId) {
+          if (resumeRecord?.members) resumeRecord.members[seat.name] = { taken_up: true, member_id: memberId };
+          log(`goal: ${seat.name} takes up its earlier member ${memberId}\n`);
+          return entered;
+        }
+        reason = "join_failed";
+      }
+      joinsNew(seat.name, memberId, reason);
+      return null;
+    };
 
     // Every seat: its own container, its own home, its own sign-in, its own seat in the Room.
     for (const seat of records) {
@@ -1149,16 +1212,11 @@ export async function runGoal(
       if (prepared.code !== 0) throw localError("container_failed", `${seat.name}'s home could not be made: ${prepared.stderr.trim()}`);
       // The driver's own marker names the seat's runtime on the Web; the invite travels by environment.
       const marker: Record<string, string> = seat.driver === "codex" ? { CODEX_SESSION_ID: `goal-${seat.name}` } : { CLAUDECODE: "1" };
-      const joined = await exec(seat, ["sharednet", "join", input.roomId, "--name", seat.name, "--json"], {
+      const earlier = earlierMembers.get(seat.name);
+      const joined = (earlier === undefined ? null : await takeUp(seat, earlier, marker)) ?? await exec(seat, ["sharednet", "join", input.roomId, "--name", seat.name, "--json"], {
         env: { ...marker, SHAREDNET_INVITE_TOKEN: input.inviteToken },
       });
-      const memberId = (() => {
-        try {
-          return (JSON.parse(joined.stdout) as { member_id?: string }).member_id ?? null;
-        } catch {
-          return null;
-        }
-      })();
+      const memberId = memberOf(joined);
       if (joined.code !== 0 || !memberId) throw localError("join_failed", `${seat.name} could not join the Room: ${(joined.stdout + joined.stderr).trim().slice(0, 400)}`);
       seat.member_id = memberId;
       if (input.taskGate) {
@@ -1299,13 +1357,16 @@ export async function runGoal(
       if (input.resume && resume && resumeRecord) {
         const names = records.map((record) => record.name);
         const earlier = { earlierRoomId: input.resume.source.roomId, earlierRooms: resumeRecord.earlier_rooms, workspace: CONTAINER_WORKSPACE };
-        const opening = `${prompt}\n\n${newcomerNote({ seat: seat.name, seats: names, resumed: new Set(resume.seats.keys()), ...earlier, roomId: input.roomId, goalSequence: input.goalSequence })}`;
+        // In the same Room, a seat that took up its earlier member speaks from the seat it had.
+        const sameSeat = resumeRecord.members?.[seat.name]?.taken_up === true ? { sameSeat: true } : {};
+        const opening = `${prompt}\n\n${newcomerNote({ seat: seat.name, seats: names, resumed: new Set(resume.seats.keys()), ...earlier, roomId: input.roomId, goalSequence: input.goalSequence, ...sameSeat })}`;
         if (taken) {
           const controls = roomControls({ mentionGate, taskGate, messageRouting, turnPolicy, modules: describeModules(modules), seats: names });
           const again = resumePrompt({
             seat: seat.name, seats: names, resumed: new Set(resume.seats.keys()), roomId: input.roomId, ...earlier,
             goal: input.goal, goalSequence: input.goalSequence, until: input.until, today: dependencies.now().toISOString().slice(0, 10),
             rules: controls === input.resume.source.controls ? null : roomRules({ seat, seats: records, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules }),
+            ...sameSeat,
           });
           seat.session_id = taken.sessionId;
           resumeRecord.seats[seat.name] = { resumed: true, session_id: taken.sessionId, baseline: taken.baseline, prompt_sha256: sha256(again) };
