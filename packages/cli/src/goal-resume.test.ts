@@ -6,9 +6,9 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { ApiClient } from "./api-client.ts";
+import { ApiClient } from "./api-client.ts";
 import { earlierRoomMarkdown, newcomerNote, planResume, readResumeSource, resumePrompt, roomControls, usageSince } from "./goal-resume.ts";
-import { runCli } from "./cli.ts";
+import { runCli, sayNextGoal } from "./cli.ts";
 import { DEFAULT_IMAGE, TurnReader, codexSessionUsage, containerName, openingPrompt, parseAgents, runGoal, type DockerRunner, type GoalRunInput, type GoalRunResult } from "./goal-run.ts";
 
 const ROOM = "rom_NewRoom002";
@@ -218,6 +218,17 @@ describe("what a resumed swarm is told", () => {
     expect(prompt).toContain(`- The Room is new: ${ROOM}. The earlier Room has ended`);
     expect(prompt).not.toContain("What was said earlier");
     expect(prompt).not.toContain("only when you believe");
+  });
+
+  it("says the Room is the same when the next goal is said in the earlier Goal's own Room", () => {
+    const prompt = resumePrompt({ ...base, roomId: EARLIER_ROOM, goalSequence: 41 });
+    expect(prompt).toContain(`- The Room is the same, ${EARLIER_ROOM}: the earlier goal has ended and this is its next one, at message #41. Everything before #41 belongs to the earlier Goal.`);
+    expect(prompt).toContain("You speak in it from a new seat under the same name");
+    expect(prompt).toContain("The new goal (message #41):");
+    expect(prompt).not.toContain("The Room is new");
+    expect(prompt).not.toContain("numbered from #1 again");
+    const note = newcomerNote({ seat: "codex-2", seats: base.seats, resumed: base.resumed, earlierRoomId: EARLIER_ROOM, earlierRooms: null, workspace: "/workspace", roomId: EARLIER_ROOM, goalSequence: 41 });
+    expect(note).toBe("This swarm has worked before, on an earlier Goal in this Room (the messages before #41). codex-1 and claude-code-1 are the same sessions that worked on it, resumed with what they remember; you are a new session and start without that memory.");
   });
 
   it("tells a seat that starts fresh in a resumed swarm who remembers and where the earlier Room is", () => {
@@ -488,5 +499,64 @@ describe("goal run --resume-from on the command line", () => {
       expect(outside.stderr).toContain("is not a file in the workspace");
     }
     for (const result of [notARecord, alone, frozen, compiled]) expect(result.requests).toBe(0);
+  });
+
+  it("refuses, before anything is sent, a --room that is not a Room id or does not go with the other options", async () => {
+    const notAnId = await refused([...run, "--room", "my-room"], { "TASK.md": "Do it." });
+    expect(notAnId.stderr).toContain("--room names a Room of yours by its id");
+    const compiled = await refused([...run, "--type", "compiled", "--room", EARLIER_ROOM], { "TASK.md": "Do it." });
+    expect(compiled.stderr).toContain("--room is for plain board Rooms");
+    const named = await refused([...run, "--name", "Another", "--room", EARLIER_ROOM], { "TASK.md": "Do it." });
+    expect(named.stderr).toContain("--name names a new Room");
+    const frozen = await refused(["goal", "run", "TASK.md", "--agent", "codex:gpt-test", "--until", "after: 1h", "--harness-mode", "research/baseline@1", "--room", EARLIER_ROOM], { "TASK.md": "Do it." });
+    expect(frozen.stderr).toContain("--resume-from is not part of one");
+    const episode = JSON.stringify({ room_id: EARLIER_ROOM, agents: [] });
+    const overwrite = await refused([...run, "--resume-from", "runs/earlier", "--out", "runs/earlier"], { "TASK.md": "Do it.", "runs/earlier/episode.json": episode });
+    expect(overwrite.stderr).toContain("cannot be the record --resume-from reads");
+    for (const result of [notAnId, compiled, named, frozen, overwrite]) expect(result.requests).toBe(0);
+  });
+});
+
+describe("the next goal of a Room that exists (goal run --room)", () => {
+  /** A service that answers the three calls, or refuses the one named. */
+  function service(refuse: { path?: string; code?: string; room?: Record<string, unknown> } = {}) {
+    const calls: Array<{ method: string; path: string; token: string; body: unknown }> = [];
+    const fetch = (async (url: string | URL, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname.replace(/^\/api\/v1/, "");
+      calls.push({ method: init?.method ?? "GET", path, token: String(new Headers(init?.headers).get("authorization")).replace(/^Bearer /, ""), body: init?.body ? JSON.parse(String(init.body)) : null });
+      if (refuse.path && path.endsWith(refuse.path)) return new Response(JSON.stringify({ error: { code: refuse.code ?? "room_not_found", message: "Room was not found." } }), { status: refuse.code === "goal_already_set" ? 409 : 404, headers: { "content-type": "application/json" } });
+      const body = path.endsWith("/reopen") ? { room: { id: EARLIER_ROOM, type: "board", state: "open", ...refuse.room } }
+        : path.endsWith("/join") ? { room: { id: EARLIER_ROOM }, membership: { member_id: "i_runner0001" } }
+        : { room: { id: EARLIER_ROOM }, message: { id: "msg_next000001", sequence: 41 } };
+      return new Response(JSON.stringify(body), { status: path.endsWith("/goal") ? 201 : 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof globalThis.fetch;
+    return { calls, client: new ApiClient("http://127.0.0.1:3001", fetch) };
+  }
+
+  it("opens the Room again by the owner's key, seats the runner in it, and says the goal there", async () => {
+    const { calls, client } = service();
+    const started = await sayNextGoal(client, "snk_owner", "sni_runner", EARLIER_ROOM, "Say the word.", ["after 10m"]);
+    expect(started.message).toMatchObject({ sequence: 41 });
+    expect(calls.map((call) => `${call.method} ${call.path} ${call.token}`)).toEqual([
+      `POST /rooms/${EARLIER_ROOM}/reopen snk_owner`,
+      `POST /rooms/${EARLIER_ROOM}/join sni_runner`,
+      `POST /rooms/${EARLIER_ROOM}/goal snk_owner`,
+    ]);
+    expect(calls[2]!.body).toEqual({ content: "Say the word.", until: ["after 10m"] });
+  });
+
+  it("says room_not_reusable for any refusal on the way, before an Agent starts", async () => {
+    for (const [refuse, said] of [
+      [{ path: "/reopen", code: "room_not_found" }, null],
+      [{ path: "/goal", code: "goal_already_set" }, null],
+      [{ room: { type: "compiled" } }, "it is not a plain board Room."],
+      [{ room: { kind: "direct" } }, "it is not a plain board Room."],
+    ] as const) {
+      const { client } = service(refuse);
+      const error = await sayNextGoal(client, "snk_owner", "sni_runner", EARLIER_ROOM, "Go.", ["after 10m"]).then(() => null, (caught: unknown) => caught as { code: string; message: string });
+      expect(error?.code).toBe("room_not_reusable");
+      // The service's refusal in the CLI's words, or what the CLI found itself.
+      expect(error?.message).toMatch(said === null ? new RegExp(`^${EARLIER_ROOM} cannot take this Goal: .+`) : new RegExp(`^${EARLIER_ROOM} cannot take this Goal: ${said.replace(".", "\\.")}$`));
+    }
   });
 });

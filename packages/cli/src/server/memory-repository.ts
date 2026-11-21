@@ -729,7 +729,8 @@ export class MemorySharedNetRepository implements SharedNetRepository {
   async startGoal(principalId: PrincipalId, roomId: RoomId, input: StartGoalRequest): Promise<{ room: Room; message: Message }> {
     const room = this.ownedRoom(principalId, roomId);
     if (room.state === "closed") throw new RepositoryError(409, "room_closed", "Room is closed.");
-    if (room.goal !== null) throw new RepositoryError(409, "goal_already_set", "This Room already has a goal.");
+    // One goal at a time: a goal that has ended may be followed by the next, said in the same Room.
+    if (room.goal !== null && room.goal.ended_by === null) throw new RepositoryError(409, "goal_already_set", "This Room already has a goal.");
     const authUserId = this.requireAccount(principalId);
     const { message } = await this.ownerLine(authUserId, room, input.content, "owner", this.principals.get(principalId)?.display_name ?? null);
     room.goal = { message_id: message.id, sequence: message.sequence, until: [...input.until], started_at: message.created_at, ended_by: null };

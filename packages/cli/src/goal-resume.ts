@@ -247,7 +247,9 @@ export function resumePrompt(input: {
     "</goal>",
     "",
     "What is different now:",
-    `- The Room is new: ${input.roomId}. ${input.earlierRoomId ? `The earlier Room, ${input.earlierRoomId},` : "The earlier Room"} has ended and nothing more is said there. \`sharednet\` now reads and speaks in the new Room, whose messages are numbered from #1 again.`,
+    input.earlierRoomId === input.roomId
+      ? `- The Room is the same, ${input.roomId}: the earlier goal has ended and this is its next one, at message #${input.goalSequence}. Everything before #${input.goalSequence} belongs to the earlier Goal. You speak in it from a new seat under the same name; the seat you spoke from before is no longer used.`
+      : `- The Room is new: ${input.roomId}. ${input.earlierRoomId ? `The earlier Room, ${input.earlierRoomId},` : "The earlier Room"} has ended and nothing more is said there. \`sharednet\` now reads and speaks in the new Room, whose messages are numbered from #1 again.`,
     ...(input.earlierRooms ? [`- What was said earlier is in ${input.earlierRooms} in ${input.workspace}, oldest first. You were there; search the file when you need an exact line instead of reading it whole.`] : []),
     `- Today is ${input.today} (UTC).`,
     `- The team: ${team}`,
@@ -264,9 +266,12 @@ export function resumePrompt(input: {
  * What a seat that starts fresh in a resumed run is told after its opening: that the swarm has
  * worked before, who remembers it, and where what was said then can be read.
  */
-export function newcomerNote(input: { seat: string; seats: readonly string[]; resumed: ReadonlySet<string>; earlierRoomId: string | null; earlierRooms: string | null; workspace: string }): string {
+export function newcomerNote(input: { seat: string; seats: readonly string[]; resumed: ReadonlySet<string>; earlierRoomId: string | null; earlierRooms: string | null; workspace: string; roomId?: string; goalSequence?: number }): string {
   const same = input.seats.filter((name) => name !== input.seat && input.resumed.has(name));
-  const room = input.earlierRoomId ? `Room ${input.earlierRoomId}` : "an earlier Room";
+  // In the same Room the earlier Goal is the part of this Room before the new goal's message.
+  const room = input.earlierRoomId !== null && input.earlierRoomId === input.roomId
+    ? `this Room (the messages before #${input.goalSequence ?? 1})`
+    : input.earlierRoomId ? `Room ${input.earlierRoomId}` : "an earlier Room";
   return [
     same.length > 0
       ? `This swarm has worked before, on an earlier Goal in ${room}. ${list(same)} ${same.length === 1 ? "is the same session that" : "are the same sessions that"} worked on it, resumed with what ${same.length === 1 ? "it remembers" : "they remember"}; you are a new session and start without that memory.`

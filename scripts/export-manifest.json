@@ -273,7 +273,8 @@
       "changes": [
         "Ported for `sharednet local` from the private service repository; licensed MIT here with the rest of this repository.",
         "protocol imports point at ../protocol/ inside the CLI package",
-        "The default store no longer builds the Postgres runtime repository (not ported): without a store passed in, the handler answers 503 service_unavailable, as the service does without a database."
+        "The default store no longer builds the Postgres runtime repository (not ported): without a store passed in, the handler answers 503 service_unavailable, as the service does without a database.",
+        "goal Rooms take their next goal: `POST /api/v1/rooms/<id>/reopen` by the owner's key, and a goal may follow one that has ended (also proposed to the service)"
       ]
     },
     "packages/cli/src/server/memory-repository.ts": {
@@ -282,7 +283,8 @@
       "sourceSha256": "23e3287404997b0b3e7782d3d0e426d7ed63028ef426be303204b68aab9e5012",
       "changes": [
         "Ported for `sharednet local` from the private service repository; licensed MIT here with the rest of this repository.",
-        "protocol imports point at ../protocol/ inside the CLI package"
+        "protocol imports point at ../protocol/ inside the CLI package",
+        "goal Rooms take their next goal: `POST /api/v1/rooms/<id>/reopen` by the owner's key, and a goal may follow one that has ended (also proposed to the service)"
       ]
     },
     "packages/cli/src/server/repository.ts": {
@@ -439,7 +441,8 @@
         "Ported for `sharednet local` from the private service repository; licensed MIT here with the rest of this repository.",
         "protocol imports point at ../protocol/ inside the CLI package",
         "relative imports carry the .ts extension",
-        "ids copied from real Rooms and accounts are replaced by synthetic ids of the same shape"
+        "ids copied from real Rooms and accounts are replaced by synthetic ids of the same shape",
+        "goal Rooms take their next goal: `POST /api/v1/rooms/<id>/reopen` by the owner's key, and a goal may follow one that has ended (also proposed to the service)"
       ]
     },
     "packages/cli/src/server/instance-directory.test.ts": {

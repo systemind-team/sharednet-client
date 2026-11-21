@@ -2800,6 +2800,32 @@ describe("goal Rooms over the API (decision 2026-10-05)", () => {
     expect((await json(again)).error.code).toBe("goal_already_set");
   });
 
+  it("takes the next goal in the same Room once the last one has ended: its owner reopens it by key, and nobody else can", async () => {
+    const { store } = goalStore();
+    const { roomId, guestToken } = await room(store);
+    const first = await json(await post(store, `/api/v1/rooms/${roomId}/goal`, OWNER, { content: "First goal.", until: ["after 1h"] }));
+    // Closed with the trigger that ended it, as goal run closes it.
+    expect((await post(store, `/api/v1/rooms/${roomId}/close`, OWNER, { trigger: "said DONE", detail: null })).status).toBe(200);
+    // Closed, it takes nothing; only its owner may open it again.
+    expect((await json(await post(store, `/api/v1/rooms/${roomId}/goal`, OWNER, { content: "Too soon.", until: ["after 1h"] }))).error.code).toBe("room_closed");
+    expect((await post(store, `/api/v1/rooms/${roomId}/reopen`, OTHER)).status).toBe(404);
+    const reopened = await post(store, `/api/v1/rooms/${roomId}/reopen`, OWNER);
+    expect(reopened.status).toBe(200);
+    expect((await json(reopened)).room).toMatchObject({ id: roomId, state: "open" });
+    const next = await post(store, `/api/v1/rooms/${roomId}/goal`, OWNER, { content: "Second goal.", until: ["after 30m"] });
+    expect(next.status).toBe(201);
+    const body = await json(next);
+    expect(body.message.sequence).toBeGreaterThan(first.message.sequence);
+    expect(body.room.goal).toEqual({ message_id: body.message.id, sequence: body.message.sequence, until: ["after 30m"], started_at: body.message.created_at, ended_by: null });
+    // The earlier goal's lines are still the Room's, before the new one.
+    const seen = await read(store, roomId, guestToken);
+    expect(seen.room.goal.message_id).toBe(body.message.id);
+    // While that goal runs there is still only one.
+    expect((await json(await post(store, `/api/v1/rooms/${roomId}/goal`, OWNER, { content: "A third.", until: ["after 1h"] }))).error.code).toBe("goal_already_set");
+    // Reopening an open Room changes nothing.
+    expect((await json(await post(store, `/api/v1/rooms/${roomId}/reopen`, OWNER))).room.goal.message_id).toBe(body.message.id);
+  });
+
   it("refuses a goal with no bound, from anyone but the owner, and from a key with no account, minting nothing", async () => {
     const { store } = goalStore();
     const { roomId, guestToken } = await room(store);

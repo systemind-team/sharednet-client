@@ -1298,7 +1298,7 @@ export async function runGoal(
       if (input.resume && resume && resumeRecord) {
         const names = records.map((record) => record.name);
         const earlier = { earlierRoomId: input.resume.source.roomId, earlierRooms: resumeRecord.earlier_rooms, workspace: CONTAINER_WORKSPACE };
-        const opening = `${prompt}\n\n${newcomerNote({ seat: seat.name, seats: names, resumed: new Set(resume.seats.keys()), ...earlier })}`;
+        const opening = `${prompt}\n\n${newcomerNote({ seat: seat.name, seats: names, resumed: new Set(resume.seats.keys()), ...earlier, roomId: input.roomId, goalSequence: input.goalSequence })}`;
         if (taken) {
           const controls = roomControls({ mentionGate, taskGate, messageRouting, turnPolicy, modules: describeModules(modules), seats: names });
           const again = resumePrompt({

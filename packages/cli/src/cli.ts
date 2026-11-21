@@ -157,6 +157,7 @@ const optionValueNames = new Set([
   "disallow-tools",
   "resume-from",
   "earlier-rooms",
+  "room",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate", "activity-view"]);
 
@@ -618,8 +619,26 @@ async function goalCommand(
  * Everything that could fail half-way (the goal, the triggers, Docker, each driver's sign-in)
  * is checked before the Room exists.
  */
+/**
+ * `goal run --room`: the next goal of a Room of the owner's that already exists. The Room is opened
+ * again if it is closed (its seats, invites and log come back as they were), the runner's seat joins
+ * it, and the goal is said there; the earlier goal must have ended. Any refusal on the way is
+ * `room_not_reusable`, said before an Agent starts, so a caller can fall back to a new Room.
+ */
+export async function sayNextGoal(client: ApiClient, apiKey: string, runnerToken: string, roomId: string, content: string, until: string[]): Promise<Awaited<ReturnType<typeof startGoal>>> {
+  const refuse = (error: unknown): never => {
+    const refused = asCliError(error);
+    throw new CliError("room_not_reusable", `${roomId} cannot take this Goal: ${refused.message}`, refused.exitCode, refused.requestId);
+  };
+  const reopened = await client.request<{ room?: { id?: string; type?: string; kind?: string } }>("POST", `/rooms/${encodeURIComponent(roomId)}/reopen`, apiKey).catch(refuse);
+  if (reopened.room?.id !== roomId) refuse(new CliError("invalid_server_response", "The Room did not come back.", 5));
+  if (reopened.room?.type === "compiled" || reopened.room?.kind === "direct") refuse(localError("invalid_arguments", "it is not a plain board Room."));
+  await client.request("POST", `/rooms/${encodeURIComponent(roomId)}/join`, runnerToken, undefined, { "idempotency-key": randomUUID() }).catch(refuse);
+  return startGoal(client, apiKey, roomId, content, until).catch(refuse);
+}
+
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools", "resume-from", "earlier-rooms"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools", "resume-from", "earlier-rooms", "room"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
   const turnPolicy = option(parsed, "turn-policy") ?? "legacy";
@@ -628,7 +647,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (namedMode !== undefined && ["mention-gate", "task-gate", "message-routing"].some((name) => parsed.options.has(name))) {
     throw localError("invalid_arguments", "--harness-mode fixes the gate and routing controls; do not combine it with --mention-gate, --task-gate, or --message-routing.");
   }
-  if (namedMode !== undefined && (parsed.options.has("resume-from") || parsed.options.has("earlier-rooms"))) {
+  if (namedMode !== undefined && (parsed.options.has("resume-from") || parsed.options.has("earlier-rooms") || parsed.options.has("room"))) {
     throw localError("invalid_arguments", "--harness-mode fixes a frozen treatment, whose seats start fresh; --resume-from is not part of one.");
   }
   const namedSpec = namedMode === undefined ? undefined : getHarnessModeSpec(namedMode);
@@ -665,7 +684,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--disallow-tools <Tool,Tool>] [--resume-from <record dir> [--earlier-rooms <file>]]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit 20m] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--disallow-tools <Tool,Tool>] [--resume-from <record dir> [--earlier-rooms <file>]] [--room <room id>]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
@@ -748,8 +767,18 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     }
   }
   const resume = resumeFrom === undefined ? undefined : { source: await readResumeSource(resolvePathFrom(dependencies.cwd, resumeFrom)), earlierRooms: earlierRooms ?? null };
+  // A Room of the owner's that already exists, for this Goal to be said in: the next goal of that Room.
+  const sameRoom = option(parsed, "room");
+  if (sameRoom !== undefined) {
+    if (!/^rom_[A-Za-z0-9]{6,40}$/.test(sameRoom)) throw localError("invalid_arguments", "--room names a Room of yours by its id, such as rom_AbCdEf1234.");
+    if (type === "compiled") throw localError("invalid_arguments", "--room is for plain board Rooms.");
+    if (parsed.options.has("name")) throw localError("invalid_arguments", "--name names a new Room; with --room the Goal is said in a Room that exists.");
+  }
   const requestedOut = option(parsed, "out");
   const outputRoot = resolvePathFrom(dependencies.cwd, requestedOut ?? "runs");
+  if (resume && requestedOut !== undefined && outputRoot === resume.source.record) {
+    throw localError("invalid_arguments", "--out is where this run's record goes; it cannot be the record --resume-from reads.");
+  }
   await preflightGoalOutput(outputRoot);
   const checkEveryMs = parsed.options.has("check-every") ? parseDuration(option(parsed, "check-every"), "--check-every") : 60_000;
   const baseUrl = resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL);
@@ -772,22 +801,31 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   );
   const limited: ResolvedDependencies = { ...dependencies, fetch: withRequestLimit(dependencies.fetch) };
   return withSelectedSession(globals, limited, async (client, session) => {
-    const created = await client.request<{ room?: { id?: string } }>(
-      "POST",
-      "/rooms",
-      session.instance_token,
-      { name: option(parsed, "name") ?? basename(workspace), ...(type === undefined ? {} : { type }) },
-      { "idempotency-key": randomUUID() },
-    );
-    const roomId = created.room?.id;
-    if (!roomId) throw new CliError("invalid_server_response", "The Room was created but its id did not come back.", 5);
-    const started = await startGoal(client, apiKey, roomId, content, until.wire).catch((error: unknown) => {
-      const refused = asCliError(error);
-      throw new CliError(refused.code, `${roomId} was created, but its goal was refused: ${refused.message}`, refused.exitCode, refused.requestId);
-    });
+    let roomId: string;
+    let started: Awaited<ReturnType<typeof startGoal>>;
+    if (sameRoom === undefined) {
+      const created = await client.request<{ room?: { id?: string } }>(
+        "POST",
+        "/rooms",
+        session.instance_token,
+        { name: option(parsed, "name") ?? basename(workspace), ...(type === undefined ? {} : { type }) },
+        { "idempotency-key": randomUUID() },
+      );
+      const createdId = created.room?.id;
+      if (!createdId) throw new CliError("invalid_server_response", "The Room was created but its id did not come back.", 5);
+      roomId = createdId;
+      started = await startGoal(client, apiKey, roomId, content, until.wire).catch((error: unknown) => {
+        const refused = asCliError(error);
+        throw new CliError(refused.code, `${roomId} was created, but its goal was refused: ${refused.message}`, refused.exitCode, refused.requestId);
+      });
+    } else {
+      roomId = sameRoom;
+      started = await sayNextGoal(client, apiKey, session.instance_token, sameRoom, content, until.wire);
+    }
     const invite = await client.request<{ token?: string }>("POST", `/rooms/${encodeURIComponent(roomId)}/invites`, session.instance_token);
     if (!invite?.token) throw new CliError("invalid_server_response", "The Agents' invite did not come back.", 5);
-    const out = requestedOut === undefined ? join(outputRoot, roomId) : outputRoot;
+    // A Room that takes its next goal keeps each goal's record apart: the earlier one may be what --resume-from reads.
+    const out = requestedOut === undefined ? join(outputRoot, sameRoom === undefined ? roomId : `${roomId}-goal-${(started.message as { sequence?: number } | undefined)?.sequence ?? 1}`) : outputRoot;
     dependencies.stderr(`goal: ${roomId} is open; the record goes to ${out}\n`);
     // Ctrl-C ends the run without leaving Agents at work in containers nobody watches.
     const interrupt = () => {

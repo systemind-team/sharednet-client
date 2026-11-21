@@ -243,13 +243,15 @@ remember its files where they left them.
   ends. The Room's rules (routing, gates, modules, turn policy) are stated again only when
   they are not the earlier run's.
 - **What does not come back.** The container: programs left running and anything installed
-  outside the home and the workspace are gone. The Room: a run opens a new one, and the seat
-  joins it as a new member. The sign-ins: a record holds none, so each seat is signed in again
-  the way a new seat is, from this run's own key or login.
-- **The earlier Room.** It has ended and cannot be read from the new seats. `goal run` writes
-  what was said there to `earlier-rooms/<rom_…>.md` in the workspace, oldest first, for the
-  agents to search. If your workspace already has such a file, name it with
-  `--earlier-rooms <file>` and none is written.
+  outside the home and the workspace are gone. The seat: each seat joins the Room as a new
+  member under its old name (the record holds no Room credential). The sign-ins: a record holds
+  none, so each seat is signed in again the way a new seat is, from this run's own key or login.
+- **The Room.** Without `--room` a run opens a new Room. With `--room <the earlier rom_…>` the
+  next goal is said in the earlier Goal's own Room (see below), so the whole swarm's history is
+  one Room.
+- **The earlier Room's messages.** `goal run` writes what was said there to
+  `earlier-rooms/<rom_…>.md` in the workspace, oldest first, for the agents to search. If your
+  workspace already has such a file, name it with `--earlier-rooms <file>` and none is written.
 - **A seat that cannot be taken up starts fresh.** It gets the whole opening, and one more
   paragraph saying the swarm has worked before and who remembers it. This happens when the
   seat is new, ran another harness, never got a session, has no home or no session file in the
@@ -277,6 +279,32 @@ compaction leaves a summary that is a little longer than the last, so a swarm on
 Goal starts each turn with more than it did on its first. If that grows too far, run a Goal
 without `--resume-from`: the team starts fresh, with the workspace and the `earlier-rooms/`
 files that are already there.
+
+## The next goal in the same Room (`--room`)
+
+```sh
+sharednet goal run NEXT.md --session "$SID" --resume-from runs/rom_AbCdEf1234 --room rom_AbCdEf1234 \
+  --agent codex --agent codex --until 'said: DONE' --until 'after: 2h'
+```
+
+`--room <room id>` says this run's goal in a Room of yours that already exists, instead of
+opening a new one. A Room holds one goal at a time; once its goal has ended, its owner may say
+the next one there. `goal run`:
+
+1. opens the Room again if it is closed (`POST /rooms/<id>/reopen`, by your key, as it closes
+   one): its seats, invites and log come back as they were;
+2. seats its runner in it, says the goal as the owner, and invites the Agents, who join as new
+   members under their seat names;
+3. watches the goal from its own message on: claims, checks, counts and wakes before it belong
+   to the earlier goal and do not count.
+
+With `--resume-from`, a resumed seat is told the Room is the same and where the new goal starts.
+The record goes to `runs/<rom_…>-goal-<n>` (n is the goal's message number), so the earlier
+goal's record is not overwritten; `--out` may not be the record `--resume-from` reads.
+
+Anything that stops the goal being said there (not your Room, a compiled or direct Room, a
+goal still running in it) is refused as `room_not_reusable`, before an Agent starts, so a
+caller can fall back to a new Room. Without `--room`, a run is what it was.
 
 ## Serve-backed runtime modes
 
