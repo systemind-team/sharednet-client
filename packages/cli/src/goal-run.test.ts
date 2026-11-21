@@ -183,7 +183,7 @@ describe("Gemini native turns", () => {
     await writeFile(join(home, "package.json"), "{}");
     const agents = parseAgents(Array.from({ length: 128 }, () => "gemini"));
     const input = { agents, image: "candidate:1", workspace: home, home, entry: join(home, "main.ts") };
-    const { docker, calls } = fakeDocker(() => ({}));
+    const { docker, calls } = fakeDocker(call => ({ stdout: call.args[0] === "run" ? "0.70.0\n" : "" }));
     await expect(prepareRun({ ...input, env: {} }, docker, () => undefined)).rejects.toMatchObject({ code: "agent_auth_missing" });
     const plan = await prepareRun({ ...input, env: { GEMINI_API_KEY: "synthetic-gemini-key" } }, docker, () => undefined);
     expect(plan.geminiAuth).toBe("GEMINI_API_KEY");
@@ -191,7 +191,15 @@ describe("Gemini native turns", () => {
     const defaultPlan = await prepareRun({ ...input, image: null, env: { GEMINI_API_KEY: "synthetic-gemini-key" } }, docker, () => undefined);
     expect(defaultPlan.image).toBe("sharednet-goal-agents:2");
     await expect(prepareRun({ ...input, isolate: true, env: { GEMINI_API_KEY: "synthetic-gemini-key" } }, docker, () => undefined)).rejects.toMatchObject({ code: "invalid_arguments" });
-    expect(calls.some(call => call.args[0] === "run")).toBe(false);
+    expect(calls.filter(call => call.args[0] === "run").every(call => call.args.includes("--version") && call.args.includes("none") && !call.args.includes("-e"))).toBe(true);
+  });
+
+  it.each([{ code: 127, stdout: "" }, { code: 0, stdout: "not a CLI version" }])("refuses a custom image without a working Gemini binary: %j", async response => {
+    const home = await temporary();
+    await writeFile(join(home, "package.json"), "{}");
+    const { docker, calls } = fakeDocker(call => call.args[0] === "run" ? response : {});
+    await expect(prepareRun({ agents: parseAgents(["gemini"]), image: "older-worker:1", workspace: home, home, entry: join(home, "main.ts"), env: { GEMINI_API_KEY: "synthetic-key" } }, docker, () => undefined)).rejects.toMatchObject({ code: "agent_runtime_missing" });
+    expect(calls.some(call => call.args.includes("--detach"))).toBe(false);
   });
 
   it("executes a disposable Gemini binary twice with its actual headless command and persisted session", async () => {

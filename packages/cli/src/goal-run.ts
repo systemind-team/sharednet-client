@@ -450,6 +450,14 @@ export async function prepareRun(
     const built = await docker(["build", "-t", image, "-"], { input: AGENT_DOCKERFILE });
     if (built.code !== 0) throw localError("image_build_failed", `The Agents' image could not be built: ${built.stderr.trim().split("\n").slice(-3).join(" ")}`);
   }
+  if (gemini) {
+    // A worker may pin an older custom image. Check its real binary without keys, a
+    // network, or the image's entrypoint, and bound even a broken version command.
+    const version = await docker(["run", "--rm", "--network", "none", "--entrypoint", "timeout", image, "15", "gemini", "--version"]);
+    if (version.code !== 0 || !/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version.stdout.trim())) {
+      throw localError("agent_runtime_missing", `The image ${image} needs a working Gemini CLI on PATH (gemini --version); rebuild the image with @google/gemini-cli@0.70.0 or use the default Gemini image.`);
+    }
+  }
   let codexAuth: RunPlan["codexAuth"] = null;
   const codex = codexApi(input.modelApi ?? undefined);
   if (input.agents.some((agent) => agent.driver === "codex")) {

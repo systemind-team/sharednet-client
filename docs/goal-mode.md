@@ -94,7 +94,10 @@ Gemini uses `GEMINI_API_KEY` from the runner's environment. Its value enters onl
 environment, never a command argument. The default Gemini image is `sharednet-goal-agents:2`
 and installs `@google/gemini-cli@0.70.0`; the separate image tag avoids reusing an older cached
 image without Gemini. Existing Codex and Claude runs retain their image tag. A custom image
-must provide a compatible `gemini` binary.
+must provide a compatible `gemini` binary. Before the team starts, the runner checks
+`gemini --version` in a disposable container with no network or model credentials and a
+15-second timeout. A missing or broken binary refuses the run with `agent_runtime_missing`;
+workers with `PROMETHEUS_WORKER_IMAGE` must rebuild that image with the Gemini CLI.
 
 Gemini runs headlessly with `--output-format stream-json`, and every later turn uses the
 exact session UUID announced by the first turn. An exit with no matching session and final
