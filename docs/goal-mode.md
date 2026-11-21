@@ -102,8 +102,10 @@ workers with `PROMETHEUS_WORKER_IMAGE` must rebuild that image with the Gemini C
 Gemini runs headlessly with `--output-format stream-json`, and every later turn uses the
 exact session UUID announced by the first turn. An exit with no matching session and final
 successful result counts as a failed turn. Gemini's `stats.input` is fresh input,
-`stats.cached` is cached input, and `stats.output_tokens` is output for that process; resumed
-turns add these counts to the run. `--web-search off` excludes `google_web_search` and
+`stats.cached` is cached input, and `stats.total_tokens - stats.input_tokens` counts all
+generated output for that process, including reasoning. `stats.output_tokens` alone counts
+only visible candidates and would undercharge reasoning. Missing or inconsistent totals
+fail the turn; resumed turns add the validated counts to the run. `--web-search off` excludes `google_web_search` and
 `web_fetch` in the seat's Gemini settings. Gemini with `--isolate` is refused before a
 container starts because that gateway does not yet support Google's model API.
 The [official headless reference](https://geminicli.com/docs/cli/headless/),

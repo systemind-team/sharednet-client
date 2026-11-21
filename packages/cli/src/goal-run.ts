@@ -841,9 +841,17 @@ export class TurnReader {
         const stats = event.stats;
         if (stats && typeof stats === "object" && !Array.isArray(stats)) {
           const usage = stats as Record<string, unknown>;
-          const keys = ["input", "cached", "output_tokens"] as const;
+          const keys = ["input", "cached", "output_tokens", "input_tokens", "total_tokens"] as const;
           if (keys.every(key => typeof usage[key] === "number" && Number.isSafeInteger(usage[key]) && usage[key] >= 0)) {
-            this.reading.usage = { input: usage.input as number, cached: usage.cached as number, output: usage.output_tokens as number };
+            const input = usage.input as number;
+            const cached = usage.cached as number;
+            const prompt = usage.input_tokens as number;
+            const total = usage.total_tokens as number;
+            // Gemini's output_tokens counts visible candidates alone. Its total also
+            // includes generated reasoning, which must consume the fresh-token budget.
+            if (prompt === input + cached && total >= prompt + (usage.output_tokens as number)) {
+              this.reading.usage = { input, cached, output: total - prompt };
+            }
           }
         }
         this.completed = !this.reading.failed && this.started && this.pendingTools.size === 0 && event.status === "success" && event.error === undefined && this.reading.usage !== null;
@@ -1679,7 +1687,7 @@ async function sessionFileUsage(sessions: string, sessionId: string): Promise<Us
 
 /** A record is made to be handed on: the seat's token and the harness's sign-in leave it. */
 export async function scrubHome(home: string): Promise<void> {
-  for (const secret of [".config/sharednet", ".codex/auth.json", ".claude/.credentials.json", ".gemini/oauth_creds.json", ".gemini/google_accounts.json", ".gemini/mcp-oauth-tokens.json", ".gemini/a2a-oauth-tokens.json", ".gemini/.env"]) {
+  for (const secret of [".config/sharednet", ".codex/auth.json", ".claude/.credentials.json", ".gemini/oauth_creds.json", ".gemini/google_accounts.json", ".gemini/gemini-credentials.json", ".gemini/mcp-oauth-tokens.json", ".gemini/a2a-oauth-tokens.json", ".gemini/.env"]) {
     await rm(join(home, secret), { recursive: true, force: true });
   }
 }

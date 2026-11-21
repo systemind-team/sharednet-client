@@ -129,7 +129,7 @@ describe("--agent", () => {
 describe("Gemini native turns", () => {
   const session = "12345678-1234-4234-8234-123456789abc";
   const init = { type: "init", session_id: session, model: "gemini-4-argon" };
-  const result = { type: "result", status: "success", stats: { input_tokens: 100, input: 20, cached: 80, output_tokens: 7, tool_calls: 1 } };
+  const result = { type: "result", status: "success", stats: { total_tokens: 107, input_tokens: 100, input: 20, cached: 80, output_tokens: 7, tool_calls: 1 } };
 
   it.each([32, 64, 128])("plans %i independently named Gemini agents", count => {
     const agents = parseAgents(Array.from({ length: count }, () => "gemini:gemini-4-argon"));
@@ -157,6 +157,15 @@ describe("Gemini native turns", () => {
     expect(reader.toolCalls).toBe(1);
   });
 
+  it("counts generated reasoning tokens from the total rather than only visible candidates", () => {
+    const reader = new TurnReader("gemini");
+    reader.line(JSON.stringify(init));
+    reader.line(JSON.stringify({ ...result, stats: { total_tokens: 10_100, input_tokens: 100, input: 100, cached: 0, output_tokens: 10 } }));
+    reader.finish();
+    expect(reader.reading).toEqual({ sessionId: session, usage: { input: 100, cached: 0, output: 10_000 }, failed: false });
+    expect(freshTokens(reader.reading.usage)).toBe(10_100);
+  });
+
   it.each([
     [init],
     [result],
@@ -165,6 +174,10 @@ describe("Gemini native turns", () => {
     [{ ...init, session_id: "87654321-1234-4234-8234-123456789abc" }, result],
     [init, { ...result, stats: { ...result.stats, input: -1 } }],
     [init, { ...result, stats: { ...result.stats, output_tokens: "7" } }],
+    [init, { ...result, stats: { input_tokens: 100, input: 20, cached: 80, output_tokens: 7 } }],
+    [init, { ...result, stats: { ...result.stats, total_tokens: 106 } }],
+    [init, { ...result, stats: { ...result.stats, total_tokens: "107" } }],
+    [init, { ...result, stats: { ...result.stats, cached: 101 } }],
     [init, result, result],
     [init, null, result],
     [init, { type: "tool_use", tool_id: "missing", tool_name: "run_shell_command", parameters: {} }, result],
@@ -223,9 +236,9 @@ describe("Gemini native turns", () => {
     const home = await temporary();
     const folder = join(home, ".gemini");
     await mkdir(folder);
-    for (const file of ["oauth_creds.json", "google_accounts.json", "mcp-oauth-tokens.json", "a2a-oauth-tokens.json", ".env", "session.json"]) await writeFile(join(folder, file), "synthetic");
+    for (const file of ["oauth_creds.json", "google_accounts.json", "gemini-credentials.json", "mcp-oauth-tokens.json", "a2a-oauth-tokens.json", ".env", "session.json"]) await writeFile(join(folder, file), "synthetic");
     await scrubHome(home);
-    for (const file of ["oauth_creds.json", "google_accounts.json", "mcp-oauth-tokens.json", "a2a-oauth-tokens.json", ".env"]) await expect(readFile(join(folder, file))).rejects.toThrow();
+    for (const file of ["oauth_creds.json", "google_accounts.json", "gemini-credentials.json", "mcp-oauth-tokens.json", "a2a-oauth-tokens.json", ".env"]) await expect(readFile(join(folder, file))).rejects.toThrow();
     expect(await readFile(join(folder, "session.json"), "utf8")).toBe("synthetic");
   });
 
@@ -511,7 +524,7 @@ describe("runGoal", () => {
         else await new Promise(resolve => setTimeout(resolve, 2));
         active -= 1;
         finished += 1;
-        return { lines: [JSON.stringify({ type: "init", session_id: "12345678-1234-4234-8234-123456789abc", model: "gemini-4-argon" }), JSON.stringify({ type: "result", status: "success", stats: { input: 1, cached: 2, output_tokens: 3 } })] };
+        return { lines: [JSON.stringify({ type: "init", session_id: "12345678-1234-4234-8234-123456789abc", model: "gemini-4-argon" }), JSON.stringify({ type: "result", status: "success", stats: { total_tokens: 16, input_tokens: 3, input: 1, cached: 2, output_tokens: 3 } })] };
       }
       if (command[0] === "sharednet" && command[1] === "wait") return { stdout: JSON.stringify({ fired: ["closed"], messages: [] }) };
       return {};
@@ -531,6 +544,7 @@ describe("runGoal", () => {
     expect(started).toBe(cancel ? 8 : 128);
     expect(afterStop).toBe(0);
     expect(result.agents).toHaveLength(128);
+    expect(result.tokens).toBe((cancel ? 8 : 128) * 14);
     expect(calls.filter(call => call.args[0] === "run")).toHaveLength(129);
     expect(calls.at(-1)?.args).toEqual(["rm", "--force", ...runContainers(ROOM, agents)]);
     const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
