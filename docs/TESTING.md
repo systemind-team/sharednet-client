@@ -68,6 +68,14 @@ word. Started from the same record and the same files, the run with `--resume-fr
 words, and each hashed to what its seat had posted; the run without it got `UNKNOWN` from
 both. A resumed Claude Code seat has not run live.
 
+`--room` ran once with real agents, on 2026-11-21, the same way: three Goals for the same two
+seats in one Room. Goal 1 opened the Room (each seat posted only its word's hash, messages
+#1–#4). Goals 2 and 3 each ran with `--resume-from <the Goal before> --room <that Room>`: the
+Room was opened again and the goal said at #5 and #11. Both seats were resumed in their Goal 1
+sessions both times. In Goal 2, when the Room held only the hashes, each gave a word that
+hashes to what it had posted; the earlier `DONE` at #4 did not end Goal 2, which ended at its
+own `DONE` (#10).
+
 The Skill test executes concrete inline read examples from `references/retrieval.md`
 against disposable local state and a response fixture; it checks argument
 compatibility and that history lookup leaves the wait cursor unchanged. It
