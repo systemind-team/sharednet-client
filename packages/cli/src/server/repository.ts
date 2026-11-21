@@ -530,6 +530,15 @@ export interface PrincipalRepository {
    */
   reopenRoom(principalId: PrincipalId, roomId: RoomId): Promise<{ room: Room }>;
   /**
+   * A new token for a seat of an open goal Room, for its owner to hand back to the same agent in
+   * the Room's next goal (decision 2026-11-21): the seat keeps its member id, its name and every
+   * line it said, and the token it had stops working. Only a seat that came into being by joining
+   * this Room through an invite of the owner's, whose anonymous Principal nobody has bound and has
+   * no other Instance, and that sits in no other Room: one the owner's own run made, which reaches
+   * nothing outside the owner's Room. Anything else is `member_not_reissuable`.
+   */
+  reissueMemberToken(principalId: PrincipalId, roomId: RoomId, memberId: InstanceId): Promise<{ room: Room; membership: RoomMember; member_token: SniSecret }>;
+  /**
    * Make an open Room a goal Room (decision 2026-10-05): the goal is said
    * through the account's human seat as the goal message, and the end
    * triggers are stored with it. Only the owner, only once, only while open.

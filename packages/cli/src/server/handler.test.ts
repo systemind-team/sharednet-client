@@ -2826,6 +2826,128 @@ describe("goal Rooms over the API (decision 2026-10-05)", () => {
     expect((await json(await post(store, `/api/v1/rooms/${roomId}/reopen`, OWNER))).room.goal.message_id).toBe(body.message.id);
   });
 
+  describe("a seat taken up again for the Room's next goal (decision 2026-11-21)", () => {
+    /** A goal Room as goal run leaves it: the owner's run invited two agents, which joined with the invite alone and spoke. */
+    async function swarmRoom(store: MemorySharedNetRepository) {
+      const { roomId, ownerToken, guestToken } = await room(store);
+      const goal = await json(await post(store, `/api/v1/rooms/${roomId}/goal`, OWNER, { content: "First goal.", until: ["after 1h"] }));
+      const invite = await json(await request(store, `/api/v1/rooms/${roomId}/invites`, { method: "POST", headers: instanceHeaders(ownerToken) }));
+      const seat = async (name: string) => {
+        const joined = await post(store, `/api/v1/rooms/${roomId}/join`, invite.token, { name });
+        expect(joined.status).toBe(200);
+        const body = await json(joined);
+        return { memberId: body.membership.member_id as string, token: body.member_token as string };
+      };
+      const one = await seat("codex-1");
+      const two = await seat("codex-2");
+      const said = await request(store, `/api/v1/rooms/${roomId}/messages`, {
+        method: "POST",
+        headers: instanceHeaders(one.token, { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }),
+        body: JSON.stringify({ content: "HASH codex-1 9f86d0" }),
+      });
+      expect(said.status).toBe(201);
+      return { roomId, ownerToken, guestToken, goal, invite: invite.token as string, one, two };
+    }
+    const takeUp = (store: MemorySharedNetRepository, roomId: string, memberId: string, key = OWNER) => post(store, `/api/v1/rooms/${roomId}/members/${memberId}/token`, key);
+
+    it("gives the owner a new token for the same member, under its name and with its lines, and the old token stops working", async () => {
+      const { store } = goalStore();
+      const { roomId, guestToken, one, two } = await swarmRoom(store);
+      // The goal ends and the Room closes; its owner opens it again and says the next goal.
+      expect((await post(store, `/api/v1/rooms/${roomId}/close`, OWNER, { trigger: "said DONE", detail: null })).status).toBe(200);
+      expect((await json(await takeUp(store, roomId, one.memberId))).error.code).toBe("room_closed");
+      expect((await post(store, `/api/v1/rooms/${roomId}/reopen`, OWNER)).status).toBe(200);
+      expect((await post(store, `/api/v1/rooms/${roomId}/goal`, OWNER, { content: "Second goal.", until: ["after 30m"] })).status).toBe(201);
+
+      const taken = await takeUp(store, roomId, one.memberId);
+      expect(taken.status).toBe(200);
+      expect(taken.headers.get("cache-control")).toContain("no-store");
+      const body = await json(taken);
+      expect(body.membership).toMatchObject({ member_id: one.memberId, name: "codex-1", kind: "guest", state: "active" });
+      expect(body.member_token).toMatch(/^sni_/);
+      expect(body.member_token).not.toBe(one.token);
+      // The old token is no credential any more; the new one is the same member, and says its next line from it.
+      expect((await request(store, `/api/v1/rooms/${roomId}`, { headers: instanceHeaders(one.token) })).status).toBe(401);
+      const again = await request(store, `/api/v1/rooms/${roomId}/messages`, {
+        method: "POST",
+        headers: instanceHeaders(body.member_token, { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }),
+        body: JSON.stringify({ content: "WORD codex-1 thistledown" }),
+      });
+      expect(again.status).toBe(201);
+      const seen = await read(store, roomId, guestToken);
+      const log = await json(await request(store, `/api/v1/rooms/${roomId}/messages?after=0&limit=100`, { headers: instanceHeaders(guestToken) }));
+      const fromOne = log.items.filter((message: any) => message.sender_instance_id === one.memberId).map((message: any) => message.content);
+      expect(fromOne).toEqual(["HASH codex-1 9f86d0", "WORD codex-1 thistledown"]);
+      // One member per agent: nothing was added.
+      expect(seen.memberships.filter((member: any) => member.name === "codex-1")).toHaveLength(1);
+      // Taking it up again mints another token and retires the one before it.
+      const twice = await json(await takeUp(store, roomId, one.memberId));
+      expect((await request(store, `/api/v1/rooms/${roomId}`, { headers: instanceHeaders(body.member_token) })).status).toBe(401);
+      expect((await request(store, `/api/v1/rooms/${roomId}`, { headers: instanceHeaders(twice.member_token) })).status).toBe(200);
+      // The other seat is untouched.
+      expect((await request(store, `/api/v1/rooms/${roomId}`, { headers: instanceHeaders(two.token) })).status).toBe(200);
+    });
+
+    it("is the owner's alone, by key, and only for a seat the owner's own invite made in this goal Room", async () => {
+      const { store } = goalStore();
+      const { roomId, ownerToken, guestToken, goal, invite, one, two } = await swarmRoom(store);
+      // Not the owner, no key, a member token, a malformed id, a member of no such seat.
+      expect((await takeUp(store, roomId, one.memberId, OTHER)).status).toBe(404);
+      expect((await request(store, `/api/v1/rooms/${roomId}/members/${one.memberId}/token`, { method: "POST" })).status).toBe(401);
+      expect((await takeUp(store, roomId, one.memberId, two.token)).status).toBe(401);
+      expect((await json(await takeUp(store, roomId, "mem_x"))).error.code).toBe("invalid_id");
+      expect((await json(await takeUp(store, roomId, "i_NoSuchSeat"))).error.code).toBe("instance_not_found");
+      expect((await request(store, `/api/v1/rooms/${roomId}/members/${one.memberId}/token`, { headers: { authorization: `Bearer ${OWNER}` } })).status).toBe(405);
+      // Another account's Agent, the owner's own seats, and the person's: none of them is a seat the invite made.
+      const view = await read(store, roomId, guestToken);
+      const other = view.memberships.find((member: any) => member.runtime_kind === "claude-code" && member.kind === "instance");
+      const person = view.memberships.find((member: any) => member.member_id === goal.message.sender_instance_id);
+      const creator = view.memberships.find((member: any) => member.member_id !== person.member_id && member.kind === "instance" && member.runtime_kind === "codex");
+      for (const member of [other, person, creator]) expect((await json(await takeUp(store, roomId, member.member_id))).error.code).toBe("member_not_reissuable");
+      // A seat that also sits in another Room: a token for it would reach that Room too.
+      const elsewhere = await room(store);
+      const otherInvite = await json(await request(store, `/api/v1/rooms/${elsewhere.roomId}/invites`, { method: "POST", headers: instanceHeaders(elsewhere.ownerToken) }));
+      const entered = await request(store, `/api/v1/rooms/${elsewhere.roomId}/join`, {
+        method: "POST",
+        headers: instanceHeaders(two.token, { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }),
+        body: JSON.stringify({ invite: otherInvite.token }),
+      });
+      expect(entered.status).toBe(200);
+      expect((await json(await takeUp(store, roomId, two.memberId))).error.code).toBe("member_not_reissuable");
+      // A seat somebody has bound to an account is theirs.
+      const login = await store.startCliLogin({ label: null, seats: [one.token] });
+      const bob = await store.authenticateApiKey(OTHER);
+      await store.approveCliLogin({ code: login.user_code, principalId: bob!.principalId });
+      expect((await json(await takeUp(store, roomId, one.memberId))).error.code).toBe("member_not_reissuable");
+      // A Room with no goal is not a goal run's.
+      const plain = await room(store);
+      const plainInvite = await json(await request(store, `/api/v1/rooms/${plain.roomId}/invites`, { method: "POST", headers: instanceHeaders(plain.ownerToken) }));
+      const guest = await json(await post(store, `/api/v1/rooms/${plain.roomId}/join`, plainInvite.token, { name: "codex-1" }));
+      expect((await json(await takeUp(store, plain.roomId, guest.membership.member_id))).error.code).toBe("member_not_reissuable");
+      // A refusal mints nothing: each seat's own token still works.
+      expect((await request(store, `/api/v1/rooms/${plain.roomId}`, { headers: instanceHeaders(guest.member_token) })).status).toBe(200);
+      expect(invite).toMatch(/^rit_/);
+    });
+
+    it("takes down a doorbell the seat's earlier holder set, so nothing the Room says rings there again", async () => {
+      const { store } = goalStore();
+      const { roomId, one, two } = await swarmRoom(store);
+      for (const seat of [one, two]) {
+        const auth = await store.authenticateInstance(seat.token);
+        await store.setPush(auth!, roomId as any, `https://hooks.example.com/${seat.memberId}`);
+      }
+      // A line neither of the two has handled yet, so each bell is due (said in the store, so nothing rings it here).
+      const owner = await store.authenticateApiKey(OWNER);
+      await store.speakAsOwner(owner!.principalId, roomId as any, { content: "Carry on.", as: "owner" });
+      const ringing = async () => (await store.pushTargets(roomId as any, null, new Date("2026-10-05T12:00:00.000Z"))).map((target) => target.instance_id);
+      expect(await ringing()).toEqual(expect.arrayContaining([one.memberId, two.memberId]));
+      expect((await takeUp(store, roomId, one.memberId)).status).toBe(200);
+      const after = await ringing();
+      expect(after).not.toContain(one.memberId);
+      expect(after).toContain(two.memberId);
+    });
+  });
+
   it("refuses a goal with no bound, from anyone but the owner, and from a key with no account, minting nothing", async () => {
     const { store } = goalStore();
     const { roomId, guestToken } = await room(store);
