@@ -159,9 +159,13 @@ harness of each driver you use (`codex`, `claude`), `sh` and `git`. `--agent-use
 user the agents and the checks run as in it (default `node`, the default image's user). The
 runner makes `/home/agents` for that user if the image has none.
 
-`--turn-limit 45m` stops a single turn after 45 minutes instead of the default 20 (at least
-`1m`). An experiment that wants only the Room's own end to stop an agent sets it to its
-`after`. `episode.json` records it as `turn_limit_s`.
+For `goal run` without a harness mode or with a `research/*` mode, omitting `--turn-limit`
+leaves each turn without a time limit of its own. `--turn-limit 45m` stops a single turn
+after 45 minutes (at least `1m`). The Goal's `--until` conditions, including `after` and
+`at` deadlines, still end the run and stop its agents. `episode.json` records the setting
+as `turn_limit_s`: the duration in seconds when set, or `null` when omitted. The
+serve-backed `runtime/serve-first@1` and `runtime/serve-all@1` modes retain their default
+20-minute turn limit; see [harness modes](harness-modes.md).
 
 `--disallow-tools ScheduleWakeup,CronCreate` keeps the named Claude Code tools from the Claude
 Code seats (Codex has no such list, so a run without a Claude Code seat refuses the option).
@@ -206,7 +210,8 @@ wake template and source commit too when freezing a study protocol.
 - **The agents work in turns.** Each one first gets the goal and how the Room ends. After
   that, the runner wakes it whenever another member says something: it resumes the same
   harness session with what was said, and acknowledges the wake when the turn ends. Every
-  agent is woken by the same policy. A turn is stopped after 20 minutes, or after `--turn-limit`.
+  agent is woken by the same policy. In this runner-owned loop, a turn has no time limit
+  unless `--turn-limit` sets one; the Goal's `--until` conditions still stop the run.
 - **They talk with `sharednet say` and `sharednet read`.** Their own final text is not posted.
   Codex agents have live web search and Claude Code agents have their built-in tools, unless
   the run says `--web-search off`.

@@ -16,7 +16,8 @@ import { DEFAULT_IMAGE, containerName, openingPrompt, parseAgents, runGoal, turn
  * service, write down everything the run did (every Docker call, every request that changes the
  * Room, every line it logged, its result and its record), and hold that to hashes taken from the
  * code before `--resume-from` was added (commit 7e8f89b). A change to any prompt, argument, record
- * field or log line of an ordinary run fails here.
+ * field or log line of a run with the historical explicit 20-minute turn cap fails here.
+ * The omitted-limit behavior is covered separately in goal-run.test.ts.
  */
 
 const ROOM = "rom_AbCdEfGhIj";
@@ -138,6 +139,7 @@ async function transcript(agents: string[], plan: Partial<RunPlan>, input: Parti
       checkEveryMs: 60_000,
       quietChecks: false,
       codeProvenance: { clientCommit: "c".repeat(40), runnerCommit: "c".repeat(40), sourceWorktreeDirty: false, packageVersion: "0.1.17", packageManifestSha256: "1".repeat(64), entrySha256: "2".repeat(64), codeTreeSha256: "3".repeat(64) },
+      turnLimitMs: 1_200_000,
       ...input,
     },
     { docker, now: () => new Date(AT), sleep: async () => undefined, stderr: (line) => logged.push(line) },
@@ -165,7 +167,7 @@ async function transcript(agents: string[], plan: Partial<RunPlan>, input: Parti
 describe("goal run without --resume-from is what it was", () => {
   it.each([
     [
-      "two Codex seats on a login, every default",
+      "two Codex seats on a login, with the historical 20-minute turn cap",
       ["codex:gpt-6-luna", "codex"],
       { codexAuth: { kind: "login", file: "/Users/someone/.codex/auth.json" } },
       {},
@@ -211,11 +213,11 @@ describe("goal run without --resume-from is what it was", () => {
       wakePrompt({ wake_id: "wk_1", fired: ["message"], messages: [{ sequence: 7, content: "look", sender: { member_id: "i_x" } }], events: [], from: 6, through: 7 }, "cooperative-v1"),
     ];
     const commands = [
-      turnCommand(seats[0]!, "p", null),
-      turnCommand(seats[0]!, "p", "thread-1"),
+      turnCommand(seats[0]!, "p", null, "live", 1_200),
+      turnCommand(seats[0]!, "p", "thread-1", "live", 1_200),
       turnCommand(seats[2]!, "p", "thread-1", "off", 600, { url: "http://gateway:8080/v1", custom: false }, { reasoningEffort: "high", contextWindow: 262_144, compactAt: 200_000 }),
       turnCommand(seats[2]!, "p", null, "live", 1_200, { url: "https://openrouter.ai/api/v1", custom: true }),
-      turnCommand(seats[1]!, "p", null),
+      turnCommand(seats[1]!, "p", null, "live", 1_200),
       turnCommand(seats[1]!, "p", "session-1", "off", 1_200, null, {}, ["ScheduleWakeup"]),
     ];
     if (process.env.SHAREDNET_PRINT_PINS) console.log(`PIN prompts: ${sha(JSON.stringify(prompts))}\nPIN commands: ${sha(JSON.stringify(commands))}`);

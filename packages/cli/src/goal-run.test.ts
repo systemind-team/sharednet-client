@@ -129,17 +129,17 @@ describe("a turn", () => {
   it("starts a harness with nothing asked of a person, and resumes the same session on the next wake", () => {
     const codex = { name: "codex-1", driver: "codex" as const, model: "gpt-6-luna" };
     expect(turnCommand(codex, "the goal", null)).toEqual([
-      "timeout", "1200", "codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", 'web_search="live"', "-m", "gpt-6-luna", "the goal",
+      "codex", "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox", "-c", 'web_search="live"', "-m", "gpt-6-luna", "the goal",
     ]);
-    expect(turnCommand(codex, "new lines", "thread-1").slice(2, 5)).toEqual(["codex", "exec", "resume"]);
+    expect(turnCommand(codex, "new lines", "thread-1").slice(0, 3)).toEqual(["codex", "exec", "resume"]);
     expect(turnCommand(codex, "new lines", "thread-1").slice(-2)).toEqual(["thread-1", "new lines"]);
     const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
     expect(turnCommand(claude, "new lines", "session-1")).toEqual([
-      "timeout", "1200", "claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--resume", "session-1", "new lines",
+      "claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "--resume", "session-1", "new lines",
     ]);
   });
 
-  it("stops a turn at the run's turn limit, 20 minutes unless the run sets another", () => {
+  it("wraps a turn in a timeout when the run explicitly supplies a limit", () => {
     const codex = { name: "codex-1", driver: "codex" as const, model: null };
     expect(turnCommand(codex, "the goal", null, "live", 2700).slice(0, 3)).toEqual(["timeout", "2700", "codex"]);
     const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
@@ -180,7 +180,7 @@ describe("a turn", () => {
     ]);
     expect(turnCommand(claude, "the goal", null, "off", 1200, null, {}, ["ScheduleWakeup"]).slice(4, 8)).toEqual(["--disallowedTools", "WebSearch", "WebFetch", "ScheduleWakeup"]);
     const codex = { name: "codex-1", driver: "codex" as const, model: null };
-    expect(turnCommand(codex, "the goal", null, "live", 1200, null, {}, ["ScheduleWakeup"])).toEqual(turnCommand(codex, "the goal", null, "live"));
+    expect(turnCommand(codex, "the goal", null, "live", 1200, null, {}, ["ScheduleWakeup"])).toEqual(turnCommand(codex, "the goal", null, "live", 1200));
     expect(parseDisallowedTools(undefined)).toEqual([]);
     expect(parseDisallowedTools("ScheduleWakeup, CronCreate,ScheduleWakeup")).toEqual(["ScheduleWakeup", "CronCreate"]);
     expect(() => parseDisallowedTools(",")).toThrow(/comma-separated list/u);
@@ -195,7 +195,7 @@ describe("a turn", () => {
     const claude = { name: "claude-code-1", driver: "claude-code" as const, model: null };
     // The list of denied tools ends at the next flag, so the prompt stays the prompt.
     expect(turnCommand(claude, "the goal", null, "off")).toEqual([
-      "timeout", "1200", "claude", "-p", "--disallowedTools", "WebSearch", "WebFetch", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "the goal",
+      "claude", "-p", "--disallowedTools", "WebSearch", "WebFetch", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", "the goal",
     ]);
   });
 
@@ -325,6 +325,65 @@ function fakeDocker(answer: (call: DockerCall, command: readonly string[]) => { 
   };
   return { docker, calls };
 }
+
+describe("unlimited turns", () => {
+  it.each(["codex", "claude-code"])("lets %s run without a turn timeout and still interrupts it when the Goal expires", async (driver) => {
+    const out = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents([driver]),
+      workspace: out,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: driver === "codex" ? { kind: "api-key" } : null,
+      claudeAuth: driver === "claude-code" ? "ANTHROPIC_API_KEY" : null,
+    };
+    const modelDriver = driver === "codex" ? "codex" : "claude";
+    let started!: () => void;
+    const modelStarted = new Promise<void>((resolve) => { started = resolve; });
+    let stop!: () => void;
+    const modelStopped = new Promise<void>((resolve) => { stop = resolve; });
+    const { docker, calls } = fakeDocker(async (call, command) => {
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_ModelSeat01" }) };
+      if (command.includes(modelDriver)) {
+        started();
+        await modelStopped;
+        return { code: 137 };
+      }
+      if (call.args[0] === "stop") stop();
+      return {};
+    });
+    const start = Date.parse("2026-10-05T12:00:00.000Z");
+    let tick = start;
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["after 60m"], started_at: new Date(start).toISOString(), ended_by: null };
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) {
+          await modelStarted;
+          tick = start + 3_600_000;
+          return { room: { id: ROOM, state: "open", goal }, memberships: [] };
+        }
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: new Date(tick).toISOString() } } } };
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    const result = await runGoal(client, "sni_owner-seat", OWNER_KEY, {
+      plan, roomId: ROOM, inviteToken: INVITE, goal: "Keep working.", goalSequence: 1,
+      until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true,
+    }, { docker, now: () => new Date(tick), sleep: async () => undefined });
+
+    const turns = calls.filter((call) => call.args[0] === "exec" && call.args.includes(modelDriver));
+    expect(turns).toHaveLength(1);
+    expect(turns[0]!.args).not.toContain("timeout");
+    expect(result.ended_by).toMatchObject({ trigger: "after 60m" });
+    expect(result.agents[0]).toMatchObject({ turns: 1, failed_turns: 0 });
+    expect(calls.find((call) => call.args[0] === "stop")!.args).toEqual(["stop", "--time", "5", ...runContainers(ROOM, plan.agents)]);
+    expect(calls.findIndex((call) => call.args[0] === "stop")).toBeLessThan(calls.findIndex((call) => call.args[0] === "cp"));
+    const wake = JSON.parse((await readFile(join(out, "wakes.ndjson"), "utf8")).trim());
+    expect(wake).toMatchObject({ failed: false, cut_by_end: true, exit_code: 137 });
+    const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
+    expect(episode).toMatchObject({ turn_limit_s: null, harness: { resolved_profile: { turn_limit_s: null } } });
+  });
+});
 
 describe("prepareRun", () => {
   const agents = parseAgents(["codex", "claude-code"]);
@@ -551,8 +610,8 @@ describe("runGoal", () => {
         return { stdout: JSON.stringify({ member_id: name === "codex-1" ? "i_CodexOne01" : "i_CodexTwo02" }) };
       }
       if (command[0] === "sharednet" && command[1] === "open") return { stdout: JSON.stringify({ protocol_version: "rac/1", sequence: (turnsTaken.get(seat!) ?? 0) + 1, digest: "abc", projection: { work: {} }, obligations: `Personal obligation for ${seat}`, events: [] }) };
-      if (command[2] === "codex") {
-        const resumed = command[4] === "resume";
+      if (command[0] === "codex" || command[2] === "codex") {
+        const resumed = command[command.indexOf("codex") + 2] === "resume";
         const turn = (turnsTaken.get(seat!) ?? 0) + 1;
         turnsTaken.set(seat!, turn);
         // A resumed session reports its running total: 300 fresh tokens per turn here.
@@ -757,7 +816,7 @@ describe("runGoal", () => {
     await expect(readFile(join(home, ".codex", "auth.json"))).rejects.toThrow();
     await expect(readFile(join(home, ".config", "sharednet", "rooms", "seat.json"))).rejects.toThrow();
     const episode = JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
-    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", turn_limit_s: 1200, turn_policy: turnPolicy, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
+    expect(episode).toMatchObject({ image: DEFAULT_IMAGE, web_search: "live", turn_limit_s: null, turn_policy: turnPolicy, totals: { tokens: 1_900, cached_tokens: 5_600 }, ended_by: { trigger: "budget 1k tokens" } });
     expect(episode.harness.resolved_profile.turn_policy).toBe(turnPolicy);
     expect(episode.agents).toHaveLength(2);
     if (harnessMode) {
@@ -773,7 +832,7 @@ describe("runGoal", () => {
           task_gate: false,
           message_routing: "broadcast",
           web_search: "live",
-          turn_limit_s: 1200,
+          turn_limit_s: null,
           until: goal.until,
         },
         client_commit: null,
@@ -890,7 +949,7 @@ describe("an isolated run", () => {
     const { docker, calls } = fakeDocker((call, command) => {
       if (call.args[0] === "inspect") return { stdout: "10.9.0.3\n" };
       if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_RunnerSeat1" }) };
-      if (command[2] === "codex") {
+      if (command[0] === "codex" || command[2] === "codex") {
         return { lines: [JSON.stringify({ type: "thread.started", thread_id: "thread-1" }), JSON.stringify({ type: "turn.completed", usage: { input_tokens: 2_000, cached_input_tokens: 0, output_tokens: 100 } })] };
       }
       if (command[0] === "sharednet" && command[1] === "wait") return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [{ kind: "closed" }], messages: [] }) };
@@ -997,7 +1056,7 @@ describe("an image of your own", () => {
     };
     const { docker, calls } = fakeDocker((_call, command) => {
       if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_CodexOne01" }) };
-      if (command[2] === "codex") return { lines: [JSON.stringify({ type: "thread.started", thread_id: "thread-1" }), JSON.stringify({ type: "turn.completed", usage: { input_tokens: 2_000, cached_input_tokens: 0, output_tokens: 100 } })] };
+      if (command[0] === "codex" || command[2] === "codex") return { lines: [JSON.stringify({ type: "thread.started", thread_id: "thread-1" }), JSON.stringify({ type: "turn.completed", usage: { input_tokens: 2_000, cached_input_tokens: 0, output_tokens: 100 } })] };
       if (command[0] === "sharednet" && command[1] === "wait") return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [{ kind: "closed" }], messages: [] }) };
       return {};
     });
