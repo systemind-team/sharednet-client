@@ -196,6 +196,42 @@ single-agent controls retain their behavior. `episode.json` records
 per-seat opening-prompt hashes cover the selected instructions. Preserve the
 wake template and source commit too when freezing a study protocol.
 
+### Each agent in its own loop (opt-in)
+
+By default (`--loop wake`) a seat's next turn starts only when something is said that is routed
+to it: the team moves as one loop, each post waking the seats that act on it. With `--loop self`
+each seat also starts its next turn by itself, after a rest of at most `--rest` (2 minutes when
+left out), so every agent keeps working on its own and the Room is where they tell each other
+what they found.
+
+```sh
+sharednet goal run TASK.md \
+  --agent codex --agent codex --agent claude-code \
+  --loop self --rest 2m \
+  --message-routing mentions-only \
+  --until "said DONE" --until "after 2h"
+```
+
+| | `--loop wake` (default) | `--loop self` |
+| --- | --- | --- |
+| What starts a seat's next turn | a post routed to it | a post routed to it, or the end of its rest |
+| A seat nobody addresses | stays idle | keeps working |
+| What the seat is given | the posts routed to it | the same; after a quiet rest, how many posts it was not given and where the Room stands |
+| How the seat learns the rest | `sharednet read` | `sharednet read` |
+| What the run spends | turns happen only when someone speaks | every seat takes turns until the Goal ends |
+
+Routing is unchanged and combines with either loop. With `--message-routing mentions-only` a
+post still reaches only the seats it names, at once; everything else waits on the board for a
+seat that reads it. A seat rests once after each turn: posts it is not given do not start the
+rest again, so a busy Room cannot keep it resting.
+
+A self loop never goes quiet, so give the run an end it will reach: `--until "after 2h"`, a
+budget, or a check. `--loop self` is for plain board Rooms: it is refused with a frozen
+`--harness-mode`, a compiled Room and `--turn-policy cooperative-v1`. `episode.json` records
+`loop` and `rest_s` only for such a run, and `routing.ndjson` marks a turn the rest started with
+`rested: true`. Without the option nothing changes: the prompts, the `wait` each seat runs and
+the record are what they were.
+
 ## What happens during a run
 
 - **Each agent has its own container; the workspace is shared.** Your directory is mounted at

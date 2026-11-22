@@ -140,6 +140,8 @@ const optionValueNames = new Set([
   "agent-user",
   "model-api",
   "turn-policy",
+  "loop",
+  "rest",
   "message-routing",
   "harness-mode",
   "kickoff",
@@ -638,12 +640,18 @@ export async function sayNextGoal(client: ApiClient, apiKey: string, runnerToken
 }
 
 async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools", "resume-from", "earlier-rooms", "room"]);
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "loop", "rest", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools", "resume-from", "earlier-rooms", "room"]);
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
   const turnPolicy = option(parsed, "turn-policy") ?? "legacy";
   if (turnPolicy !== "legacy" && turnPolicy !== "cooperative-v1") throw localError("invalid_arguments", "--turn-policy is legacy or cooperative-v1.");
   if (namedMode !== undefined && turnPolicy !== "legacy") throw localError("invalid_arguments", "--turn-policy cooperative-v1 cannot override a frozen --harness-mode.");
+  // What starts a seat's next turn: something said to it (wake, as always), or also the end of a rest (self).
+  const loop = option(parsed, "loop") ?? "wake";
+  if (loop !== "wake" && loop !== "self") throw localError("invalid_arguments", "--loop is wake or self.");
+  if (loop === "wake" && parsed.options.has("rest")) throw localError("invalid_arguments", "--rest is the rest between a seat's own turns: it needs --loop self.");
+  if (loop === "self" && (namedMode !== undefined || requestedType === "compiled" || turnPolicy !== "legacy")) throw localError("invalid_arguments", "--loop self is for plain board Rooms: not a frozen --harness-mode, a compiled Room or --turn-policy cooperative-v1.");
+  const restMs = parsed.options.has("rest") ? parseDuration(option(parsed, "rest"), "--rest") : undefined;
   if (namedMode !== undefined && ["mention-gate", "task-gate", "message-routing"].some((name) => parsed.options.has(name))) {
     throw localError("invalid_arguments", "--harness-mode fixes the gate and routing controls; do not combine it with --mention-gate, --task-gate, or --message-routing.");
   }
@@ -684,7 +692,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit <duration>] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--disallow-tools <Tool,Tool>] [--resume-from <record dir> [--earlier-rooms <file>]] [--room <room id>]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit <duration>] [--turn-policy legacy|cooperative-v1] [--loop wake|self [--rest 2m]] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--disallow-tools <Tool,Tool>] [--resume-from <record dir> [--earlier-rooms <file>]] [--room <room id>]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
@@ -855,6 +863,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
           mentionGate,
           taskGate,
           turnPolicy,
+          ...(loop === "self" ? { loop, ...(restMs === undefined ? {} : { restMs }) } : {}),
           ...(messageRouting ? { messageRouting } : {}),
           ...(harnessMode ? { harnessMode } : {}),
           ...(codeProvenance ? { codeProvenance } : {}),

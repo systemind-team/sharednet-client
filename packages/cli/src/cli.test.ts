@@ -385,6 +385,28 @@ describe("reach: forming a group from the account CLI", () => {
     expect(accepted.requests).toEqual([]);
   });
 
+  it("validates the opt-in seat loop before reading a goal or making a request", async () => {
+    for (const [extra, expected] of [
+      [["--loop", "always"], "--loop is wake or self"],
+      [["--rest", "5m"], "it needs --loop self"],
+      [["--loop", "wake", "--rest", "5m"], "it needs --loop self"],
+      [["--loop", "self", "--rest", "soon"], "--rest takes a duration"],
+      [["--loop", "self", "--type", "compiled"], "--loop self is for plain board Rooms"],
+      [["--loop", "self", "--agent", "codex", "--turn-policy", "cooperative-v1"], "--loop self is for plain board Rooms"],
+      [["--loop", "self", "--harness-mode", "research/baseline@1"], "--loop self is for plain board Rooms"],
+    ] as const) {
+      const refused = await harness(["goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", ...extra], []);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr.join(" ")).toContain(expected);
+      expect(refused.requests).toEqual([]);
+    }
+    for (const extra of [["--loop", "self"], ["--loop", "self", "--rest", "5m"], ["--loop", "wake"]]) {
+      const accepted = await harness(["goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", ...extra], []);
+      expect(accepted.stderr.join(" ")).toContain("file that could not be read: missing.md");
+      expect(accepted.requests).toEqual([]);
+    }
+  });
+
   it("validates canonical harness modes before reading the goal or making a request", async () => {
     const malformed = await harness([
       "goal", "run", "missing.md", "--agent", "codex", "--until", "after: 1h", "--harness-mode", "research/baseline",
