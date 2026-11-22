@@ -35,6 +35,9 @@ all seats initially. After that, the routing column decides which seats a Room
 message wakes. Every mode stops at the first configured `--until` condition; a
 `said` claim runs the configured check before the Room closes.
 
+Without `--turn-limit`, these research modes impose no per-turn time limit. An explicit
+duration caps each turn; the Goal's `--until` conditions still end the run.
+
 | Canonical mode | Agent count | Before-post receipt gate | Task claim/done gate | Message routing | Spec SHA-256 |
 | --- | ---: | --- | --- | --- | --- |
 | `research/baseline@1` | explicit run input | off | off | broadcast | `3bced23adad81117a2eb039fe5a284eeab49ad7711e1a2efc4506db553a95514` |
@@ -101,6 +104,9 @@ and the mode's one frozen kickoff. `serve-first` mentions only the coordinator;
 `serve-all` mentions all three agents. Later wakes always come from direct Room
 mentions handled and acknowledged by each seat's listener.
 
+These serve-backed modes retain a 20-minute per-turn limit when `--turn-limit` is omitted.
+An explicit duration changes that limit; the Goal's `--until` conditions still end the run.
+
 ```bash
 sharednet goal run TASK.md \
   --harness-mode runtime/serve-first@1 \
@@ -117,8 +123,8 @@ conditions are not available in that implementation.
 Every `goal run` writes a `harness` object in `episode.json`. Named runs record:
 
 - the canonical mode and spec SHA-256;
-- the fully resolved core profile plus `web_search`, `turn_limit_s`, and every
-  `until` condition;
+- the fully resolved core profile plus `web_search`, `turn_limit_s` (seconds, or
+  `null` for an uncapped runner-owned turn), and every `until` condition;
 - the CLI package version, SHA-256 of its `package.json`, and SHA-256 of the
   executable entry file;
 - a deterministic SHA-256 over the runtime source tree used by that entry;

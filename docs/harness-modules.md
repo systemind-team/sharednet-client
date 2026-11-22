@@ -58,7 +58,8 @@ and staggered starts of the report have no option yet.
   `mentions-only`, a post that names nobody resumes nobody.
 - `--turn-policy cooperative-v1`: every wake ends by asking the seat to finish one bounded piece
   of work, publish it and end its turn, without polling or waiting.
-- `--turn-limit <duration>`: the longest a turn may run.
+- `--turn-limit <duration>`: the longest a turn may run. In runner-owned runs, omit it
+  for no per-turn time limit; the Goal's `--until` conditions still stop the run.
 - New: `--disallow-tools <Tool,Tool>` withholds the named tools from Claude Code seats. Its use
   here is `ScheduleWakeup`: a seat that schedules its own wake stays inside its turn until then,
   and the runner cannot resume a seat that is in a turn. See [goal-mode.md](goal-mode.md).

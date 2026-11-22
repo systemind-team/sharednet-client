@@ -234,8 +234,6 @@ const CONTAINER_WORKSPACE = "/workspace";
 const CONTAINER_HOMES = "/home/agents";
 const CONTAINER_CLI = "/opt/sharednet";
 const CONTAINER_CODEX_AUTH = "/run/codex/auth.json";
-/** A turn that runs longer than this is stopped; the next wake starts the next one. */
-const TURN_LIMIT_SECONDS = 1_200;
 /** A seat whose harness fails this many turns in a row stops taking turns. */
 const FAILED_TURNS_LIMIT = 3;
 
@@ -663,8 +661,8 @@ export interface CodexModel {
 /** The provider Codex is given for a model API other than OpenAI's: Responses over HTTP, keyed from OPENAI_API_KEY. */
 const CODEX_PROVIDER = "goal_api";
 
-export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live", turnLimitSeconds = TURN_LIMIT_SECONDS, codexBase: CodexBase | null = null, model: CodexModel = {}, disallowedTools: readonly string[] = []): string[] {
-  const limit = ["timeout", String(turnLimitSeconds)];
+export function turnCommand(seat: AgentSpec, prompt: string, sessionId: string | null, webSearch: WebSearch = "live", turnLimitSeconds: number | null = null, codexBase: CodexBase | null = null, model: CodexModel = {}, disallowedTools: readonly string[] = []): string[] {
+  const limit = turnLimitSeconds === null ? [] : ["timeout", String(turnLimitSeconds)];
   if (seat.driver === "codex") {
     // Live web search, which Claude Code has by default: a goal is as often research as code.
     const search = webSearch === "live" ? 'web_search="live"' : 'web_search="disabled"';
@@ -831,7 +829,7 @@ export interface GoalRunInput {
   webSearch?: WebSearch;
   /** Claude Code tools the Claude Code seats may not use, such as ScheduleWakeup (a seat that waits inside its turn cannot be woken). */
   disallowedTools?: readonly string[];
-  /** The longest one turn may run; the default is 20 minutes. An experiment may set it to the run's own limit. */
+  /** The longest one turn may run. Omitted, there is no per-turn time limit; Goal end conditions still apply. */
   turnLimitMs?: number;
   /** Opt-in board controls. Mention gates default to targeted wakes unless overridden. */
   mentionGate?: boolean;
@@ -896,7 +894,7 @@ export async function runGoal(
   const sleep = dependencies.sleep ?? ((ms: number) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)));
   const checks = containerName(input.roomId);
   const containers = runContainers(input.roomId, plan.agents);
-  const turnLimitSeconds = Math.round((input.turnLimitMs ?? TURN_LIMIT_SECONDS * 1000) / 1000);
+  const turnLimitSeconds = input.turnLimitMs === undefined ? null : Math.round(input.turnLimitMs / 1000);
   const base = input.baseUrl;
   const user = plan.agentUser ?? AGENT_USER;
   const isolation = plan.isolation ?? null;
