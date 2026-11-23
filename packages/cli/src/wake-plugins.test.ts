@@ -55,6 +55,8 @@ describe("the registry", () => {
     expect(wakePlugins.map((plugin) => plugin.driver)).toEqual(["codex", "claude-code", "codebuddy", "command"]);
     expect(pluginFor("claude-code").label).toBe("Claude Code");
     expect(seatWakeFrom({ CODEX_SESSION_ID: "019a", PATH: "" }, "/w")?.driver).toBe("codex");
+    expect(seatWakeFrom({ CODEX_SESSION_ID: "root-thread", CODEX_THREAD_ID: "child-thread", PATH: "" }, "/w"))
+      .toMatchObject({ driver: "codex", session: "child-thread" });
     expect(seatWakeFrom({ CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "6613", PATH: "" }, "/w")?.driver).toBe("claude-code");
     // An adapter is chosen by a person, never recognised.
     expect(seatWakeFrom({ PATH: "" }, "/w")).toBeNull();

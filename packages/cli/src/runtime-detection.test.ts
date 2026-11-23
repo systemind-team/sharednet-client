@@ -38,14 +38,27 @@ describe("driver detection", () => {
     });
   });
 
-  it("recognises Codex, treats the thread id as lineage only, and names exec as the entrypoint", () => {
+  it("recognises the executing Codex thread and names exec as the entrypoint", () => {
     expect(
       detectRuntime(
         { CODEX_SESSION_ID: "session-a", CODEX_THREAD_ID: "thread", CODEX_CI: "1" },
         noParent,
       ),
-    ).toEqual({ kind: "codex", anchor: "session-a", version: null, entrypoint: "exec", source: "detected" });
-    expect(detectRuntime({ CODEX_THREAD_ID: "thread" }, noParent).kind).toBe("custom");
+    ).toEqual({ kind: "codex", anchor: "thread", version: null, entrypoint: "exec", source: "detected" });
+    expect(detectRuntime({ CODEX_THREAD_ID: "thread" }, noParent)).toMatchObject({ kind: "codex", anchor: "thread" });
+  });
+
+  it.each([undefined, "", " \t "])("falls back to the root session when the thread marker is %j", (thread) => {
+    expect(detectRuntime({ CODEX_SESSION_ID: "legacy-session", CODEX_THREAD_ID: thread }, noParent))
+      .toMatchObject({ kind: "codex", anchor: "legacy-session" });
+  });
+
+  it("trims the executing thread and ignores changing per-call identifiers", () => {
+    const env = { CODEX_SESSION_ID: "root-session", CODEX_THREAD_ID: " child-thread " };
+    for (const call of ["call-one", "call-two"]) {
+      expect(detectRuntime({ ...env, CODEX_TOOL_CALL_ID: call }, noParent))
+        .toMatchObject({ kind: "codex", anchor: "child-thread" });
+    }
   });
 
   it("recognises the other documented drivers by their variable prefixes", () => {
