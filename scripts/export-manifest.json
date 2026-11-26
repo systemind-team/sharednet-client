@@ -747,6 +747,7 @@
     "scripts/check-experiment-protocol.mjs",
     "scripts/check-experiment-protocol.test.mjs",
     "docs/harness-modules.md",
+    "docs/commands.md",
     "packages/cli/src/modules/index.ts",
     "packages/cli/src/modules/information.ts",
     "packages/cli/src/modules/modules.test.ts",
