@@ -1,7 +1,7 @@
 // @vitest-environment node
 
 import { createServer } from "node:net";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -81,6 +81,23 @@ describe("sharednet local", () => {
     expect(await local.exit).toBe(0);
     expect(JSON.parse(local.stdout.at(-1)!)).toEqual({ stopped: true, base_url: local.info.base_url });
     await expect(stat(local.info.env_file)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("holds a goal: the local key speaks as the Room's owner, so goal start sets the goal", async () => {
+    const env = await sandbox();
+    const local = await startLocal(env);
+    const key = /^export SHAREDNET_API_KEY=(snk_[A-Za-z0-9_-]{43})$/m.exec(await readFile(local.info.env_file, "utf8"))![1]!;
+    const owner = { ...env, SHAREDNET_BASE_URL: local.info.base_url, SHAREDNET_API_KEY: key };
+    const goalFile = join(env.HOME!, "TASK.md");
+    await writeFile(goalFile, "Say DONE.\n");
+    const session = await cli(["session", "start", "--new"], owner);
+
+    const started = await cli(["goal", "start", goalFile, "--until", "said: /^DONE$/", "--until", "after: 30m", "--session", session.session_id], owner);
+    expect(started.room.goal).toMatchObject({ until: ["said /^DONE$/", "after 30m"], ended_by: null });
+    expect(started.message.content).toBe("Say DONE.\n");
+
+    local.stop();
+    expect(await local.exit).toBe(0);
   });
 
   it("refuses a port that is already taken", async () => {
