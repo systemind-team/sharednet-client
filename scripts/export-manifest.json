@@ -755,6 +755,7 @@
     "packages/cli/src/modules/topology.ts",
     "packages/cli/src/goal-run-unchanged.test.ts",
     "packages/cli/src/goal-resume.ts",
-    "packages/cli/src/goal-resume.test.ts"
+    "packages/cli/src/goal-resume.test.ts",
+    "docs/your-own-swarm.md"
   ]
 }
