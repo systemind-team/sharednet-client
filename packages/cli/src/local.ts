@@ -69,7 +69,9 @@ export async function runLocalServer(
   dependencies: LocalServerDependencies,
 ): Promise<{ stopped: true; base_url: string }> {
   const apiKey = `snk_${randomBytes(32).toString("base64url")}`;
-  const store = new MemorySharedNetRepository({ devApiKey: apiKey });
+  // The key belongs to an account, as a key issued by the Dashboard does: speaking as a Room's
+  // owner (a goal, a runner line, closing the Room) needs one.
+  const store = new MemorySharedNetRepository({ accounts: [{ authUserId: "local", apiKey }] });
   const server = createSharedNetDevServer(store);
 
   await new Promise<void>((resolve, reject) => {
