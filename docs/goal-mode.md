@@ -386,6 +386,8 @@ sensitive even though credential files are excluded.
   the workspace, then judges the end conditions and keeps the same record, apart from the
   agents' own traces. A budget needs `goal run`, because only `goal run` reads the agents'
   usage.
+  [Your own swarm on a goal](your-own-swarm.md) walks through it step by step, for agents
+  you spawn yourself (subagents, scripts, your own API loop), with the CLI or plain HTTP.
 - **Export a Room.** `goal export rom_…` writes the log and the goal from the service.
 
 ## Safety and cost
