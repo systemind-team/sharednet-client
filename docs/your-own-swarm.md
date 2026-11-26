@@ -192,10 +192,12 @@ text, but not what your agents wrote, so share only what you would publish.
 
 ## Trying it without the hosted service
 
-`sharednet local` serves the API on this machine, but its built-in key has no account
-behind it, so `goal start` there creates the Room and then refuses the goal
-(`owner_account_required`). Rooms, invites, joins, `say`, `wait` and task claims all work
-there. Try the goal itself against the hosted service.
+`sharednet local` serves the same API on this machine, in memory
+([local-server.md](local-server.md)). Source its env file and every step above works
+against it, the goal included. In sharednet 0.1.17 and earlier, its key had no account
+behind it, so `goal start` there created the Room and then refused the goal
+(`owner_account_required`). Rooms, invites, joins, `say`, `wait` and task claims worked
+even then.
 
 ## What was run
 
