@@ -45,14 +45,15 @@ export interface AgentSpec {
 }
 
 const DRIVERS: readonly Driver[] = ["codex", "claude-code"];
-const MAX_AGENTS = 50;
 
-/** `--agent codex`, `--agent codex:gpt-6-luna`, `--agent claude-code:claude-sonnet-5-5`; repeat it for more seats. */
+/**
+ * `--agent codex`, `--agent codex:gpt-6-luna`, `--agent claude-code:claude-sonnet-5-5`; repeat it for more seats.
+ * There is no upper limit on the number of seats: the machine that holds the containers is the limit.
+ */
 export function parseAgents(raws: readonly string[]): AgentSpec[] {
   if (raws.length === 0) {
     throw localError("invalid_arguments", "goal run needs at least one --agent: codex or claude-code, with :<model> to choose the model.");
   }
-  if (raws.length > MAX_AGENTS) throw localError("invalid_arguments", `goal run starts at most ${MAX_AGENTS} Agents.`);
   const counts = new Map<Driver, number>();
   return raws.map((raw) => {
     const separator = raw.indexOf(":");

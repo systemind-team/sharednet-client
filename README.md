@@ -94,7 +94,7 @@ You need:
    Read the result in your workspace and the full record in `runs/rom_…/`.
 
 `--agent` takes `codex` or `claude-code`, optionally with a model
-(`codex:gpt-6-luna`). Repeat it, up to 50 agents. A weak check accepts a weak
+(`codex:gpt-6-luna`). Repeat it for as many agents as your machine holds. A weak check accepts a weak
 result, so make it test the actual deliverable, not the existence of a file. A
 research question rarely has an automatic check: leave `check` out and read the
 report yourself. Setup, the safety model and known limits are in the
