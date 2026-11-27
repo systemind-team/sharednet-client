@@ -151,6 +151,11 @@ export interface GoalWatchOptions {
   ignoreThrough?: number;
   /** Read the Room's state at least this often, to notice an end the service or the owner made. */
   roomCheckMs?: number;
+  /**
+   * `goal run --said-by all`: the seats whose claim counts. A `said` claim then ends the Goal only
+   * while every one of them stands by it. A seat's claim stands until it says something else.
+   */
+  claimsByAll?: string[];
 }
 
 /** The wait the runner sits in, bounded the way the service bounds every wait. */
@@ -305,6 +310,11 @@ export async function goalWatch(
   await mkdir(options.out, { recursive: true });
   const roomLog = join(options.out, "room.ndjson");
   const checkLog = join(options.out, "checks.ndjson");
+  // Under --said-by all: who stands by a claim now, and each change of mind as it is said.
+  const voters = options.claimsByAll ? new Set(options.claimsByAll) : null;
+  const standing = new Set<string>();
+  const claimLog = join(options.out, "claims.ndjson");
+  if (voters) await writeFile(claimLog, "");
   // The Room's log is read again from its start; checks a stopped runner already ran are history and stay.
   await writeFile(roomLog, "");
   const earlierChecks = await readFile(checkLog, "utf8").then((text) => text.split("\n").filter(Boolean).length, () => null);
@@ -456,6 +466,14 @@ export async function goalWatch(
         mentions(item.content, { memberId: goalSpeaker.member_id ?? "", name: goalSpeaker.name ?? null })
       ) {
         end = { trigger: "mention", detail: item.content.slice(0, 500) };
+      } else if (voters) {
+        // Every seat has to stand by the claim. Saying it again renews it; saying anything else withdraws it.
+        if (!voters.has(sender)) continue;
+        const claims = said.some((trigger) => saidIn(item.content, trigger));
+        if (claims) standing.add(sender);
+        else if (!standing.delete(sender)) continue;
+        await appendFile(claimLog, `${JSON.stringify({ at: new Date(lastMessageAt ?? 0).toISOString(), sequence: item.sequence, seat: sender, claim: claims, standing: standing.size, of: voters.size })}\n`);
+        claim = claims && standing.size === voters.size ? item : null;
       } else if (said.some((trigger) => saidIn(item.content, trigger)) && claim === null) {
         claim = item;
       }
@@ -466,7 +484,7 @@ export async function goalWatch(
     if (!end && claim) {
       const claimed = said.find((trigger) => saidIn(claim!.content, trigger))!;
       if (checks.length === 0) {
-        end = { trigger: claimed.label, detail: claim.content.slice(0, 500) };
+        end = { trigger: claimed.label, detail: voters ? `all ${voters.size} agents: ${claim.content.slice(0, 480)}` : claim.content.slice(0, 500) };
       } else {
         for (const check of checks) {
           const result = await evaluate(check, "claim");

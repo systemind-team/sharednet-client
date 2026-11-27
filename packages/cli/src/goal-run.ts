@@ -563,7 +563,7 @@ const COOPERATIVE_TURNS = [
 const COOPERATIVE_REMINDER = "Continue under the cooperative-turn policy: complete one bounded work unit, publish actionable results with sharednet say, then finish your response and end your turn. If blocked, request what you need and yield; do not poll or wait. A handoff is not DONE.";
 
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
-export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules; loop?: SeatLoop; restMs?: number }): string {
+export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; saidBy?: "any" | "all"; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules; loop?: SeatLoop; restMs?: number }): string {
   const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
   const single = input.seats.length === 1;
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
@@ -578,7 +578,11 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
     "</goal>",
     "",
     `The Room ends when the first of these happens: ${input.until.join("; ")}.`,
-    ...(claims.length > 0 ? [`Say ${claims.join(" or ")} in the Room only when you believe the goal is met: saying it runs the check.`] : []),
+    ...(claims.length > 0
+      ? [input.saidBy === "all"
+        ? `Say ${claims.join(" or ")} in the Room only when you believe the goal is met. The Room ends on it only when every agent has said it and stands by it: your claim stands until you say anything else in the Room, and saying it again renews it.`
+        : `Say ${claims.join(" or ")} in the Room only when you believe the goal is met: saying it runs the check.`]
+      : []),
     "",
     single
       ? `You work in this directory (${CONTAINER_WORKSPACE}) in your own container. Use the SharedNet Room to record concise progress and the final completion claim:`
@@ -884,6 +888,11 @@ export interface GoalRunInput {
    */
   loop?: SeatLoop;
   restMs?: number;
+  /**
+   * Whose claim ends the Goal. `any` (left out): the first seat to say a `said` trigger, as before.
+   * `all`: only when every seat has said it and stands by it; a seat withdraws by saying anything else.
+   */
+  saidBy?: "any" | "all";
   /** A canonical treatment selected by --harness-mode. Omission preserves legacy ad-hoc flags. */
   harnessMode?: GoalRunHarnessResolution;
   /** Tests and artifact builders may supply provenance; source runs discover repository and package identity. */
@@ -968,6 +977,9 @@ export async function runGoal(
   if (loop === "wake" && input.restMs !== undefined) throw localError("invalid_arguments", "--rest is the rest between a seat's own turns: it needs --loop self.");
   if (loop === "self" && (input.harnessMode || input.roomType === "compiled" || turnPolicy !== "legacy")) throw localError("invalid_arguments", "--loop self is for plain board Rooms: not a frozen --harness-mode, a compiled Room or --turn-policy cooperative-v1.");
   const restMs = input.restMs ?? DEFAULT_REST_MS;
+  // Whose claim ends the Goal: any one seat's (as always), or only every seat's together.
+  const saidBy = input.saidBy ?? "any";
+  if (saidBy === "all" && !input.until.some((trigger) => trigger.startsWith("said "))) throw localError("invalid_arguments", "--said-by all needs a claim to count: add --until \"said: DONE\".");
   // What the prompts and the controls take: nothing at all for an ordinary run.
   const selfLoop = loop === "self" ? { loop, restMs } : {};
   if (
@@ -1401,7 +1413,7 @@ export async function runGoal(
 
     // Every seat starts once. Subsequent wakes follow the configured routing policy.
     const seatLoop = async (seat: SeatRecord) => {
-      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules, ...selfLoop });
+      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules, ...selfLoop, ...(saidBy === "all" ? { saidBy } : {}) });
       // A seat taken up again resumes its own session with the new goal and what has changed; a seat
       // that starts fresh in such a run gets the whole opening, and is told the swarm has worked before.
       let taken = resume?.seats.get(seat.name) ?? null;
@@ -1495,7 +1507,12 @@ export async function runGoal(
       memberToken,
       apiKey,
       // Under mentions-only an unaddressed line wakes nobody, so a failing check is said to the seat that claimed.
-      { roomId: input.roomId, workspace: plan.workspace, out: input.out, checkEveryMs: input.checkEveryMs, quietChecks: input.quietChecks, ...(messageRouting === "mentions-only" ? { feedbackToClaimant: true } : {}) },
+      {
+        roomId: input.roomId, workspace: plan.workspace, out: input.out, checkEveryMs: input.checkEveryMs, quietChecks: input.quietChecks,
+        ...(messageRouting === "mentions-only" ? { feedbackToClaimant: true } : {}),
+        // Every seat that joined has to stand by the claim; a seat that never joined cannot say it.
+        ...(saidBy === "all" ? { claimsByAll: records.flatMap((seat) => (seat.member_id ? [seat.member_id] : [])) } : {}),
+      },
       {
         now: dependencies.now,
         ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}),
@@ -1577,6 +1594,7 @@ export async function runGoal(
           turn_policy: turnPolicy,
           // Only a run whose seats loop on their own says so: an ordinary run's record is what it was.
           ...(loop === "self" ? { loop, rest_s: Math.round(restMs / 1000) } : {}),
+          ...(saidBy === "all" ? { said_by: saidBy } : {}),
           mention_gate: input.mentionGate ?? false,
           task_gate: input.taskGate ?? false,
           message_routing: messageRouting,

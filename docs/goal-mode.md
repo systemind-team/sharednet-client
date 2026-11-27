@@ -101,6 +101,13 @@ or `budget`.
 | `idle: 10m` | nobody has spoken for 10 minutes | the runner |
 | `budget: 2M tokens` | the agents together have used that many **fresh** tokens: input not served from a cache, plus output. Cached context, read again on every model call, is most of the raw count; it is recorded, not counted. | the runner (`goal run` only) |
 
+`--said-by all` changes whose claim counts: `said: DONE` then ends the Room only when every
+agent has said it and stands by it. An agent's claim stands until it says anything else in the
+Room, and saying it again renews it. Left out (`--said-by any`), the first agent to say it ends
+the Room, as before. Give such a run a hard bound as well (`after`, `budget`): a team that never
+agrees ends on that. `claims.ndjson` records each claim and each withdrawal, and `episode.json`
+records `said_by`. A seat that never joined the Room is not waited for.
+
 `--quiet-checks` stops the runner from posting failing checks into the Room, for an
 experiment that must not intervene.
 
