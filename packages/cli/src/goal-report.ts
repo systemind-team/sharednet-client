@@ -477,7 +477,7 @@ export async function findRecords(path: string, limit = 5000): Promise<string[]>
 
 export interface ReportDelivery {
   to: string;
-  kind: "directory" | "url";
+  kind: "directory" | "url" | "sharednet";
   delivered: number;
 }
 
@@ -485,10 +485,27 @@ export interface ReportDependencies {
   fetch: typeof globalThis.fetch;
   env: Record<string, string | undefined>;
   cwd: string;
+  /**
+   * The SharedNet service this CLI is signed in to, for `--to sharednet`: its origin, and the
+   * account's key, read only when a report is actually sent there.
+   */
+  service?: { baseUrl: string; apiKey(): Promise<string> };
 }
 
-/** `--to` as a place: a URL that takes rows, or a directory that keeps one file a run. */
-export function reportTarget(to: string, cwd: string): { kind: "url"; url: URL } | { kind: "directory"; path: string } {
+export type ReportTarget = { kind: "url"; url: URL } | { kind: "directory"; path: string } | { kind: "sharednet"; board: string | null };
+
+/**
+ * `--to` as a place: `sharednet` (the account's catalogue on the service, or `sharednet:<id>`
+ * for a catalogue it was let into, `sharednet:me` for its own), a URL that takes rows, or a
+ * directory that keeps one file a run.
+ */
+export function reportTarget(to: string, cwd: string): ReportTarget {
+  const named = /^sharednet(?::(.+))?$/.exec(to);
+  if (named) {
+    const board = named[1] ?? null;
+    if (board !== null && !/^[A-Za-z0-9_.@-]{1,200}$/.test(board)) throw localError("invalid_arguments", "--to sharednet:<catalogue> names a catalogue by its id, or `me` for your own.");
+    return { kind: "sharednet", board };
+  }
   if (/^https?:\/\//i.test(to)) {
     let url: URL;
     try {
@@ -521,6 +538,7 @@ export async function deliverReport(rows: readonly ReportRow[], to: string, depe
     }
     return { to: target.path, kind: "directory", delivered: rows.length };
   }
+  if (target.kind === "sharednet") return deliverToService(rows, target.board, dependencies);
   const token = dependencies.env.SHAREDNET_REPORT_TOKEN;
   let delivered = 0;
   for (let start = 0; start < rows.length; start += 50) {
@@ -540,6 +558,83 @@ export async function deliverReport(rows: readonly ReportRow[], to: string, depe
     delivered += batch.length;
   }
   return { to: `${target.url.origin}${target.url.pathname}`, kind: "url", delivered };
+}
+
+/**
+ * Rows to the SharedNet service's catalogue (`POST /api/scaling/runs`), as the account, by its
+ * own key: the one place a report goes with that key, because it is the service the key is for.
+ * A row with no trace link gets the Room's own address there. Batches stay under what one
+ * request may carry; a refusal says how far it got and what the service said.
+ */
+async function deliverToService(rows: readonly ReportRow[], board: string | null, dependencies: ReportDependencies): Promise<ReportDelivery> {
+  const service = dependencies.service;
+  if (!service) throw localError("invalid_arguments", "--to sharednet needs the SharedNet service this CLI signs in to.");
+  const key = await service.apiKey();
+  const sent = rows.map((row) => (row.trace.url ? row : { ...row, trace: { ...row.trace, url: `${service.baseUrl}/chat?room=${encodeURIComponent(row.room_id)}`, url_kind: "room" } }));
+  const batches: ReportRow[][] = [];
+  let bytes = 0;
+  for (const row of sent) {
+    const size = Buffer.byteLength(JSON.stringify(row), "utf8");
+    const last = batches[batches.length - 1];
+    if (!last || last.length >= 50 || bytes + size > 2_500_000) {
+      batches.push([row]);
+      bytes = size;
+    } else {
+      last.push(row);
+      bytes += size;
+    }
+  }
+  let delivered = 0;
+  let catalogue = board;
+  for (const batch of batches) {
+    let response: Response;
+    try {
+      response = await dependencies.fetch(`${service.baseUrl}/api/scaling/runs`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+        body: JSON.stringify({ schema: REPORT_SCHEMA, rows: batch, ...(board === null ? {} : { board }) }),
+        signal: AbortSignal.timeout(60_000),
+      });
+    } catch {
+      throw new CliError("report_not_delivered", `SharedNet did not answer; ${delivered} of ${rows.length} rows were delivered.`, 5);
+    }
+    const answer = (await response.json().catch(() => null)) as { board?: unknown; error?: { message?: unknown } } | null;
+    if (!response.ok) {
+      const said = typeof answer?.error?.message === "string" ? ` ${answer.error.message}` : "";
+      throw new CliError("report_not_delivered", `SharedNet answered ${response.status};${said} ${delivered} of ${rows.length} rows were delivered.`.replace(";  ", "; "), response.status === 401 || response.status === 403 ? 3 : 5);
+    }
+    if (typeof answer?.board === "string") catalogue = answer.board;
+    delivered += batch.length;
+  }
+  return { to: `sharednet${catalogue ? `:${catalogue}` : ""}`, kind: "sharednet", delivered };
+}
+
+/**
+ * Rows somebody already made: a JSON file holding one row, an array of rows or `{rows: [...]}`,
+ * or a directory of such files (what `--to <dir>` writes). Lets a folder that collected reports on
+ * a machine with no route to the service be handed on from one that has.
+ */
+export async function readRows(path: string): Promise<ReportRow[]> {
+  const files: string[] = [];
+  const entry = await stat(path).catch(() => null);
+  if (!entry) throw localError("invalid_arguments", `--rows ${path} is not a file or a directory.`);
+  if (entry.isDirectory()) {
+    for (const name of (await readdir(path)).sort()) if (name.endsWith(".json") && !name.startsWith(".")) files.push(join(path, name));
+  } else {
+    files.push(path);
+  }
+  const rows: ReportRow[] = [];
+  for (const file of files) {
+    const value = await readJson(file);
+    const found = Array.isArray(value) ? value : record(value) && Array.isArray(value.rows) ? value.rows : [value];
+    for (const row of found) {
+      if (!record(row) || row.schema !== REPORT_SCHEMA || !text(row.room_id) || !record(row.metrics) || !record(row.config) || !record(row.performance)) {
+        throw localError("invalid_arguments", `${file} holds something that is not a row \`goal report\` makes (schema ${REPORT_SCHEMA}).`);
+      }
+      rows.push({ ...(row as ReportRow), trace: record(row.trace) ? row.trace : { url: null, local_path: null, notes: null }, per_agent: Array.isArray(row.per_agent) ? (row.per_agent as Json[]) : [], tags: Array.isArray(row.tags) ? (row.tags as string[]) : [], goal_seq: count(row.goal_seq), id: text(row.id) ?? (row.room_id as string) });
+    }
+  }
+  return rows;
 }
 
 /** `--score "<name>=<number>"`. */

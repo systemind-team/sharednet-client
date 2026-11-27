@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { runCli } from "./cli.ts";
-import { cleanReportText, deliverReport, findRecords, launchArguments, launchCommandLine, parseReportScore, reportOutcome, reportRow, reportTarget } from "./goal-report.ts";
+import { cleanReportText, deliverReport, findRecords, launchArguments, launchCommandLine, parseReportScore, readRows, reportOutcome, reportRow, reportTarget } from "./goal-report.ts";
 
 const ROOM = "rom_AbCdEfGhIj";
 /** Visibly made up, in the shapes the real ones have. */
@@ -261,6 +261,58 @@ describe("where the rows go", () => {
     await expect(deliverReport([row], "https://scaling.example/api/runs", { fetch: refusing, env: {}, cwd: root })).rejects.toMatchObject({ code: "report_not_delivered", message: "https://scaling.example answered 403; 0 of 1 rows were delivered." });
   });
 
+  it("sends rows to the SharedNet service's catalogue by the account's own key, in batches, with the Room's address as the trace", async () => {
+    const root = await temporary();
+    const rows = [];
+    for (let index = 0; index < 60; index += 1) {
+      await writeRecord(join(root, `r${index}`), { room_id: `rom_${String(index).padStart(10, "0")}` });
+      rows.push((await reportRow(join(root, `r${index}`)))!);
+    }
+    const requests: Array<{ url: string; headers: Record<string, string>; body: any }> = [];
+    let keyReads = 0;
+    const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(input), headers: init?.headers as Record<string, string>, body: JSON.parse(String(init?.body)) });
+      return Response.json({ board: "user_team", saved: 1 });
+    }) as typeof globalThis.fetch;
+    const service = { baseUrl: "https://www.sharednet.ai", apiKey: async () => { keyReads += 1; return FAKE_OWNER_KEY; } };
+    const delivery = await deliverReport(rows, "sharednet", { fetch, env: { SHAREDNET_REPORT_TOKEN: "report-token-synthetic" }, cwd: root, service });
+    // The service says which catalogue took them; with none named, that is the one this account may add to.
+    expect(delivery).toEqual({ to: "sharednet:user_team", kind: "sharednet", delivered: 60 });
+    expect(requests.map((request) => [request.url, request.body.rows.length, request.body.board])).toEqual([["https://www.sharednet.ai/api/scaling/runs", 50, undefined], ["https://www.sharednet.ai/api/scaling/runs", 10, undefined]]);
+    expect(requests[0]!.headers).toEqual({ "content-type": "application/json", authorization: `Bearer ${FAKE_OWNER_KEY}` });
+    expect(JSON.stringify(requests)).not.toContain("report-token-synthetic");
+    expect(keyReads).toBe(1);
+    expect(requests[0]!.body.rows[0].trace).toMatchObject({ url: "https://www.sharednet.ai/chat?room=rom_0000000000", url_kind: "room" });
+    // A named catalogue is asked for; a trace link somebody set is left alone.
+    const one = { ...rows[0]!, trace: { ...rows[0]!.trace, url: "https://traces.example/1" } };
+    await deliverReport([one], "sharednet:me", { fetch, env: {}, cwd: root, service });
+    expect(requests.at(-1)!.body).toMatchObject({ board: "me", rows: [{ trace: { url: "https://traces.example/1" } }] });
+    // A refusal carries what the service said, and how far the report got.
+    const refusing = (async () => Response.json({ error: { code: "read_only", message: "This catalogue is shared with you to read. Ask its owner to let you add runs." } }, { status: 403 })) as unknown as typeof globalThis.fetch;
+    await expect(deliverReport([one], "sharednet:user_other", { fetch: refusing, env: {}, cwd: root, service })).rejects.toMatchObject({ code: "report_not_delivered", exitCode: 3, message: "SharedNet answered 403; This catalogue is shared with you to read. Ask its owner to let you add runs. 0 of 1 rows were delivered." });
+    expect(reportTarget("sharednet", "/tmp")).toEqual({ kind: "sharednet", board: null });
+    expect(reportTarget("sharednet:me", "/tmp")).toEqual({ kind: "sharednet", board: "me" });
+    expect(() => reportTarget("sharednet:../x y", "/tmp")).toThrow(/names a catalogue by its id/);
+    // A folder called sharednet is still a folder when it is written as a path.
+    expect(reportTarget("./sharednet", "/srv")).toEqual({ kind: "directory", path: "/srv/sharednet" });
+  });
+
+  it("reads rows that were already made, from a file or a folder of them, and refuses what is not one", async () => {
+    const root = await temporary();
+    await writeRecord(join(root, "one"));
+    await writeRecord(join(root, "two"), { room_id: "rom_ZyXwVuTsRq" });
+    const rows = [(await reportRow(join(root, "one")))!, (await reportRow(join(root, "two")))!];
+    await deliverReport(rows, "inbox", { fetch: (async () => { throw new Error("no request"); }) as unknown as typeof globalThis.fetch, env: {}, cwd: root });
+    expect((await readRows(join(root, "inbox"))).map((row) => row.id).sort()).toEqual([ROOM, "rom_ZyXwVuTsRq"].sort());
+    await writeFile(join(root, "all.json"), JSON.stringify({ rows }));
+    expect(await readRows(join(root, "all.json"))).toHaveLength(2);
+    await writeFile(join(root, "array.json"), JSON.stringify(rows));
+    expect(await readRows(join(root, "array.json"))).toHaveLength(2);
+    await writeFile(join(root, "bad.json"), JSON.stringify([{ schema: 1, room_id: ROOM }]));
+    await expect(readRows(join(root, "bad.json"))).rejects.toThrow(/not a row/);
+    await expect(readRows(join(root, "missing.json"))).rejects.toThrow(/not a file or a directory/);
+  });
+
   it("refuses a place that would send a report in the clear or carry a password", () => {
     expect(() => reportTarget("http://scaling.example/runs", "/tmp")).toThrow(/https, or http on this machine only/);
     expect(() => reportTarget("https://ada:secret@scaling.example/runs", "/tmp")).toThrow(/SHAREDNET_REPORT_TOKEN/);
@@ -322,6 +374,32 @@ describe("goal report on the command line", () => {
     await writeRecord(join(root, "runs", "b"), { room_id: "rom_ZyXwVuTsRq" });
     const two = await cli(["goal", "report", "runs", "--score", "x=1"], root);
     expect(two.stderr).toContain("--score belongs to one run");
+  });
+
+  it("reports to the service with --to sharednet by the key in the environment, and hands on rows with --rows", async () => {
+    const root = await temporary();
+    await writeRecord(join(root, "runs", "a"));
+    const requests: Array<{ url: string; auth: string | undefined; rows: number }> = [];
+    const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(input), auth: (init?.headers as Record<string, string>).authorization, rows: JSON.parse(String(init?.body)).rows.length });
+      return Response.json({ board: "user_ann", saved: 1 });
+    }) as typeof globalThis.fetch;
+    const env = { SHAREDNET_BASE_URL: "http://127.0.0.1:3001", SHAREDNET_API_KEY: FAKE_OWNER_KEY };
+    const sent = await cli(["goal", "report", "runs/a", "--to", "sharednet", "--json"], root, env, fetch);
+    expect(sent.exitCode).toBe(0);
+    expect(JSON.parse(sent.stdout)).toEqual({ reported: 1, to: "sharednet:user_ann", rooms: [ROOM] });
+    expect(requests).toEqual([{ url: "http://127.0.0.1:3001/api/scaling/runs", auth: `Bearer ${FAKE_OWNER_KEY}`, rows: 1 }]);
+    expect(sent.stdout + sent.stderr).not.toContain(FAKE_OWNER_KEY);
+    // A folder that collected rows elsewhere is handed on whole.
+    await cli(["goal", "report", "runs/a", "--to", "inbox", "--json"], root);
+    const handed = await cli(["goal", "report", "--rows", "inbox", "--to", "sharednet:me", "--json"], root, env, fetch);
+    expect(JSON.parse(handed.stdout)).toMatchObject({ reported: 1, rooms: [ROOM] });
+    expect((await cli(["goal", "report", "--rows", "inbox"], root)).stderr).toContain("say where with --to");
+    // Without a key there is nothing to send with, and nothing is sent.
+    const before = requests.length;
+    const signedOut = await cli(["goal", "report", "runs/a", "--to", "sharednet", "--json"], root, { SHAREDNET_BASE_URL: "http://127.0.0.1:3001" }, fetch);
+    expect(signedOut.exitCode).not.toBe(0);
+    expect(requests.length).toBe(before);
   });
 
   it("refuses --report on goal run before anything is sent when the place cannot be used", async () => {

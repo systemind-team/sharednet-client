@@ -390,21 +390,30 @@ record and hands it over:
 # print the rows of every record under runs/
 npx sharednet goal report runs/
 
-# hand one record's row to a folder that collects them, with the score you measured afterwards
-npx sharednet goal report runs/rom_AbCdEfGhIj --to /srv/scaling/inbox \
-  --experiment widget-scaling --tag pilot --score "hidden tests passed=0.22"
+# add every run under runs/ to your catalogue on SharedNet (the Scaling page, /scaling)
+npx sharednet goal report runs/ --to sharednet --experiment widget-scaling
+
+# one run, with the score you measured afterwards
+npx sharednet goal report runs/rom_AbCdEfGhIj --to sharednet --score "hidden tests passed=0.22"
 
 # or let every run report itself when it ends
 npx sharednet goal run TASK.md --agent codex --agent codex --until "after: 1h" \
-  --report /srv/scaling/inbox --experiment widget-scaling
-export SHAREDNET_REPORT_TO=/srv/scaling/inbox   # the same, for every goal run on this machine
+  --report sharednet --experiment widget-scaling
+export SHAREDNET_REPORT_TO=sharednet   # the same, for every goal run on this machine
 ```
 
-- **`--to` and `--report` name a place you run:** a directory, which gets one `<room id>.json`
-  a run (the next goal of the same Room is `<room id>@<message number>.json`), or an `https`
-  URL, which gets `POST {"schema": 2, "rows": [...]}`. A URL is sent `SHAREDNET_REPORT_TOKEN`
-  as its bearer token when that is set. Your SharedNet key is never sent: the place is yours,
-  not the service. Plain `http` is taken for this machine only.
+- **`--to sharednet` is your catalogue on the service** (`POST /api/scaling/runs`, by your
+  account's key, the service the key is for). It opens at `/scaling`, to you and to the
+  accounts you open it to there. If someone let you add to their catalogue and it is the only
+  one, your runs go there with no setting; `--to sharednet:me` always means your own, and
+  `--to sharednet:<id>` names another. A run reported again has its numbers refreshed; a
+  title, trace link or score typed on the page stays.
+- **`--to` and `--report` also take a place you run:** a directory, which gets one
+  `<room id>.json` a run (the next goal of the same Room is `<room id>@<message number>.json`),
+  or an `https` URL, which gets `POST {"schema": 2, "rows": [...]}`. A URL is sent
+  `SHAREDNET_REPORT_TOKEN` as its bearer token when that is set, and never your SharedNet
+  key: that place is yours, not the service. Plain `http` is taken for this machine only.
+  `goal report --rows <file or dir> --to sharednet` hands on rows such a folder collected.
 - **What is in a row:** how the run was launched (the command from `episode.json` → `launch`,
   or from a launcher's own `launch.json`, else rebuilt from the record and marked so), the
   agents and their models, the end conditions, how it ended, and what was measured: duration,
@@ -416,8 +425,8 @@ export SHAREDNET_REPORT_TO=/srv/scaling/inbox   # the same, for every goal run o
   opened. Absolute paths are cut to their last two folders, anything shaped like a key is
   replaced, account and seat names are dropped from the command, and the message that matched
   a `said` condition is left out unless it is a bare marker such as `DONE`.
-- **It reads local files only.** No sign-in, no Room, and it works on any record, finished
-  days ago or just now. A report that cannot be delivered after `goal run` is said on stderr
+- **Making a row reads local files only.** No sign-in, no Room, and it works on any record,
+  finished days ago or just now; nothing is sent anywhere without `--to` or `--report`. A report that cannot be delivered after `goal run` is said on stderr
   and does not change how the run ended; the result gets `report: {to, delivered}`.
 
 ## Other ways to use it

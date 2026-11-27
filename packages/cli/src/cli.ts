@@ -10,7 +10,7 @@ import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner, type GuestDependencies } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
-import { deliverReport, findRecords, launchArguments, parseReportScore, reportRow, reportTarget, type ReportDelivery, type ReportRow } from "./goal-report.ts";
+import { deliverReport, findRecords, launchArguments, parseReportScore, readRows, reportRow, reportTarget, type ReportDelivery, type ReportDependencies, type ReportRow } from "./goal-report.ts";
 import { readResumeSource } from "./goal-resume.ts";
 import { REASONING_EFFORTS, cliPackage, codexApi, discoverCodeProvenance, dockerRunner, isolationNames, parseAgents, parseDisallowedTools, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner, type ReasoningEffort } from "./goal-run.ts";
 import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, type ServeKickoff } from "./goal-serve-demo.ts";
@@ -164,6 +164,7 @@ const optionValueNames = new Set([
   "experiment",
   "tag",
   "score",
+  "rows",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate", "activity-view"]);
 
@@ -579,7 +580,7 @@ async function goalCommand(
     return roomCommand("create", [...args, "--goal", parsed.positionals[0]!, ...(option(parsed, "name") ? [] : ["--name", basename(parsed.positionals[0]!)])], globals, dependencies);
   }
   const usage =
-    "Use goal start <goal file> [--type board|compiled] --until <trigger>, goal run <goal file> [--type board|compiled] --agent codex[:model] --until <trigger> [...], goal serve-demo <goal file> --kickoff first|all --until <trigger> [...], goal watch <rom_…> [--workspace <dir>] [--out <dir>] [--check-every 1m] [--quiet-checks], goal export <rom_…> [--out <dir>], or goal report <record dir>... [--to <dir or https URL>] [--experiment <name>] [--tag <a,b>] [--score <name>=<number>].";
+    "Use goal start <goal file> [--type board|compiled] --until <trigger>, goal run <goal file> [--type board|compiled] --agent codex[:model] --until <trigger> [...], goal serve-demo <goal file> --kickoff first|all --until <trigger> [...], goal watch <rom_…> [--workspace <dir>] [--out <dir>] [--check-every 1m] [--quiet-checks], goal export <rom_…> [--out <dir>], or goal report <record dir>... [--to sharednet | <dir> | <https URL>] [--experiment <name>] [--tag <a,b>] [--score <name>=<number>].";
   const roomId = parsed.positionals[0];
   if ((action !== "watch" && action !== "export") || parsed.positionals.length !== 1 || !/^rom_[0-9A-Za-z]{10}$/.test(roomId ?? "")) {
     throw localError("unknown_command", usage);
@@ -620,15 +621,31 @@ async function goalCommand(
   );
 }
 
+/** What a report needs to reach a place: the service this CLI signs in to is read only for `--to sharednet`. */
+function reportDependencies(dependencies: ResolvedDependencies): ReportDependencies {
+  return {
+    fetch: dependencies.fetch,
+    env: dependencies.env,
+    cwd: dependencies.cwd,
+    service: {
+      baseUrl: resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL),
+      apiKey: () => resolveApiKey(dependencies.env, getStoragePaths(dependencies.env), resolveBaseUrl(dependencies.env.SHAREDNET_BASE_URL)),
+    },
+  };
+}
+
 /**
  * `goal report <record dir>…`: each record as one row of numbers and settings (goal-report.ts),
- * printed, or with `--to` handed to a directory or a URL that collects runs. A directory that is
- * not itself a record is searched for records. It reads local files only: no sign-in, no Room.
+ * printed, or with `--to` handed on: to `sharednet` (the account's catalogue on the service, by
+ * its key), to a directory, or to a URL. A directory that is not itself a record is searched for
+ * records. `--rows <file or dir>` hands on rows that were already made. Making a row reads local
+ * files only; nothing is sent anywhere without `--to`.
  */
 async function goalReportCommand(parsed: ParsedArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["to", "experiment", "tag", "score"]);
-  if (parsed.positionals.length === 0) {
-    throw localError("invalid_arguments", 'Usage: sharednet goal report <record dir>... [--to <dir or https URL>] [--experiment <name>] [--tag <a,b>] [--score "<name>=<number>"]');
+  assertOnlyOptions(parsed, ["to", "experiment", "tag", "score", "rows"]);
+  const made = option(parsed, "rows");
+  if (parsed.positionals.length === 0 && made === undefined) {
+    throw localError("invalid_arguments", 'Usage: sharednet goal report <record dir>... [--to sharednet | <dir> | <https URL>] [--experiment <name>] [--tag <a,b>] [--score "<name>=<number>"], or goal report --rows <file or dir> --to <place>');
   }
   const to = option(parsed, "to");
   if (to !== undefined) reportTarget(to, dependencies.cwd);
@@ -648,8 +665,12 @@ async function goalReportCommand(parsed: ParsedArguments, dependencies: Resolved
     const row = await reportRow(directory, { ...(experiment === undefined ? {} : { experiment }), tags, ...(score ? { score } : {}), now: dependencies.now });
     if (row) rows.push(row);
   }
+  if (made !== undefined) {
+    if (to === undefined) throw localError("invalid_arguments", "--rows hands on rows that were already made; say where with --to.");
+    rows.push(...(await readRows(resolvePathFrom(dependencies.cwd, made))));
+  }
   if (to === undefined) return { schema: rows[0]?.schema ?? 2, rows };
-  const delivery = await deliverReport(rows, to, { fetch: dependencies.fetch, env: dependencies.env, cwd: dependencies.cwd });
+  const delivery = await deliverReport(rows, to, reportDependencies(dependencies));
   return { reported: delivery.delivered, to: delivery.to, rooms: rows.map((row) => row.id) };
 }
 
@@ -662,7 +683,7 @@ async function reportFinishedRun(record: string, to: string, experiment: string 
   try {
     const row = await reportRow(record, { ...(experiment === undefined ? {} : { experiment }), now: dependencies.now });
     if (!row) throw localError("report_not_delivered", "the record holds no episode.json");
-    const delivery = await deliverReport([row], to, { fetch: dependencies.fetch, env: dependencies.env, cwd: dependencies.cwd });
+    const delivery = await deliverReport([row], to, reportDependencies(dependencies));
     dependencies.stderr(`goal: reported ${row.id} to ${delivery.to}\n`);
     return delivery;
   } catch (error) {
@@ -747,7 +768,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit <duration>] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--disallow-tools <Tool,Tool>] [--resume-from <record dir> [--earlier-rooms <file>]] [--room <room id>] [--report <dir or https URL> [--experiment <name>]]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit <duration>] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--disallow-tools <Tool,Tool>] [--resume-from <record dir> [--earlier-rooms <file>]] [--room <room id>] [--report sharednet|<dir>|<https URL> [--experiment <name>]]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
