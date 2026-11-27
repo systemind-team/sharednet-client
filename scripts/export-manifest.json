@@ -756,6 +756,8 @@
     "packages/cli/src/goal-run-unchanged.test.ts",
     "packages/cli/src/goal-resume.ts",
     "packages/cli/src/goal-resume.test.ts",
-    "docs/your-own-swarm.md"
+    "docs/your-own-swarm.md",
+    "packages/cli/src/goal-report.ts",
+    "packages/cli/src/goal-report.test.ts"
   ]
 }
