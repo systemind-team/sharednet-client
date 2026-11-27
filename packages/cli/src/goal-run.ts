@@ -851,6 +851,11 @@ export interface GoalRunInput {
    * goal run writes the earlier Room's messages into the workspace itself.
    */
   resume?: { source: ResumeSource; earlierRooms: string | null };
+  /**
+   * The arguments this run was launched with, as the command line gave them (cli.ts). The record
+   * keeps them, so that a run can later be read for how it was started. Left out, nothing is written.
+   */
+  launch?: { argv: string[] };
 }
 
 export interface GoalRunDependencies {
@@ -1549,6 +1554,8 @@ export async function runGoal(
           totals: { ...(episode.totals as object), tokens: spend(), cached_tokens: records.reduce((sum, seat) => sum + seat.usage.cached, 0) },
           // Only a run that was asked to resume a swarm says so: which seats were taken up again, and why the others were not.
           ...(resumeRecord ? { resume: resumeRecord } : {}),
+          // How the run was launched, when the command line handed it over.
+          ...(input.launch ? { launch: { argv: input.launch.argv } } : {}),
         },
         null,
         2,

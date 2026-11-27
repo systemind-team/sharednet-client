@@ -377,7 +377,48 @@ sensitive even though credential files are excluded.
 | `agents/<seat>/turn-NNN.jsonl` | each turn's raw stream from the harness |
 | `agents/<seat>/home/` | the agent's own session files: Codex in `.codex/sessions/`, Claude Code in `.claude/projects/` |
 | `episode.json` → `resume` | only with `--resume-from`: which seats were taken up again in their own sessions, and why each other seat started fresh |
+| `episode.json` → `launch` | the arguments `goal run` was launched with, as given (a URL loses its name, password and query); the session and the key are never arguments |
 | `gateway/` | with `--isolate`: the gateway's access logs, `sharednet.log` and one per model API, each request with the container address it came from |
+
+## Report a run: one row for a table of runs (`goal report`, `--report`)
+
+A record is a folder on one machine. To compare runs (agents, tokens and time against how
+each one ended) you want one row a run in one place. `goal report` makes that row from a
+record and hands it over:
+
+```bash
+# print the rows of every record under runs/
+npx sharednet goal report runs/
+
+# hand one record's row to a folder that collects them, with the score you measured afterwards
+npx sharednet goal report runs/rom_AbCdEfGhIj --to /srv/scaling/inbox \
+  --experiment widget-scaling --tag pilot --score "hidden tests passed=0.22"
+
+# or let every run report itself when it ends
+npx sharednet goal run TASK.md --agent codex --agent codex --until "after: 1h" \
+  --report /srv/scaling/inbox --experiment widget-scaling
+export SHAREDNET_REPORT_TO=/srv/scaling/inbox   # the same, for every goal run on this machine
+```
+
+- **`--to` and `--report` name a place you run:** a directory, which gets one `<room id>.json`
+  a run (the next goal of the same Room is `<room id>@<message number>.json`), or an `https`
+  URL, which gets `POST {"schema": 2, "rows": [...]}`. A URL is sent `SHAREDNET_REPORT_TOKEN`
+  as its bearer token when that is set. Your SharedNet key is never sent: the place is yours,
+  not the service. Plain `http` is taken for this machine only.
+- **What is in a row:** how the run was launched (the command from `episode.json` → `launch`,
+  or from a launcher's own `launch.json`, else rebuilt from the record and marked so), the
+  agents and their models, the end conditions, how it ended, and what was measured: duration,
+  fresh and cached tokens, tokens per agent and per minute, turns, the time agents spent in
+  turns, messages, checks and the time to the first check that passed, and each seat's tokens.
+  A `score.json` beside the record (`pass_fraction` or `total_score`) and `--score` fill in the
+  score; how a run ended is not a score.
+- **What never is:** messages, turn streams, the workspace and the agents' homes are not
+  opened. Absolute paths are cut to their last two folders, anything shaped like a key is
+  replaced, account and seat names are dropped from the command, and the message that matched
+  a `said` condition is left out unless it is a bare marker such as `DONE`.
+- **It reads local files only.** No sign-in, no Room, and it works on any record, finished
+  days ago or just now. A report that cannot be delivered after `goal run` is said on stderr
+  and does not change how the run ended; the result gets `report: {to, delivered}`.
 
 ## Other ways to use it
 

@@ -1255,6 +1255,7 @@ describe("module slots in a run", () => {
         plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, messageRouting: "mentions-only",
         modules: { taskJudge: "lexical", activityView: true, topology: { kind: "islands", count: 2 }, messageSchema: "sbar", probe: { command: "python3 probe.py", everyMs: 60_000 } },
         disallowedTools: ["ScheduleWakeup"],
+        launch: { argv: ["goal", "run", "TASK.md", "--agent", "claude-code", "--agent", "claude-code", "--topology", "islands:2", "--until", "after: 1h"] },
       },
       { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
     );
@@ -1272,6 +1273,8 @@ describe("module slots in a run", () => {
     expect(turns[0]!.args.slice(turns[0]!.args.indexOf("--disallowedTools"), turns[0]!.args.indexOf("--disallowedTools") + 2)).toEqual(["--disallowedTools", "ScheduleWakeup"]);
     expect(posts).toContainEqual({ content: "@all [probe] 2 differences: -buildconf exits 1", as: "runner" });
     expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).disallowed_tools).toEqual(["ScheduleWakeup"]);
+    // The record keeps how the run was launched, when the command line handed it over.
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).launch).toEqual({ argv: ["goal", "run", "TASK.md", "--agent", "claude-code", "--agent", "claude-code", "--topology", "islands:2", "--until", "after: 1h"] });
     expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8")).modules).toEqual({ state: { task_judge: "lexical", activity_view: true }, topology: "islands:2", protocol: "sbar", information: { probe: "python3 probe.py", every_ms: 60_000 } });
   });
 });

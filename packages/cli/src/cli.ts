@@ -10,6 +10,7 @@ import { CliError, asCliError, localError } from "./errors.ts";
 import { READ_OPTIONS, isGuestVerb, messageQueryFrom, runGuestVerb, type CommandRunner, type GuestDependencies } from "./guest.ts";
 import { login } from "./login.ts";
 import { goalExport, goalWatch, parseUntilList, readGoalFile, startGoal, withRequestLimit } from "./goal.ts";
+import { deliverReport, findRecords, launchArguments, parseReportScore, reportRow, reportTarget, type ReportDelivery, type ReportRow } from "./goal-report.ts";
 import { readResumeSource } from "./goal-resume.ts";
 import { REASONING_EFFORTS, cliPackage, codexApi, discoverCodeProvenance, dockerRunner, isolationNames, parseAgents, parseDisallowedTools, prepareRun, runContainers, runGoal, type CodeProvenance, type DockerRunner, type ReasoningEffort } from "./goal-run.ts";
 import { assertServeDemoGoalUnaddressed, parseServeDemoAgents, runServeGoalDemo, type ServeKickoff } from "./goal-serve-demo.ts";
@@ -158,6 +159,11 @@ const optionValueNames = new Set([
   "resume-from",
   "earlier-rooms",
   "room",
+  "report",
+  "to",
+  "experiment",
+  "tag",
+  "score",
 ]);
 const booleanOptionNames = new Set(["new", "private", "quiet-checks", "mention-gate", "task-gate", "isolate", "activity-view"]);
 
@@ -561,7 +567,8 @@ async function goalCommand(
   dependencies: ResolvedDependencies,
 ): Promise<unknown> {
   const parsed = parseArguments(commandArgs);
-  if (action === "run") return goalRunCommand(parsed, globals, dependencies);
+  if (action === "run") return goalRunCommand(parsed, globals, dependencies, ["goal", "run", ...commandArgs]);
+  if (action === "report") return goalReportCommand(parsed, dependencies);
   if (action === "serve-demo") return goalServeDemoCommand(parsed, globals, dependencies);
   if (action === "start") {
     assertOnlyOptions(parsed, ["name", "description", "with", "until", "type"]);
@@ -572,7 +579,7 @@ async function goalCommand(
     return roomCommand("create", [...args, "--goal", parsed.positionals[0]!, ...(option(parsed, "name") ? [] : ["--name", basename(parsed.positionals[0]!)])], globals, dependencies);
   }
   const usage =
-    "Use goal start <goal file> [--type board|compiled] --until <trigger>, goal run <goal file> [--type board|compiled] --agent codex[:model] --until <trigger> [...], goal serve-demo <goal file> --kickoff first|all --until <trigger> [...], goal watch <rom_…> [--workspace <dir>] [--out <dir>] [--check-every 1m] [--quiet-checks], or goal export <rom_…> [--out <dir>].";
+    "Use goal start <goal file> [--type board|compiled] --until <trigger>, goal run <goal file> [--type board|compiled] --agent codex[:model] --until <trigger> [...], goal serve-demo <goal file> --kickoff first|all --until <trigger> [...], goal watch <rom_…> [--workspace <dir>] [--out <dir>] [--check-every 1m] [--quiet-checks], goal export <rom_…> [--out <dir>], or goal report <record dir>... [--to <dir or https URL>] [--experiment <name>] [--tag <a,b>] [--score <name>=<number>].";
   const roomId = parsed.positionals[0];
   if ((action !== "watch" && action !== "export") || parsed.positionals.length !== 1 || !/^rom_[0-9A-Za-z]{10}$/.test(roomId ?? "")) {
     throw localError("unknown_command", usage);
@@ -614,6 +621,57 @@ async function goalCommand(
 }
 
 /**
+ * `goal report <record dir>…`: each record as one row of numbers and settings (goal-report.ts),
+ * printed, or with `--to` handed to a directory or a URL that collects runs. A directory that is
+ * not itself a record is searched for records. It reads local files only: no sign-in, no Room.
+ */
+async function goalReportCommand(parsed: ParsedArguments, dependencies: ResolvedDependencies): Promise<unknown> {
+  assertOnlyOptions(parsed, ["to", "experiment", "tag", "score"]);
+  if (parsed.positionals.length === 0) {
+    throw localError("invalid_arguments", 'Usage: sharednet goal report <record dir>... [--to <dir or https URL>] [--experiment <name>] [--tag <a,b>] [--score "<name>=<number>"]');
+  }
+  const to = option(parsed, "to");
+  if (to !== undefined) reportTarget(to, dependencies.cwd);
+  const score = parseReportScore(option(parsed, "score"));
+  const directories: string[] = [];
+  for (const positional of parsed.positionals) {
+    const path = resolvePathFrom(dependencies.cwd, positional);
+    const found = await findRecords(path);
+    if (found.length === 0) throw localError("invalid_arguments", `${positional} holds no goal record: a record is a directory with an episode.json.`);
+    directories.push(...found);
+  }
+  if (score && directories.length !== 1) throw localError("invalid_arguments", "--score belongs to one run; name one record.");
+  const tags = (option(parsed, "tag") ?? "").split(",").map((tag) => tag.trim()).filter((tag) => tag.length > 0);
+  const experiment = option(parsed, "experiment");
+  const rows: ReportRow[] = [];
+  for (const directory of directories) {
+    const row = await reportRow(directory, { ...(experiment === undefined ? {} : { experiment }), tags, ...(score ? { score } : {}), now: dependencies.now });
+    if (row) rows.push(row);
+  }
+  if (to === undefined) return { schema: rows[0]?.schema ?? 2, rows };
+  const delivery = await deliverReport(rows, to, { fetch: dependencies.fetch, env: dependencies.env, cwd: dependencies.cwd });
+  return { reported: delivery.delivered, to: delivery.to, rooms: rows.map((row) => row.id) };
+}
+
+/**
+ * After a `goal run` asked to report (`--report`, or SHAREDNET_REPORT_TO for every run on a
+ * machine): the finished record's row goes where it was told. A report that cannot be made or
+ * delivered is said on stderr and never changes how the run ended.
+ */
+async function reportFinishedRun(record: string, to: string, experiment: string | undefined, dependencies: ResolvedDependencies): Promise<ReportDelivery | null> {
+  try {
+    const row = await reportRow(record, { ...(experiment === undefined ? {} : { experiment }), now: dependencies.now });
+    if (!row) throw localError("report_not_delivered", "the record holds no episode.json");
+    const delivery = await deliverReport([row], to, { fetch: dependencies.fetch, env: dependencies.env, cwd: dependencies.cwd });
+    dependencies.stderr(`goal: reported ${row.id} to ${delivery.to}\n`);
+    return delivery;
+  } catch (error) {
+    dependencies.stderr(`goal: the report was not delivered: ${error instanceof Error ? error.message : "unknown error"}\n`);
+    return null;
+  }
+}
+
+/**
  * `goal run <goal file> --agent <driver[:model]>… --until <trigger>…`: the goal Room, the
  * Agents that work on it in a container, and the runner that ends it, in one command.
  * Everything that could fail half-way (the goal, the triggers, Docker, each driver's sign-in)
@@ -637,8 +695,13 @@ export async function sayNextGoal(client: ApiClient, apiKey: string, runnerToken
   return startGoal(client, apiKey, roomId, content, until).catch(refuse);
 }
 
-async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies): Promise<unknown> {
-  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools", "resume-from", "earlier-rooms", "room"]);
+async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments, dependencies: ResolvedDependencies, launchArgv?: string[]): Promise<unknown> {
+  assertOnlyOptions(parsed, ["agent", "until", "workspace", "out", "name", "image", "agent-user", "isolate", "model-api", "check-every", "quiet-checks", "web-search", "turn-limit", "turn-policy", "type", "mention-gate", "task-gate", "message-routing", "harness-mode", "reasoning-effort", "context-window", "compact-at", "task-judge", "activity-view", "topology", "message-schema", "probe", "probe-every", "disallow-tools", "resume-from", "earlier-rooms", "room", "report", "experiment"]);
+  // Where the finished run's row goes: named for this run, or once for every run on this machine.
+  const reportTo = option(parsed, "report") ?? (dependencies.env.SHAREDNET_REPORT_TO || undefined);
+  if (reportTo !== undefined) reportTarget(reportTo, dependencies.cwd);
+  const reportExperiment = option(parsed, "experiment") ?? (dependencies.env.SHAREDNET_REPORT_EXPERIMENT || undefined);
+  if (parsed.options.has("experiment") && reportTo === undefined) throw localError("invalid_arguments", "--experiment names the experiment a reported run belongs to; it goes with --report.");
   const requestedType = roomType(parsed);
   const namedMode = option(parsed, "harness-mode");
   const turnPolicy = option(parsed, "turn-policy") ?? "legacy";
@@ -684,7 +747,7 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
   if (parsed.positionals.length !== 1) {
     throw localError(
       "invalid_arguments",
-      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit <duration>] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--disallow-tools <Tool,Tool>] [--resume-from <record dir> [--earlier-rooms <file>]] [--room <room id>]",
+      "Usage: sharednet goal run <goal file> [--type board|compiled] --agent codex[:model] [--agent claude-code[:model]]... --until <trigger> [--until ...] [--workspace <dir>] [--out <dir>] [--name <name>] [--image <image>] [--agent-user <user>] [--isolate] [--model-api <url>] [--check-every 1m] [--quiet-checks] [--web-search live|off] [--turn-limit <duration>] [--turn-policy legacy|cooperative-v1] [--reasoning-effort none|minimal|low|medium|high|xhigh] [--context-window <tokens>] [--compact-at <tokens>] [--harness-mode research/<mode>@1|runtime/serve-first@1|runtime/serve-all@1 | --mention-gate/--task-gate/--message-routing] [--task-judge off|lexical] [--activity-view] [--topology all|islands:<K>] [--message-schema free|sbar] [--probe <command> [--probe-every 5m]] [--disallow-tools <Tool,Tool>] [--resume-from <record dir> [--earlier-rooms <file>]] [--room <room id>] [--report <dir or https URL> [--experiment <name>]]",
     );
   }
   const agents = parseAgents(parsed.repeated.get("agent") ?? []);
@@ -836,12 +899,13 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
     };
     if (!dependencies.docker) process.once("SIGINT", interrupt);
     try {
-      return await runGoal(
+      const result = await runGoal(
         client,
         session.instance_token,
         apiKey,
         {
           plan,
+          ...(launchArgv ? { launch: { argv: launchArguments(launchArgv) } } : {}),
           roomType: type ?? "board",
           roomId,
           inviteToken: invite.token,
@@ -871,6 +935,9 @@ async function goalRunCommand(parsed: ParsedArguments, globals: GlobalArguments,
         },
         { docker, now: dependencies.now, ...(dependencies.sleep ? { sleep: dependencies.sleep } : {}), stderr: dependencies.stderr },
       );
+      if (reportTo === undefined) return result;
+      const delivery = await reportFinishedRun(out, reportTo, reportExperiment, dependencies);
+      return { ...result, report: delivery ? { to: delivery.to, delivered: true } : { to: reportTo, delivered: false } };
     } finally {
       process.off("SIGINT", interrupt);
     }
@@ -1058,7 +1125,7 @@ async function execute(
   }
   throw localError(
     "unknown_command",
-    "Use login, whoami, join/say/read/wait/ack/watch/handed/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/serve-demo/watch/export, decision list/approve/deny, and local.",
+    "Use login, whoami, join/say/read/wait/ack/watch/handed/add/rooms/requests/accept/deny/reach/timer, task claim/done/list, wake/wake set/off/check, balance/redeem/pay/ledger, upload/download/files, act/open/deliver, or session start/status, room create/list/invite/add/join/post/messages, goal start/run/serve-demo/watch/export/report, decision list/approve/deny, and local.",
   );
 }
 
