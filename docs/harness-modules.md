@@ -29,7 +29,7 @@ before any of these options existed. A run records what it used in `episode.json
 | Activation | what resumes a seat, and when its turn ends | a teammate's post resumes every idle seat once the board has been quiet for 2 s | `--message-routing`, `--turn-policy`, `--loop` + `--rest`, `--turn-limit`, `--disallow-tools` |
 | Delivery | which posts a resumed seat is given, and what else comes with them | everything new at the start of the turn; more on `sharednet read` | `--mention-gate`, `--topology`, `--activity-view` |
 | Board | what a post is, and what a seat may publish | plain posts | `--task-gate`, `--task-judge`, `--message-schema`, `--type compiled` |
-| Stop | when the run ends | the first `--until` trigger to fire | `--until`, `--check-every`, `--quiet-checks` |
+| Stop | when the run ends | the first `--until` trigger to fire | `--until`, `--said-by`, `--check-every`, `--quiet-checks` |
 | Workspace | where work lands | one shared `/workspace` that every seat writes to | `--workspace` |
 
 Options marked new below came with the modules; the others were there before and are listed so
@@ -103,7 +103,14 @@ Not yet: neighbourhood or small-world graphs, summaries in place of posts.
 
 `--until` holds the end of the run and can be given several times; the first to fire ends it:
 `check: <command>`, `said: DONE`, `after: 30m`, `budget: 2M tokens`. `--check-every` sets how often the check runs and `--quiet-checks` keeps its results
-out of the Room. The all-member and verifier stops of the report have no option yet.
+out of the Room.
+
+- New: `--said-by all`: `said: DONE` ends the run only when every seat has said it and stands by
+  it (the all-member stop of the report). A seat's claim stands until it says anything else.
+  `--said-by any`, the reference setting, ends on the first seat's claim. See
+  [goal-mode.md](goal-mode.md).
+
+Not yet: the verifier stop of the report.
 
 ### Workspace
 

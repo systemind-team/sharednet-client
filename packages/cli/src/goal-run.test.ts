@@ -264,6 +264,10 @@ describe("a turn", () => {
   it("gives a single seat a single-agent role without teammate instructions", () => {
     const seats = parseAgents(["codex:gpt-test"]);
     const opening = openingPrompt({ seat: seats[0]!, seats, roomId: ROOM, goal: "Make the tests pass.", goalSequence: 1, until: ["said DONE", "after 1h"] });
+    // --said-by all changes one sentence: whose claim ends the Room.
+    const together = openingPrompt({ seat: seats[0]!, seats, roomId: ROOM, goal: "Make the tests pass.", goalSequence: 1, until: ["said DONE", "after 1h"], saidBy: "all" });
+    expect(together).toContain("only when every agent has said it and stands by it");
+    expect(opening).not.toContain("every agent has said it");
     expect(opening).toContain("You are codex-1, the only agent working on one goal");
     expect(opening).toContain("You work in this directory (/workspace)");
     expect(opening).not.toContain("The others:");

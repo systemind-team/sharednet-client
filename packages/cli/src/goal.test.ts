@@ -207,6 +207,37 @@ describe("goal watch", () => {
     expect(quiet.calls.some((call) => call.path.endsWith("/owner-messages"))).toBe(false);
   });
 
+  it("under --said-by all, ends on a claim only when every seat has made it", async () => {
+    const out = await temporary();
+    const other = "i_AgentSeat02";
+    const room = fakeRoom({
+      until: ["said DONE", "after 1h"],
+      pages: [[{ sequence: 2, content: "DONE", sender: AGENT }], [{ sequence: 3, content: "my half is in", sender: other }], [{ sequence: 4, content: "DONE", sender: other }]],
+    });
+    const result = await goalWatch(room.client, "sni_member", "snk_owner", { roomId: ROOM, workspace: out, out, checkEveryMs: 60_000, quietChecks: true, claimsByAll: [AGENT, other] }, {
+      now: clock(),
+      sleep: async () => undefined,
+      snapshot: null,
+    });
+    expect(result.ended_by).toMatchObject({ trigger: "said DONE", detail: "all 2 agents: DONE" });
+    const claims = (await readFile(join(out, "claims.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(claims.map((claim) => [claim.sequence, claim.seat, claim.claim, claim.standing, claim.of])).toEqual([[2, AGENT, true, 1, 2], [4, other, true, 2, 2]]);
+  });
+
+  it("under --said-by all, a seat that says anything else withdraws its claim, and saying it again renews it", async () => {
+    const out = await temporary();
+    const other = "i_AgentSeat02";
+    const pages = [[{ sequence: 2, content: "DONE", sender: AGENT }], [{ sequence: 3, content: "wait, one test still fails", sender: AGENT }], [{ sequence: 4, content: "DONE", sender: other }]];
+    const withdrawn = fakeRoom({ until: ["said DONE", "after 1h"], pages });
+    const options = { roomId: ROOM, workspace: out, out, checkEveryMs: 60_000, quietChecks: true, claimsByAll: [AGENT, other] };
+    const first = await goalWatch(withdrawn.client, "sni_member", "snk_owner", options, { now: clock(), sleep: async () => undefined, snapshot: null });
+    expect(first.ended_by).toMatchObject({ trigger: "after 1h" });
+
+    const renewed = fakeRoom({ until: ["said DONE", "after 1h"], pages: [...pages, [{ sequence: 5, content: "fixed. DONE", sender: AGENT }]] });
+    const second = await goalWatch(renewed.client, "sni_member", "snk_owner", options, { now: clock(), sleep: async () => undefined, snapshot: null });
+    expect(second.ended_by).toMatchObject({ trigger: "said DONE", detail: "all 2 agents: fixed. DONE" });
+  });
+
   it("records runner machinery but does not let it satisfy message, said, or count triggers", async () => {
     const out = await temporary();
     const { client } = fakeRoom({
