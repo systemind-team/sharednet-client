@@ -105,7 +105,7 @@ describe("--agent", () => {
       { name: "codex-2", driver: "codex", model: null },
       { name: "claude-code-1", driver: "claude-code", model: "claude-sonnet-5-5" },
     ]);
-    for (const raws of [[], ["gemini"], ["codex:bad model"], Array.from({ length: 51 }, () => "codex")]) {
+    for (const raws of [[], ["gemini"], ["codex:bad model"]]) {
       expect(() => parseAgents(raws), raws.join(" ")).toThrow();
     }
   });
@@ -116,12 +116,12 @@ describe("--agent", () => {
     expect(() => parseAgents(["codex:qwen 3"])).toThrow();
   });
 
-  it("starts up to fifty, so a team can be scaled past eight", () => {
-    const seats = parseAgents(Array.from({ length: 50 }, (_, index) => (index % 2 === 0 ? "codex" : "claude-code")));
-    expect(seats).toHaveLength(50);
-    expect(seats.at(-2)).toEqual({ name: "codex-25", driver: "codex", model: null });
-    expect(seats.at(-1)).toEqual({ name: "claude-code-25", driver: "claude-code", model: null });
-    expect(new Set(seats.map((seat) => seat.name)).size).toBe(50);
+  it("has no upper limit on seats, so a team can be scaled to any size the machine holds", () => {
+    const seats = parseAgents(Array.from({ length: 1024 }, (_, index) => (index % 2 === 0 ? "codex" : "claude-code")));
+    expect(seats).toHaveLength(1024);
+    expect(seats.at(-2)).toEqual({ name: "codex-512", driver: "codex", model: null });
+    expect(seats.at(-1)).toEqual({ name: "claude-code-512", driver: "claude-code", model: null });
+    expect(new Set(seats.map((seat) => seat.name)).size).toBe(1024);
   });
 });
 
