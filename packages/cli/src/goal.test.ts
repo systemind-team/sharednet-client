@@ -66,7 +66,7 @@ type Call = { method: string; path: string; token: string; body: unknown };
 function fakeRoom(options: {
   until: string[];
   /** What each wait answers, in turn; an error is thrown instead. */
-  pages: Array<Array<{ sequence: number; content: string; sender: string }> | CliError>;
+  pages: Array<Array<{ sequence: number; content: string; sender: string; created_at?: string }> | CliError>;
   states?: Array<{ state: "open" | "closed"; ended_by?: { trigger: string; at: string; detail: string | null } | null } | CliError>;
   /** Errors the close answers with, in turn, before it succeeds. */
   closes?: CliError[];
@@ -87,6 +87,7 @@ function fakeRoom(options: {
           memberships: [
             { member_id: HUMAN, name: "Ada Lovelace", runtime_kind: "human" },
             { member_id: AGENT, name: "codex", runtime_kind: "codex" },
+            { member_id: RUNNER, name: "runner", runtime_kind: "runner" },
           ],
         };
       }
@@ -248,6 +249,36 @@ describe("goal watch", () => {
     });
     expect(result.ended_by).toMatchObject({ trigger: "count 2" });
     expect(calls.some((call) => call.path.endsWith("/close"))).toBe(false);
+  });
+
+  it.each([
+    ["a silent Room", []],
+    ["earlier goal messages and the runner's setup line", [
+      { sequence: 1, content: "older work", sender: AGENT },
+      { sequence: 2, content: "kickoff", sender: RUNNER },
+      { sequence: 3, content: "runner notice", sender: RUNNER },
+    ]],
+    ["agent messages already present when the watcher began", [
+      { sequence: 3, content: "already said", sender: AGENT, created_at: "2026-10-05T12:19:59.000Z" },
+    ]],
+  ] as const)("starts idle at watcher invocation for %s", async (_case, page) => {
+    const out = await temporary();
+    const { client, calls } = fakeRoom({ until: ["idle 1m", "after 30m"], pages: [[], [...page]] });
+    let now = Date.parse("2026-10-05T12:20:00.000Z");
+    const started = now;
+    const request = client.request.bind(client);
+    client.request = async (method, path, token, body) => {
+      // Reading the Room advances the clock before the watcher's first poll.
+      if (calls.length === 0) now += 10_000;
+      if (path.includes("/wait?")) now += 20_000;
+      return request(method, path, token, body);
+    };
+    const result = await goalWatch(client, "sni_member", "snk_owner", {
+      roomId: ROOM, workspace: out, out, checkEveryMs: 60_000, quietChecks: false, ignoreThrough: 2,
+    }, { now: () => new Date(now), snapshot: null });
+    expect(result.ended_by?.trigger).toBe("idle 1m");
+    expect(now - started).toBe(70_000);
+    expect(result.messages).toBe(page.length);
   });
 
   it("ends on idle once the Agents have gone quiet for long enough", async () => {

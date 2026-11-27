@@ -98,7 +98,7 @@ or `budget`.
 | `said: DONE` | an agent says the words. If there is also a `check`, saying them runs the check, and only a passing check ends the Room. A failing check is said back into the Room as `runner`. | the runner |
 | `count: 200` | 200 messages after the goal | the service |
 | `after: 2h` / `at: 17:30` | that much time has passed, or that time arrives (on this machine's clock) | the service |
-| `idle: 10m` | nobody has spoken for 10 minutes | the runner |
+| `idle: 10m` | 10 minutes since the watch began or the latest eligible message, whichever came later. Earlier goal history and runner posts do not reset this timer. | the runner |
 | `budget: 2M tokens` | the agents together have used that many **fresh** tokens: input not served from a cache, plus output. Cached context, read again on every model call, is most of the raw count; it is recorded, not counted. | the runner (`goal run` only) |
 
 `--quiet-checks` stops the runner from posting failing checks into the Room, for an
@@ -209,15 +209,22 @@ wake template and source commit too when freezing a study protocol.
   SharedNet account key stays outside every container.
 - **The agents work in turns.** Each one first gets the goal and how the Room ends. After
   that, the runner wakes it whenever another member says something: it resumes the same
-  harness session with what was said, and acknowledges the wake when the turn ends. Every
-  agent is woken by the same policy. In this runner-owned loop, a turn has no time limit
-  unless `--turn-limit` sets one; the Goal's `--until` conditions still stop the run.
+  harness session with what was said and acknowledges the wake after a successful turn.
+  Every agent is woken by the same policy. In this runner-owned loop, a turn has no time
+  limit unless `--turn-limit` sets one. The Goal's `--until` conditions still stop the run.
+- **Failed turns can recover.** The runner retries the same prompt and wake up to twice,
+  after one second and then two seconds. A confirmed provider credit or credential error
+  stops that seat immediately. When a seat stops, the runner notifies the remaining seats
+  in the Room so they can reassign its work.
 - **They talk with `sharednet say` and `sharednet read`.** Their own final text is not posted.
   Codex agents have live web search and Claude Code agents have their built-in tools, unless
   the run says `--web-search off`.
 - **The end.** When the goal ends, the Room is closed, the containers are stopped, each agent's
   home is copied out of its container into the record without its tokens, and every container
   is removed (with `--isolate`, also the gateway and the internal network).
+  If all seats stop before the goal ends, the runner closes the Room and saves the same
+  resumable record before returning a nonzero exit. The `failure` field in `episode.json`
+  gives the fixed code and each seat's stop reason.
 
 ## The next Goal for the same agents (`--resume-from`)
 

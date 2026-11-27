@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import type { CompiledState } from "./compiled.ts";
 import type { ApiClient } from "./api-client.ts";
@@ -120,12 +121,37 @@ interface RoomShape {
 
 export type CheckRunner = (command: string, cwd: string) => Promise<{ exitCode: number; output: string }>;
 
+export const GOAL_FAILURE_MESSAGES = {
+  goal_agent_credits_exhausted: "The Goal stopped because its agent seats reached their provider credit or usage limit.",
+  goal_agent_auth_failed: "The Goal stopped because its agent seats could not authenticate with their provider.",
+  goal_no_usable_seats: "The Goal stopped because no agent seats remain usable.",
+} as const;
+
+export type SeatStopReason = "account_credits_exhausted" | "account_auth_failed" | "turn_retries_exhausted" | "wait_stopped" | "wake_ack_failed" | "seat_loop_failed";
+
+export interface GoalFailure {
+  code: keyof typeof GOAL_FAILURE_MESSAGES;
+  seats: { name: string; driver: string; reason: SeatStopReason }[];
+}
+
+/** A seat failure wakes the watcher so it can finish its normal close and record steps. */
+interface GoalTermination {
+  signal: AbortSignal;
+  failure: () => GoalFailure | undefined;
+}
+
 export interface GoalWatchDependencies {
   now: () => Date;
   sleep?: (ms: number) => Promise<void>;
   stderr?: (value: string) => void;
   /** Stops a watcher before it can close the Room; serve-backed runs use this on process signals. */
   signal?: AbortSignal;
+  termination?: GoalTermination;
+  /** Stop starting seat work once a normal or failed end has won. */
+  onEnding?: () => void;
+  /** Runner posts can arrive during the long poll that they wake. */
+  runnerPosts?: Set<Promise<void>>;
+  runnerSeats?: Set<string>;
   /** Runs a `check` in the workspace; tests replace it. */
   check?: CheckRunner;
   /** Takes a workspace snapshot; tests replace it, and null turns snapshots off. */
@@ -162,6 +188,8 @@ const OUTAGE_BASE_MS = 1_000;
 const OUTAGE_CAP_MS = 30_000;
 /** Closing is the runner's last word; it is worth a minute of trying. */
 const CLOSE_ATTEMPTS = 6;
+/** Read a bounded tail before ending a stopped team, even if more lines are arriving. */
+const FAULT_DRAIN_PAGES = 4;
 /** How often a budget is looked at while nothing is said. */
 const BUDGET_LOOK_MS = 5_000;
 
@@ -243,6 +271,24 @@ export function workspaceSnapshots(workspace: string, out: string): (label: stri
   };
 }
 
+/** A Goal can end before the next watch or retry deadline. */
+export async function pauseGoal(ms: number, sleep?: (ms: number) => Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return;
+  if (!sleep) {
+    await delay(ms, undefined, signal ? { signal } : {}).catch((error: unknown) => {
+      if (!signal?.aborted) throw error;
+    });
+    return;
+  }
+  if (!signal) return sleep(ms);
+  let interrupt: () => void;
+  await new Promise<void>((resolveSleep, rejectSleep) => {
+    interrupt = resolveSleep;
+    signal.addEventListener("abort", interrupt, { once: true });
+    void Promise.resolve().then(() => signal.aborted ? undefined : sleep(ms)).then(resolveSleep, rejectSleep);
+  }).finally(() => signal.removeEventListener("abort", interrupt));
+}
+
 export interface GoalWatchResult {
   room_id: string;
   ended_by: { trigger: string; at: string; detail: string | null } | null;
@@ -250,6 +296,7 @@ export interface GoalWatchResult {
   checks: number;
   snapshots: number;
   out: string;
+  failure?: GoalFailure;
 }
 
 /**
@@ -266,7 +313,11 @@ export async function goalWatch(
   options: GoalWatchOptions,
   dependencies: GoalWatchDependencies,
 ): Promise<GoalWatchResult> {
-  const sleep = dependencies.sleep ?? ((ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms)));
+  const watchStartedAt = dependencies.now().getTime();
+  const termination = dependencies.termination;
+  const pollSignal = dependencies.signal && termination
+    ? AbortSignal.any([dependencies.signal, termination.signal])
+    : dependencies.signal ?? termination?.signal;
   const log = dependencies.stderr ?? (() => undefined);
   const runCheck = dependencies.check ?? defaultCheck;
   const snapshot = dependencies.snapshot === undefined ? workspaceSnapshots(options.workspace, options.out) : dependencies.snapshot;
@@ -279,9 +330,12 @@ export async function goalWatch(
       : localError("goal_interrupted", "Goal watch was interrupted.");
   };
 
-  const readRoom = () => client.request<RoomShape>("GET", roomPath, memberToken);
+  const readRoom = (signal = dependencies.signal) => client.request<RoomShape>("GET", roomPath, memberToken, undefined, undefined, signal);
   throwIfAborted();
-  let view = await readRoom();
+  let view = await readRoom().catch((error: unknown) => {
+    throwIfAborted();
+    throw error;
+  });
   throwIfAborted();
   const goal = view.room?.goal ?? null;
   if (!goal) throw localError("not_a_goal_room", "That Room has no goal. Start one with sharednet room create --goal <file> --until <trigger>.");
@@ -300,7 +354,13 @@ export async function goalWatch(
   const said = triggers.filter((trigger): trigger is Extract<Trigger, { kind: "said" }> => trigger.kind === "said");
   // The person a `mention` addresses is the goal's speaker; the runner's own lines never count as the Agents'.
   const goalSpeaker = (view.memberships ?? []).find((member) => member.runtime_kind === "human") ?? null;
-  const runnerSeats = new Set((view.memberships ?? []).filter((member) => member.runtime_kind === "runner").map((member) => member.member_id ?? ""));
+  const runnerSeats = dependencies.runnerSeats ?? new Set<string>();
+  const rememberRunners = (room: RoomShape) => {
+    for (const member of room.memberships ?? []) {
+      if (member.runtime_kind === "runner" && member.member_id) runnerSeats.add(member.member_id);
+    }
+  };
+  rememberRunners(view);
 
   await mkdir(options.out, { recursive: true });
   const roomLog = join(options.out, "room.ndjson");
@@ -315,12 +375,15 @@ export async function goalWatch(
   let messages = 0;
   let checkCount = earlierChecks ?? 0;
   let snapshots = 0;
-  let lastMessageAt: number | null = null;
+  let lastMessageAt = watchStartedAt;
   let lastRoomCheckAt = dependencies.now().getTime();
   const checkState = new Map<string, { passing: boolean; ranAt: number | null }>();
   for (const check of checks) checkState.set(check.label, { passing: false, ranAt: null });
   let end: { trigger: string; detail: string | null } | null = null;
   let endedByService: GoalShape["ended_by"] = goal.ended_by;
+  let failure: GoalFailure | undefined;
+  let faultPages = 0;
+  let finalReadDone = false;
 
   const takeSnapshot = async (label: string) => {
     if (!snapshot) return;
@@ -363,12 +426,12 @@ export async function goalWatch(
 
   /** An outage is ridden out with a growing pause, and the loop goes on: the clock and the checks still count. */
   let failedAttempts = 0;
-  const rideOut = async (error: unknown, doing: string) => {
+  const rideOut = async (error: unknown, doing: string, signal?: AbortSignal) => {
     if (!isOutage(error)) throw error;
     const pause = Math.min(OUTAGE_BASE_MS * 2 ** failedAttempts, OUTAGE_CAP_MS);
     failedAttempts += 1;
     log(`goal: the service did not answer while ${doing} (${error.code}); trying again in ${Math.round(pause / 1000)}s, attempt ${failedAttempts}\n`);
-    await sleep(pause);
+    await pauseGoal(pause, dependencies.sleep, signal);
   };
   const answered = () => {
     if (failedAttempts > 0) log(`goal: the service answers again, after ${failedAttempts} failed attempt${failedAttempts === 1 ? "" : "s"}\n`);
@@ -383,6 +446,7 @@ export async function goalWatch(
   }
 
   for (;;) {
+    throwIfAborted();
     if (endedByService) break;
     const now = dependencies.now().getTime();
 
@@ -392,7 +456,7 @@ export async function goalWatch(
       if (trigger.kind === "count" && cursor - triggerStart >= trigger.count) end = { trigger: trigger.label, detail: null };
       if (trigger.kind === "after" && now >= startedAt + trigger.ms) end = { trigger: trigger.label, detail: null };
       if (trigger.kind === "at" && now >= trigger.time) end = { trigger: trigger.label, detail: null };
-      if (trigger.kind === "idle" && lastMessageAt !== null && now - lastMessageAt >= trigger.ms) end = { trigger: trigger.label, detail: null };
+      if (trigger.kind === "idle" && now - lastMessageAt >= trigger.ms) end = { trigger: trigger.label, detail: null };
       if (trigger.kind === "budget" && spend) {
         const used = spend();
         if (used >= trigger.tokens) end = { trigger: trigger.label, detail: `${used} tokens` };
@@ -407,13 +471,18 @@ export async function goalWatch(
       if (result.startedPassing) end = { trigger: check.label, detail: result.output.trim() || null };
     }
     if (end) break;
+    const stopped = termination?.failure();
+    if (stopped && finalReadDone) {
+      failure = stopped;
+      break;
+    }
 
     // Sit until something is said, or the next thing on the clock is due.
     let waitMs = WAIT_MAX_SECONDS * 1000;
     for (const trigger of triggers) {
       if (trigger.kind === "after") waitMs = Math.min(waitMs, startedAt + trigger.ms - now);
       if (trigger.kind === "at") waitMs = Math.min(waitMs, trigger.time - now);
-      if (trigger.kind === "idle" && lastMessageAt !== null) waitMs = Math.min(waitMs, lastMessageAt + trigger.ms - now);
+      if (trigger.kind === "idle") waitMs = Math.min(waitMs, lastMessageAt + trigger.ms - now);
       // Spend grows between messages, as turns end: look at it every few seconds.
       if (trigger.kind === "budget" && spend) waitMs = Math.min(waitMs, BUDGET_LOOK_MS);
     }
@@ -421,23 +490,34 @@ export async function goalWatch(
       const ranAt = checkState.get(check.label)!.ranAt;
       waitMs = Math.min(waitMs, ranAt === null ? 0 : ranAt + options.checkEveryMs - now);
     }
-    const timeout = Math.min(WAIT_MAX_SECONDS, Math.max(0, Math.ceil(waitMs / 1000)));
+    // After the last seat stops, drain what has already been said and give an
+    // existing service/owner end a chance to win before closing on the fault.
+    const timeout = stopped ? 0 : Math.min(WAIT_MAX_SECONDS, Math.max(0, Math.ceil(waitMs / 1000)));
+    const signal = stopped ? dependencies.signal : pollSignal;
+    const previousCursor = cursor;
     let items: MessageShape[] = [];
+    let hasMore = false;
     // A closed Room answers every wait at once; read its end now rather than ask again in a loop.
     let closed = false;
     try {
-      const page = await client.request<{ items?: MessageShape[] }>("GET", `${roomPath}/wait?after=${cursor}&timeout=${timeout}`, memberToken);
+      const page = await client.request<{ items?: MessageShape[]; has_more?: boolean }>("GET", `${roomPath}/wait?after=${cursor}&timeout=${timeout}`, memberToken, undefined, undefined, signal);
       items = Array.isArray(page?.items) ? page.items : [];
+      hasMore = page?.has_more === true;
       answered();
     } catch (error) {
+      throwIfAborted();
       if (error instanceof CliError && error.code === "room_closed") closed = true;
-      else {
-        await rideOut(error, "waiting in the Room");
+      else if (!stopped) {
+        if (termination?.signal.aborted) continue;
+        await rideOut(error, "waiting in the Room", pollSignal);
         continue;
       }
     }
     throwIfAborted();
 
+    if (items.length && dependencies.runnerPosts?.size) {
+      await Promise.all(dependencies.runnerPosts);
+    }
     let claim: MessageShape | null = null;
     for (const item of items.sort((left, right) => left.sequence - right.sequence)) {
       if (!Number.isSafeInteger(item.sequence) || item.sequence <= cursor) continue;
@@ -447,7 +527,9 @@ export async function goalWatch(
       if (item.sequence <= triggerStart) continue;
       const sender = item.sender_instance_id ?? item.sender?.member_id ?? "";
       if (runnerSeats.has(sender)) continue;
-      lastMessageAt = dependencies.now().getTime();
+      const observedAt = dependencies.now().getTime();
+      const postedAt = Date.parse(item.created_at ?? "");
+      lastMessageAt = Math.max(lastMessageAt, Number.isFinite(postedAt) ? Math.min(postedAt, observedAt) : observedAt);
       if (end) continue;
       if (triggers.some((trigger) => trigger.kind === "message")) end = { trigger: "message", detail: item.content.slice(0, 500) };
       else if (
@@ -486,43 +568,62 @@ export async function goalWatch(
     // The service ends a goal on count, after and at by itself, and the owner may close it from
     // the Dashboard: read the Room now and then so either is noticed.
     const at = dependencies.now().getTime();
-    if (closed || at - lastRoomCheckAt >= roomCheckMs || (items.length === 0 && timeout === 0)) {
+    if (closed || stopped || at - lastRoomCheckAt >= roomCheckMs || (items.length === 0 && timeout === 0)) {
       lastRoomCheckAt = at;
       try {
-        view = await readRoom();
+        view = await readRoom(signal);
+        rememberRunners(view);
         answered();
       } catch (error) {
-        await rideOut(error, "reading the Room");
-        continue;
+        throwIfAborted();
+        if (!stopped) {
+          if (termination?.signal.aborted) continue;
+          await rideOut(error, "reading the Room", pollSignal);
+          continue;
+        }
       }
       if (closed || view.room?.state === "closed") {
         endedByService = view.room?.goal?.ended_by ?? { trigger: "owner", at: new Date(at).toISOString(), detail: null };
       }
     }
-    if (items.length === 0 && timeout === 0) await sleep(0);
+    if (stopped) {
+      if (endedByService) break;
+      faultPages += 1;
+      finalReadDone = !hasMore || cursor === previousCursor || faultPages >= FAULT_DRAIN_PAGES;
+      continue;
+    }
+    if (items.length === 0 && timeout === 0) await pauseGoal(0, dependencies.sleep, pollSignal);
   }
 
   // Close with the trigger that fired; the service keeps the first end it was told.
   throwIfAborted();
+  dependencies.onEnding?.();
+  const close = end ?? (failure ? { detail: GOAL_FAILURE_MESSAGES[failure.code] } : null);
   let endedBy = endedByService;
-  for (let attempt = 1; !endedBy && end; attempt += 1) {
+  for (let attempt = 1; !endedBy && close; attempt += 1) {
     throwIfAborted();
     try {
-      const closed = await client.request<{ room?: { goal?: GoalShape | null } }>("POST", `${roomPath}/close`, apiKey, end);
-      endedBy = closed?.room?.goal?.ended_by ?? { ...end, at: dependencies.now().toISOString() };
+      const closed = await client.request<{ room?: { goal?: GoalShape | null } }>("POST", `${roomPath}/close`, apiKey, close);
+      endedBy = closed?.room?.goal?.ended_by ?? { trigger: end?.trigger ?? "owner", detail: close.detail, at: dependencies.now().toISOString() };
+      if (failure && (endedBy.trigger !== "owner" || endedBy.detail !== close.detail)) failure = undefined;
     } catch (error) {
       if (isOutage(error) && attempt < CLOSE_ATTEMPTS) {
-        await rideOut(error, "closing the Room");
+        await rideOut(error, "closing the Room", dependencies.signal);
         continue;
       }
       log(`goal: the Room was not closed (${error instanceof CliError ? error.code : "error"}); its end is recorded here\n`);
-      endedBy = { ...end, at: dependencies.now().toISOString() };
+      endedBy = { trigger: end?.trigger ?? "owner", detail: close.detail, at: dependencies.now().toISOString() };
     }
   }
   await takeSnapshot("end");
-  if (view.room?.type === "compiled") await exportCompiled(client, memberToken, options.roomId, options.out);
+  if (view.room?.type === "compiled") {
+    await exportCompiled(client, memberToken, options.roomId, options.out).catch((error: unknown) => {
+      if (!failure) throw error;
+      log("goal: compiled Room state could not be exported\n");
+    });
+  }
   const budget = spend ? [] : triggers.filter((trigger) => trigger.kind === "budget").map((trigger) => trigger.label);
-  const result: GoalWatchResult = { room_id: options.roomId, ended_by: endedBy, messages, checks: checkCount, snapshots, out: options.out };
+  const result: GoalWatchResult = { room_id: options.roomId, ended_by: endedBy, messages, checks: checkCount, snapshots, out: options.out, ...(failure ? { failure } : {}) };
   await writeFile(
     join(options.out, "episode.json"),
     `${JSON.stringify(
@@ -531,6 +632,7 @@ export async function goalWatch(
         room_id: options.roomId,
         goal: { message_id: goal.message_id, sequence: goal.sequence, until: goal.until, started_at: goal.started_at },
         ended_by: endedBy,
+        ...(failure ? { failure } : {}),
         runner: { started_at: runnerStartedAt, ended_at: dependencies.now().toISOString(), workspace: resolve(options.workspace) },
         totals: { messages, checks: checkCount, snapshots, ...(spend ? { tokens: spend() } : {}) },
         ...(budget.length > 0 ? { not_measured: budget.map((label) => `${label}: goal watch did not start the Agents, so it cannot read their spend; goal run can`) } : {}),
