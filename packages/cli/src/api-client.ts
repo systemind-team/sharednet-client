@@ -117,6 +117,7 @@ export class ApiClient {
     credential: string,
     body?: unknown,
     requestHeaders: Record<string, string> = {},
+    signal?: AbortSignal,
   ): Promise<T> {
     let response: Response;
     // Bytes go up as they are; anything else is JSON.
@@ -131,6 +132,7 @@ export class ApiClient {
           ...requestHeaders,
         },
         ...(body === undefined ? {} : { body: raw ? (body as unknown as BodyInit) : JSON.stringify(body) }),
+        ...(signal ? { signal } : {}),
       });
     } catch {
       throw new CliError(

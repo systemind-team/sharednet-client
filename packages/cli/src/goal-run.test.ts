@@ -9,7 +9,9 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { ApiClient } from "./api-client.ts";
+import { ApiClient } from "./api-client.ts";
+import { readResumeSource } from "./goal-resume.ts";
+import { parseCloseRoomRequest } from "./protocol/index.ts";
 import { resolveGoalRunHarnessMode } from "./harness-modes.ts";
 import {
   AGENT_DOCKERFILE,
@@ -325,6 +327,347 @@ function fakeDocker(answer: (call: DockerCall, command: readonly string[]) => { 
   };
   return { docker, calls };
 }
+
+const seatAt = "2026-10-05T12:00:01.000Z";
+const completedCodex = { type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 1 } };
+const failedCodex = { type: "turn.failed", error: { message: "upstream connection reset" } };
+
+async function seatFailureFixture(
+  names: string[],
+  options: {
+    command: Parameters<typeof fakeDocker>[0];
+    done?: () => boolean;
+    closed?: () => boolean;
+    notice?: (body: { content: string; as: string }) => void;
+    sleep?: (ms: number) => Promise<void>;
+    blockedWatcher?: boolean;
+    check?: string;
+  },
+) {
+  const out = await temporary();
+  const plan: RunPlan = {
+    image: DEFAULT_IMAGE,
+    agents: parseAgents(names),
+    workspace: out,
+    cli: { root: "/opt/cli", entry: "src/main.ts" },
+    codexAuth: { kind: "api-key" },
+    claudeAuth: names.some((name) => name.startsWith("claude-code")) ? "ANTHROPIC_API_KEY" : null,
+  };
+  let stopDocker = () => {};
+  const dockerStopped = new Promise<void>((resolve) => { stopDocker = resolve; });
+  let startPolling = () => {};
+  const polling = new Promise<void>((resolve) => { startPolling = resolve; });
+  const { docker, calls } = fakeDocker(async (call, command) => {
+    if (call.args[0] === "stop") stopDocker();
+    if (command[0] === "sharednet" && command[1] === "join") {
+      const name = command[command.indexOf("--name") + 1]!;
+      return { stdout: JSON.stringify({ member_id: `i_Synthetic${name.replaceAll("-", "")}` }) };
+    }
+    if (call.args[0] === "cp") {
+      const target = call.args[2]!;
+      await mkdir(join(target, ".codex", "sessions"), { recursive: true });
+      await writeFile(join(target, ".codex", "auth.json"), "synthetic only");
+      await writeFile(join(target, ".codex", "sessions", "rollout-fixture-session.jsonl"), "");
+    }
+    if (options.blockedWatcher && (command[0] === "codex" || command[0] === "claude")) await polling;
+    const response = await options.command(call, command);
+    if (command[1] === "wait" && Object.keys(response).length === 0) {
+      await dockerStopped;
+      return { code: 137 };
+    }
+    return response;
+  });
+
+  let polls = 0;
+  let watcherInterrupted = false;
+  const closeBodies: unknown[] = [];
+  const notices: unknown[] = [];
+  const logged: string[] = [];
+  const goal = { message_id: "msg_goal000001", sequence: 1, until: ["said DONE", ...(options.check ? [options.check] : []), "after 2h"], started_at: seatAt, ended_by: null };
+  const ownerEnd = { trigger: "owner", detail: null, at: seatAt };
+  const client = new ApiClient("https://fixture.invalid", async (request, init) => {
+    const url = new URL(String(request));
+    if (url.pathname.endsWith("/owner-messages")) {
+      const body = JSON.parse(String(init?.body));
+      notices.push(body);
+      options.notice?.(body);
+      return Response.json({ message: { sender_instance_id: "i_SyntheticRunner" } });
+    }
+    if (url.pathname.endsWith("/close")) {
+      const body: unknown = JSON.parse(String(init?.body));
+      closeBodies.push(body);
+      const { trigger, detail } = parseCloseRoomRequest(body);
+      return Response.json({ room: { state: "closed", goal: { ...goal, ended_by: { trigger: trigger ?? "owner", detail, at: seatAt } } } });
+    }
+    if (url.pathname.endsWith("/wait")) {
+      if (options.blockedWatcher && url.searchParams.get("timeout") !== "0") {
+        await new Promise<void>((resolve, reject) => {
+          startPolling();
+          const signal = init?.signal;
+          const onAbort = () => {
+            clearTimeout(fallback);
+            watcherInterrupted = true;
+            reject(signal?.reason);
+          };
+          const fallback = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            polls = 20;
+            resolve();
+          }, 200);
+          signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        polls += 1;
+      }
+      if (options.done?.()) return Response.json({ items: [{ sequence: 3, content: "DONE", sender: { member_id: "i_SyntheticPeer" }, created_at: seatAt }] });
+      if (polls >= 20 || options.closed?.()) return Response.json({ error: { code: "room_closed" } }, { status: 409 });
+      return Response.json({ items: [] });
+    }
+    if (url.pathname === `/api/v1/rooms/${ROOM}`) {
+      const closed = polls >= 20 || options.closed?.() === true;
+      return Response.json({ room: { id: ROOM, state: closed ? "closed" : "open", goal: { ...goal, ended_by: closed ? ownerEnd : null } }, memberships: [] });
+    }
+    throw new Error(`unexpected ${url.pathname}`);
+  });
+  const result = runGoal(client, "sni_synthetic-member", OWNER_KEY, {
+    plan, roomId: ROOM, inviteToken: INVITE, goal: "Fixture goal", goalSequence: 1, until: goal.until,
+    baseUrl: "https://fixture.invalid", out, checkEveryMs: 60_000, quietChecks: true, messageRouting: "mentions-only",
+  }, { docker, now: () => new Date(seatAt), sleep: options.sleep ?? (async () => undefined), stderr: (line) => logged.push(line) });
+  const episode = async () => JSON.parse(await readFile(join(out, "episode.json"), "utf8"));
+  return { out, result, calls, episode, closeBodies, notices, logged, watcherInterrupted: () => watcherInterrupted };
+}
+
+describe("seat recovery", () => {
+  it.each([
+    ["terminal turn failure", failedCodex],
+    ["error-only stream with exit zero", { type: "error", message: "upstream connection reset" }],
+  ] as const)("retries the same wake on %s and acknowledges it once after success", async (_case, failure) => {
+    let turn = 0;
+    let waits = 0;
+    const order: string[] = [];
+    const prompts: string[] = [];
+    const delays: number[] = [];
+    const fixture = await seatFailureFixture(["codex"], {
+      command: (_call, command) => {
+        if (command[0] === "codex") {
+          order.push(`turn ${++turn}`);
+          if (turn === 1) return { lines: [JSON.stringify({ type: "thread.started", thread_id: "fixture-session" }), JSON.stringify(completedCodex)] };
+          prompts.push(command.at(-1)!);
+          return { lines: [JSON.stringify(turn < 4 ? failure : completedCodex)] };
+        }
+        if (command[1] === "wait" && ++waits === 1) {
+          return { stdout: JSON.stringify({ wake_id: "wk_synthetic", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: "@codex-1 review" }] }) };
+        }
+        if (command[1] === "ack") order.push(`ack ${command[2]}`);
+        return {};
+      },
+      sleep: async (ms) => { delays.push(ms); },
+      done: () => waits >= 2,
+    });
+    expect((await fixture.result).ended_by?.trigger).toBe("said DONE");
+    expect(order).toEqual(["turn 1", "turn 2", "turn 3", "turn 4", "ack wk_synthetic"]);
+    expect(delays).toEqual([1_000, 2_000]);
+    expect(prompts).toHaveLength(3);
+    expect(new Set(prompts).size).toBe(1);
+    const log = (await readFile(join(fixture.out, "wakes.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(log.map(({ wake_id, failed }) => [wake_id, failed])).toEqual([[null, false], ["wk_synthetic", true], ["wk_synthetic", true], ["wk_synthetic", false]]);
+  });
+
+  it.each([
+    ["generic HTTP 429", [{ type: "error", message: "HTTP 429 Too Many Requests" }, failedCodex], "", "goal_no_usable_seats", 3],
+    ["generic HTTP 401", [{ type: "error", message: "HTTP 401 Unauthorized" }, failedCodex], "", "goal_no_usable_seats", 3],
+    ["model refusal quoting an error", [{ type: "item.completed", item: { type: "agent_message", text: "insufficient_quota" } }, failedCodex], "", "goal_no_usable_seats", 3],
+    ["explicit quota", [{ type: "turn.failed", error: { code: "insufficient_quota", message: "synthetic-private-detail" } }], "", "goal_agent_credits_exhausted", 1],
+    ["reused login diagnostics", [failedCodex], "ERROR: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.", "goal_agent_auth_failed", 1],
+  ] as const)("reports %s with a safe failure and saves the resumable run", async (_case, events, stderr, code, attempts) => {
+    const delays: number[] = [];
+    const errors = new Map([
+      ["goal_agent_credits_exhausted", "account_credits_exhausted"],
+      ["goal_agent_auth_failed", "account_auth_failed"],
+      ["goal_no_usable_seats", "turn_retries_exhausted"],
+    ]);
+    const fixture = await seatFailureFixture(["codex"], {
+      command: (_call, command) => command[0] === "codex" ? {
+        code: 1,
+        lines: [{ type: "thread.started", thread_id: "fixture-session" }, ...events].map((event) => JSON.stringify(event)),
+        stderr,
+      } : {},
+      sleep: async (ms) => { delays.push(ms); },
+      blockedWatcher: true,
+    });
+    await expect(fixture.result).rejects.toMatchObject({ name: "CliError", code });
+    expect(delays).toEqual(attempts === 3 ? [1_000, 2_000] : []);
+    expect(fixture.calls.filter((call) => call.args.includes("codex"))).toHaveLength(attempts);
+    expect(fixture.calls.filter((call) => call.args.includes("wait") || call.args.includes("ack"))).toHaveLength(0);
+    expect(fixture.closeBodies).toEqual([{ detail: expect.any(String) }]);
+    const episode = await fixture.episode();
+    expect(episode.failure).toEqual({ code, seats: [{ name: "codex-1", driver: "codex", reason: errors.get(code) }] });
+    expect(JSON.stringify([episode, fixture.closeBodies, fixture.logged])).not.toMatch(/synthetic-private-detail|Please log out and sign in again/);
+    expect(fixture.watcherInterrupted()).toBe(true);
+    expect(await readResumeSource(fixture.out)).toMatchObject({ roomId: ROOM, seats: [{ name: "codex-1", sessionId: "fixture-session" }] });
+    await expect(readFile(join(fixture.out, "agents", "codex-1", "home", ".codex", "auth.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(fixture.out, "agents", "codex-1", "home", ".codex", "sessions", "rollout-fixture-session.jsonl"), "utf8")).resolves.toBe("");
+    expect(fixture.calls.at(-1)?.args[0]).toBe("rm");
+  });
+
+  it("finishes a turn that recovered from a harness error and ignores ordinary refusal text", async () => {
+    let wait = false;
+    const fixture = await seatFailureFixture(["codex"], {
+      command: (_call, command) => {
+        if (command[0] === "codex") return { lines: [
+          { type: "error", message: "Retrying provider request", code: "insufficient_quota" },
+          { type: "item.completed", item: { type: "agent_message", text: "I cannot do that." } },
+          completedCodex,
+        ].map((event) => JSON.stringify(event)) };
+        if (command[1] === "wait") wait = true;
+        return {};
+      },
+      done: () => wait,
+    });
+    expect((await fixture.result).agents[0]).toMatchObject({ turns: 1, failed_turns: 0 });
+    expect(fixture.notices).toEqual([]);
+  });
+
+  it.each([
+    ["explicit provider quota", "account_credits_exhausted"],
+    ["a close wake while the Room is still open", "wait_stopped"],
+  ] as const)("alerts a healthy provider under mention routing after %s", async (_case, reason) => {
+    let know = (_content: string) => {};
+    let healthyTurns = 0;
+    const notice = new Promise<string>((resolve) => { know = resolve; });
+    const fixture = await seatFailureFixture(["codex", "claude-code"], {
+      command: async (call, command) => {
+        if (command[0] === "codex") {
+          if (reason === "wait_stopped") return { lines: [JSON.stringify(completedCodex)] };
+          return { code: 1, lines: [JSON.stringify({ type: "turn.failed", error: { code: "insufficient_quota", message: "synthetic-private-detail" } })] };
+        }
+        if (command[1] === "wait" && call.args.includes("SHAREDNET_SEAT=i_Syntheticcodex1")) {
+          return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, messages: [], events: [{ kind: "closed" }] }) };
+        }
+        if (command[0] === "claude") {
+          healthyTurns += 1;
+          return { lines: [JSON.stringify({ type: "result", is_error: false, usage: { output_tokens: 20 } })] };
+        }
+        if (command[1] === "wait" && call.args.includes("SHAREDNET_SEAT=i_Syntheticclaudecode1") && healthyTurns === 1) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const content = await Promise.race([notice, new Promise<string>((resolve) => { timer = setTimeout(() => resolve(""), 200); })]);
+          clearTimeout(timer);
+          return content ? { stdout: JSON.stringify({ wake_id: "wk_notice", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content, sender: { member_id: "i_SyntheticRunner" } }] }) } : {};
+        }
+        return {};
+      },
+      notice: (body) => know(body.content),
+      done: () => healthyTurns === 2,
+    });
+    expect((await fixture.result).ended_by?.trigger).toBe("said DONE");
+    expect(healthyTurns).toBe(2);
+    expect(fixture.notices).toEqual([{ as: "runner", content: expect.stringMatching(/^@claude-code-1 .*codex-1 .*reassign/i) }]);
+    expect(fixture.calls.find((call) => call.args.includes("claude") && call.args.at(-1)?.includes("reassign"))).toBeDefined();
+    expect(JSON.stringify(fixture.notices)).not.toContain("synthetic-private-detail");
+    expect(await fixture.episode()).toMatchObject({ agents: [{ name: "codex-1", stopped: reason }, { name: "claude-code-1" }] });
+    expect((await fixture.episode()).failure).toBeUndefined();
+  });
+
+  it.each([
+    ["nonzero", { code: 1, stderr: "synthetic-private-detail" }],
+    ["invalid wake", { stdout: "{}" }],
+    ["closure notice without a closed Room", { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], messages: [] }) }],
+  ])("closes and saves the run when all waits exit with %s", async (_case, response) => {
+    const fixture = await seatFailureFixture(["codex"], {
+      command: (_call, command) => {
+        if (command[0] === "codex") return { lines: [JSON.stringify(completedCodex)] };
+        if (command[1] === "wait") return response;
+        return {};
+      },
+      blockedWatcher: true,
+    });
+    await expect(fixture.result).rejects.toMatchObject({ code: "goal_no_usable_seats" });
+    expect(fixture.closeBodies).toEqual([{ detail: expect.any(String) }]);
+    expect((await fixture.episode()).failure).toMatchObject({ code: "goal_no_usable_seats" });
+    expect(fixture.watcherInterrupted()).toBe(true);
+  });
+
+  it("keeps the owner's end if a seat's wait stops at the same time", async () => {
+    let closed = false;
+    const fixture = await seatFailureFixture(["codex"], {
+      command: (_call, command) => {
+        if (command[0] === "codex") return { lines: [JSON.stringify(completedCodex)] };
+        if (command[1] === "wait") {
+          closed = true;
+          return { code: 1 };
+        }
+        return {};
+      },
+      closed: () => closed,
+      blockedWatcher: true,
+    });
+    expect((await fixture.result).ended_by).toMatchObject({ trigger: "owner", detail: null });
+    expect(fixture.closeBodies).toEqual([]);
+    expect((await fixture.episode()).failure).toBeUndefined();
+  });
+
+  it("ends and saves the run when the last seat stops during a check held until Docker teardown", async () => {
+    let startCheck = () => {};
+    const checkStarted = new Promise<void>((resolve) => { startCheck = resolve; });
+    let stopContainers = () => {};
+    const stopped = new Promise<"stopped">((resolve) => { stopContainers = () => resolve("stopped"); });
+    let releasedByStop = false;
+    const fixture = await seatFailureFixture(["codex"], {
+      command: async (call, command) => {
+        if (call.args[0] === "stop") stopContainers();
+        if (command[0] === "codex") {
+          await checkStarted;
+          return { code: 1, lines: [JSON.stringify({ type: "turn.failed", error: { code: "insufficient_quota" } })] };
+        }
+        if (command[0] === "sh" && command[2] === "fixture-check") {
+          startCheck();
+          // A guard releases a broken implementation so this assertion can report the wrong outcome.
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const released = await Promise.race([stopped, new Promise<"late">((resolve) => { timer = setTimeout(() => resolve("late"), 400); })]);
+          clearTimeout(timer);
+          releasedByStop = released === "stopped";
+          return releasedByStop ? { code: 137 } : { code: 0, stdout: "late passing check" };
+        }
+        return {};
+      },
+      check: "check fixture-check",
+    });
+    await expect(fixture.result).rejects.toMatchObject({ code: "goal_agent_credits_exhausted" });
+    expect(releasedByStop).toBe(true);
+    expect(fixture.closeBodies).toEqual([{ detail: expect.any(String) }]);
+    expect(await fixture.episode()).toMatchObject({ failure: { code: "goal_agent_credits_exhausted" }, totals: { checks: 0 } });
+    expect(await readFile(join(fixture.out, "checks.ndjson"), "utf8")).toBe("");
+  });
+
+  it("keeps a passing check and interrupts pending retry backoff when the goal ends", async () => {
+    let backoffBegan = false;
+    let releaseCheck = () => {};
+    const canCheck = new Promise<void>((resolve) => { releaseCheck = resolve; });
+    const fixture = await seatFailureFixture(["codex"], {
+      command: async (_call, command) => {
+        if (command[0] === "codex") return { lines: [JSON.stringify(failedCodex)] };
+        if (command[0] === "sh" && command[2] === "fixture-check") {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([canCheck, new Promise<void>((resolve) => { timer = setTimeout(resolve, 100); })]);
+          clearTimeout(timer);
+          return { code: 0, stdout: "check passed" };
+        }
+        return {};
+      },
+      check: "check fixture-check",
+      sleep: () => {
+        backoffBegan = true;
+        releaseCheck();
+        return new Promise<void>(() => {});
+      },
+    });
+    expect((await fixture.result).ended_by).toMatchObject({ trigger: "check fixture-check", detail: "check passed" });
+    expect(backoffBegan).toBe(true);
+    expect(fixture.calls.filter((call) => call.args.includes("codex"))).toHaveLength(1);
+    expect(fixture.calls.some((call) => call.args.includes("wait"))).toBe(false);
+  });
+});
 
 describe("unlimited turns", () => {
   it.each(["codex", "claude-code"])("lets %s run without a turn timeout and still interrupts it when the Goal expires", async (driver) => {
@@ -1108,11 +1451,19 @@ describe("a check", () => {
       codexAuth: null,
       claudeAuth: "ANTHROPIC_API_KEY",
     };
-    const { docker, calls } = fakeDocker((_call, command) => {
+    let releaseWait = () => {};
+    const stopped = new Promise<void>((resolve) => { releaseWait = resolve; });
+    let beginWait = () => {};
+    const waiting = new Promise<void>((resolve) => { beginWait = resolve; });
+    const { docker, calls } = fakeDocker(async (call, command) => {
+      if (call.args[0] === "stop") releaseWait();
       if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_ClaudeOne01" }) };
       if (command[0] === "sharednet" && command[1] === "wait") {
-        return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [{ kind: "closed" }], messages: [] }) };
+        beginWait();
+        await stopped;
+        return { code: 137 };
       }
+      if (command[0] === "sh" && command[2] === "pytest -q") await waiting;
       return {};
     });
     const goal = { message_id: "msg_goal000001", sequence: 1, until: ["check pytest -q", "after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
@@ -1219,7 +1570,10 @@ describe("module slots in a run", () => {
     const seat1 = containerName(ROOM, "claude-code-1");
     const waits: Record<string, number> = {};
     const from2 = (sequence: number, content: string) => ({ sequence, content, sender: { member_id: "i_ClaudeTwo02", name: "claude-code-2" } });
-    const { docker, calls } = fakeDocker((call, command) => {
+    let releaseWaits = () => {};
+    const stopped = new Promise<void>((resolve) => { releaseWaits = resolve; });
+    const { docker, calls } = fakeDocker(async (call, command) => {
+      if (call.args[0] === "stop") releaseWaits();
       const mine = call.args.includes(seat1);
       if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: mine ? "i_ClaudeOne01" : "i_ClaudeTwo02" }) };
       if (command[0] === "sharednet" && command[1] === "task") return { stdout: JSON.stringify({ tasks: [{ key: "wav", title: "WAV core", owner: "i_ClaudeTwo02", owner_name: "claude-code-2", status: "claimed", claim_sequence: 2 }] }) };
@@ -1227,7 +1581,8 @@ describe("module slots in a run", () => {
         const n = (waits[mine ? "1" : "2"] = (waits[mine ? "1" : "2"] ?? 0) + 1);
         if (mine && n === 1) return { stdout: JSON.stringify({ wake_id: "wk_one", fired: ["message"], from: 1, through: 2, events: [], messages: [from2(2, "chatter in island two")] }) };
         if (mine && n === 2) return { stdout: JSON.stringify({ wake_id: "wk_two", fired: ["message"], from: 2, through: 3, events: [], messages: [from2(3, "@claude-code-1 S: wav done | B: 1a2b | A: matches | R: fetch it and run the difftest")] }) };
-        return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 3, through: 3, events: [{ kind: "closed" }], messages: [] }) };
+        await stopped;
+        return { code: 137 };
       }
       if (command[0] === "sh" && command[2] === "python3 probe.py") return { stdout: "2 differences: -buildconf exits 1\n" };
       return {};

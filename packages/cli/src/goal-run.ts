@@ -14,7 +14,7 @@ import { dirname, join, relative } from "node:path";
 
 import type { ApiClient } from "./api-client.ts";
 import { CliError, localError } from "./errors.ts";
-import { goalWatch, type GoalWatchResult } from "./goal.ts";
+import { GOAL_FAILURE_MESSAGES, goalWatch, pauseGoal, type GoalFailure, type GoalWatchResult, type SeatStopReason } from "./goal.ts";
 import { earlierRoomFile, earlierRoomMarkdown, newcomerNote, planMembers, planResume, resumePrompt, roomControls, usageSince, type FreshReason, type MemberTakeUp, type ResumeSource } from "./goal-resume.ts";
 import { assertGoalRunHarnessAgentCount, type GoalRunHarnessResolution } from "./harness-modes.ts";
 import { mentions } from "./triggers.ts";
@@ -235,7 +235,7 @@ const CONTAINER_HOMES = "/home/agents";
 const CONTAINER_CLI = "/opt/sharednet";
 const CONTAINER_CODEX_AUTH = "/run/codex/auth.json";
 /** A seat whose harness fails this many turns in a row stops taking turns. */
-const FAILED_TURNS_LIMIT = 3;
+const TURN_RETRY_DELAYS = [1_000, 2_000];
 
 /** The gateway of an isolated run: the one container on its internal network that has a way out. */
 export const GATEWAY_IMAGE = "nginx:1.27-alpine";
@@ -754,7 +754,50 @@ export interface TurnReading {
   failed: boolean;
 }
 
-/** Reads a harness's JSON stream for what the runner needs: the session to resume, and the spend. */
+type AccountFailure = Extract<SeatStopReason, "account_credits_exhausted" | "account_auth_failed">;
+
+function accountFailureCode(code: unknown): AccountFailure | null {
+  switch (code) {
+    case "insufficient_quota":
+    case "billing_hard_limit_reached":
+    case "out_of_credits":
+    case "billing_error":
+      return "account_credits_exhausted";
+    case "refresh_token_reused":
+    case "refresh_token_expired":
+    case "refresh_token_invalidated":
+    case "invalid_api_key":
+    case "authentication_failed":
+    case "authentication_error":
+      return "account_auth_failed";
+    default:
+      return null;
+  }
+}
+
+function accountFailureDiagnostic(driver: Driver, value: unknown): AccountFailure | null {
+  if (typeof value !== "string") return null;
+  const message = value.trim().replace(/^ERROR: /, "");
+  if (driver === "codex") {
+    if (/^Your access token could not be refreshed because your refresh token (?:was already used|was revoked|has expired)\. Please log out and sign in again\.$/.test(message)) return "account_auth_failed";
+    if (/^(?:Your workspace is out of credits\.|You hit your spend cap set (?:in|by the owner of) your workspace\.|You['’]ve hit your usage limit\.)/.test(message)) return "account_credits_exhausted";
+    // Codex can put a provider's JSON error envelope in its own HTTP diagnostic.
+    const envelope = /^unexpected status (?:401 Unauthorized|429 Too Many Requests): (\{[\s\S]*\})(?:, url: [^\r\n]*)?$/.exec(message);
+    if (envelope) {
+      try {
+        const parsed = JSON.parse(envelope[1]!) as { error?: { code?: unknown } };
+        return accountFailureCode(parsed.error?.code);
+      } catch {
+        return null;
+      }
+    }
+  }
+  // Claude Code's failed result can carry these messages even without an assistant error code.
+  if (driver === "claude-code" && /^Credit balance is too low(?:\.|$)/.test(message)) return "account_credits_exhausted";
+  return null;
+}
+
+/** Reads a harness's JSON stream for the session, spend and terminal outcome. */
 export class TurnReader {
   readonly reading: TurnReading = { sessionId: null, usage: null, failed: false };
   /**
@@ -762,10 +805,22 @@ export class TurnReader {
    * `system init`. A harness that is asked to resume a session it cannot find says neither.
    */
   started = false;
+  private accountFailure: AccountFailure | null = null;
   private readonly driver: Driver;
 
   constructor(driver: Driver) {
     this.driver = driver;
+  }
+
+  failedAccount(stderr: string): AccountFailure | null {
+    if (this.accountFailure) return this.accountFailure;
+    // Only plainly identified harness diagnostics are read from stderr, never model/tool items.
+    for (const line of stderr.split("\n")) {
+      if (!line.startsWith("ERROR: ")) continue;
+      const failure = accountFailureDiagnostic(this.driver, line);
+      if (failure) return failure;
+    }
+    return null;
   }
 
   line(text: string): void {
@@ -775,16 +830,26 @@ export class TurnReader {
     } catch {
       return;
     }
+    if (!event || typeof event !== "object") return;
     const usage = (event.usage ?? null) as Record<string, unknown> | null;
     if (this.driver === "codex") {
       if (event.type === "thread.started" && typeof event.thread_id === "string") this.reading.sessionId = event.thread_id;
       if (event.type === "thread.started") this.started = true;
-      if (event.type === "turn.completed" && usage) this.reading.usage = codexUsage(usage);
-      if (event.type === "turn.failed" || event.type === "error") this.reading.failed = true;
+      if (event.type === "turn.completed") {
+        if (usage) this.reading.usage = codexUsage(usage);
+        this.reading.failed = false;
+        this.accountFailure = null;
+      }
+      if (event.type === "turn.failed" || event.type === "error") {
+        const diagnostic = event.type === "turn.failed" ? event.error as { code?: unknown; message?: unknown } | undefined : event;
+        this.accountFailure = accountFailureCode(diagnostic?.code) ?? accountFailureDiagnostic(this.driver, diagnostic?.message) ?? this.accountFailure;
+        this.reading.failed = true;
+      }
       return;
     }
     if (typeof event.session_id === "string") this.reading.sessionId = event.session_id;
     if (event.type === "system" && event.subtype === "init") this.started = true;
+    if (event.type === "assistant") this.accountFailure = accountFailureCode(event.error) ?? this.accountFailure;
     if (event.type === "result") {
       if (usage) {
         this.reading.usage = {
@@ -793,7 +858,10 @@ export class TurnReader {
           output: numberAt(usage, "output_tokens"),
         };
       }
-      if (event.is_error === true) this.reading.failed = true;
+      this.reading.failed = event.is_error === true;
+      this.accountFailure = this.reading.failed
+        ? accountFailureDiagnostic(this.driver, event.result) ?? this.accountFailure
+        : null;
     }
   }
 }
@@ -808,6 +876,7 @@ export interface SeatRecord {
   session_id: string | null;
   turns: number;
   failed_turns: number;
+  stopped?: SeatStopReason;
   /** Fresh tokens: what a budget counts. */
   tokens: number;
   usage: Usage;
@@ -1038,6 +1107,11 @@ export async function runGoal(
   };
 
   let ended = false;
+  const seatLifetime = new AbortController();
+  const finishSeats = () => {
+    ended = true;
+    seatLifetime.abort();
+  };
   const records: SeatRecord[] = plan.agents.map((agent) => ({
     ...agent,
     member_id: null,
@@ -1243,17 +1317,19 @@ export async function runGoal(
       ? { url: `http://${GATEWAY_ALIAS}:${GATEWAY_PORTS.openai}${api.path}`, custom: api.custom }
       : api.custom ? { url: `${api.origin}${api.path}`, custom: true } : null;
 
+    const promptForTurn = async (seat: SeatRecord, prompt: string) => {
+      if (input.roomType !== "compiled") return prompt;
+      // The CLI inside the seat's container holds its own credential; the owner cannot render its obligations.
+      const opened = await exec(seat, ["sharednet", "open", "--json"]);
+      if (opened.code !== 0) throw localError("state_unavailable", "Could not read this seat's compiled Room state.");
+      let state: CompiledState;
+      try { state = JSON.parse(opened.stdout) as CompiledState; }
+      catch { throw localError("invalid_server_response", "The compiled Room state was not JSON."); }
+      if (typeof state.obligations !== "string") throw localError("invalid_server_response", "The compiled Room state has no personal obligations.");
+      return `${prompt}\n\n${compiledPrompt(state, false)}`;
+    };
+
     const runTurn = async (seat: SeatRecord, prompt: string, wake: WakeShape | null) => {
-      if (input.roomType === "compiled") {
-        // The CLI inside the seat's container holds its own credential; the owner cannot render its obligations.
-        const opened = await exec(seat, ["sharednet", "open", "--json"]);
-        if (opened.code !== 0) throw localError("state_unavailable", "Could not read this seat's compiled Room state.");
-        let state: CompiledState;
-        try { state = JSON.parse(opened.stdout) as CompiledState; }
-        catch { throw localError("invalid_server_response", "The compiled Room state was not JSON."); }
-        if (typeof state.obligations !== "string") throw localError("invalid_server_response", "The compiled Room state has no personal obligations.");
-        prompt += `\n\n${compiledPrompt(state, false)}`;
-      }
       seat.turns += 1;
       const number = String(seat.turns).padStart(3, "0");
       const directory = join(input.out, "agents", seat.name);
@@ -1263,7 +1339,8 @@ export async function runGoal(
       const reader = new TurnReader(seat.driver);
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
-      const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, codexBase, input.codexModel ?? {}, input.disallowedTools ?? []);
+      const requestedSession = seat.session_id;
+      const command = turnCommand(seat, prompt, requestedSession, input.webSearch ?? "live", turnLimitSeconds, codexBase, input.codexModel ?? {}, input.disallowedTools ?? []);
       if (input.taskGate && seat.driver === "claude-code") command.splice(command.length - 1, 0, "--settings", TASK_HOOK_SETTINGS);
       const result = await exec(seat, command, {
         through: wake?.through ?? input.goalSequence,
@@ -1278,8 +1355,9 @@ export async function runGoal(
       seat.session_id = reading.sessionId ?? seat.session_id;
       const spent = account(seat, reading.usage, seat.driver === "codex");
       // A turn the end of the goal stopped did not fail; its spend is lost with it, as the harness reports at a turn's end.
-      const cut = ended && result.code !== 0;
-      const failed = !cut && (result.code !== 0 || reading.failed);
+      const turnFailed = result.code !== 0 || reading.failed;
+      const cut = ended && turnFailed;
+      const failed = !ended && turnFailed;
       if (failed) seat.failed_turns += 1;
       await appendFile(
         wakeLog,
@@ -1300,7 +1378,10 @@ export async function runGoal(
           cut_by_end: cut,
         })}\n`,
       );
-      return { failed, started: reader.started };
+      // Claude Code reports a missing requested session before its init event.
+      const resumeRefused = failed && requestedSession !== null && seat.driver === "claude-code"
+        && result.stderr.split("\n").some((line) => line.trim() === `No conversation found with session ID: ${requestedSession}`);
+      return { failed, started: reader.started, accountFailure: failed ? reader.failedAccount(result.stderr) : null, resumeRefused };
     };
 
     /** What the module slots add to a wake: what has been asked of the seat, and who is doing what. */
@@ -1314,9 +1395,27 @@ export async function runGoal(
         let tasks: Task[] = [];
         const listed = await exec(seat, ["sharednet", "task", "list", "--json"]);
         try { tasks = (JSON.parse(listed.stdout) as { tasks?: Task[] }).tasks ?? []; } catch { /* the view goes out without tasks */ }
-        parts.push(renderActivity(records.map((record) => ({ name: record.name, member_id: record.member_id ?? null, busy: busy.has(record.name), turns: record.turns })), tasks, seat.name));
+        parts.push(renderActivity(records.filter((record) => !record.stopped).map((record) => ({ name: record.name, member_id: record.member_id ?? null, busy: busy.has(record.name), turns: record.turns })), tasks, seat.name));
       }
       return parts;
+    };
+
+    const runnerPosts = new Set<Promise<void>>();
+    const runnerSeats = new Set<string>();
+    const postRunnerLine = async (content: string) => {
+      const post = client.request<{ message?: { sender_instance_id?: string } }>(
+        "POST", `/rooms/${encodeURIComponent(input.roomId)}/owner-messages`, apiKey, { content, as: "runner" },
+      ).then((posted) => {
+        if (posted?.message?.sender_instance_id) runnerSeats.add(posted.message.sender_instance_id);
+      });
+      // A wait can return this line before the POST response names its sender.
+      const tracked = post.catch(() => undefined);
+      runnerPosts.add(tracked);
+      try {
+        await post;
+      } finally {
+        runnerPosts.delete(tracked);
+      }
     };
 
     // The information slot: a probe on a fixed clock, in the checks container, posted as the runner.
@@ -1325,8 +1424,7 @@ export async function runGoal(
       if (!probe) return;
       const probeLog = join(input.out, "probe.ndjson");
       while (!ended) {
-        // Short sleeps, so that the end of the goal does not wait out a whole probe interval.
-        for (let waited = 0; waited < probe.everyMs && !ended; waited += 5_000) await sleep(Math.min(5_000, probe.everyMs - waited));
+        await pauseGoal(probe.everyMs, dependencies.sleep, seatLifetime.signal);
         if (ended) break;
         const startedAt = dependencies.now().toISOString();
         const result = await exec(null, ["sh", "-c", probe.command]);
@@ -1334,7 +1432,7 @@ export async function runGoal(
         let posted = false;
         if (content && !ended) {
           try {
-            await client.request("POST", `/rooms/${encodeURIComponent(input.roomId)}/owner-messages`, apiKey, { content, as: "runner" });
+            await postRunnerLine(content);
             posted = true;
           } catch (error) {
             log(`goal: a probe result was not posted (${error instanceof CliError ? error.code : "error"})\n`);
@@ -1374,55 +1472,95 @@ export async function runGoal(
       }
       if (!taken) openingPromptHashes[seat.name] = sha256(prompt);
       let wake: WakeShape | null = null;
-      let failedInARow = 0;
-      while (!ended) {
-        busy.add(seat.name);
-        const { failed, started } = await runTurn(seat, prompt, wake).finally(() => busy.delete(seat.name));
-        if (wake?.wake_id) await exec(seat, ["sharednet", "ack", wake.wake_id, "--json"]);
-        failedInARow = failed ? failedInARow + 1 : 0;
-        if (taken) {
-          // The first turn shows whether the harness took the session up. Codex names the session it runs:
-          // any other than the one asked for is a new one, which has not had the opening. A harness that
-          // names none refused. Either way the seat starts again, fresh, with the whole opening.
-          const took = started && (seat.driver !== "codex" || seat.session_id === taken.sessionId);
-          taken = null;
-          if (!took) {
-            startFresh(seat, ended ? "ended_first" : "harness_refused");
-            seat.session_id = null;
-            if (ended || freshOpening === null) break;
-            prompt = freshOpening;
-            openingPromptHashes[seat.name] = sha256(prompt);
-            failedInARow = 0;
-            continue;
+      wakes: while (!ended) {
+        const turnPrompt = await promptForTurn(seat, prompt);
+        for (let attempt = 0; !ended; attempt += 1) {
+          busy.add(seat.name);
+          const { failed, started, accountFailure, resumeRefused } = await runTurn(seat, turnPrompt, wake).finally(() => busy.delete(seat.name));
+          if (accountFailure && !ended) return accountFailure;
+          if (taken) {
+            // A refused saved session gets the whole opening in a fresh session.
+            const took = started && (seat.driver !== "codex" || seat.session_id === taken.sessionId);
+            if (took) {
+              taken = null;
+            } else if (ended || resumeRefused || started || !failed) {
+              taken = null;
+              startFresh(seat, ended ? "ended_first" : "harness_refused");
+              seat.session_id = null;
+              if (ended || freshOpening === null) return;
+              prompt = freshOpening;
+              openingPromptHashes[seat.name] = sha256(prompt);
+              continue wakes;
+            } else {
+              // A pre-start error does not establish that the stored session is missing.
+              seat.session_id = taken.sessionId;
+            }
           }
+          if (ended || !failed) break;
+          const delay = TURN_RETRY_DELAYS[attempt];
+          if (delay === undefined) return "turn_retries_exhausted";
+          await pauseGoal(delay, dependencies.sleep, seatLifetime.signal);
         }
-        if (ended) break;
-        if (failedInARow >= FAILED_TURNS_LIMIT) {
-          log(`goal: ${seat.name} failed ${FAILED_TURNS_LIMIT} turns in a row and takes no more; see agents/${seat.name}/\n`);
-          break;
-        }
+        if (ended) return;
+        if (wake?.wake_id && (await exec(seat, ["sharednet", "ack", wake.wake_id, "--json"])).code !== 0) return "wake_ack_failed";
         while (!ended) {
           const waited = await exec(seat, ["sharednet", "wait", "--on", "message", "--on", "closed", "--settle", "2s", "--ack", "manual", "--json"]);
-          if (ended || waited.code !== 0) return;
+          if (ended) return;
+          if (waited.code !== 0) return "wait_stopped";
           let raw: WakeShape;
-          try { raw = JSON.parse(waited.stdout) as WakeShape; } catch { return; }
-          if (raw.fired.includes("closed")) return;
+          try { raw = JSON.parse(waited.stdout) as WakeShape; } catch { return "wait_stopped"; }
+          if (!raw || !Array.isArray(raw.fired) || !Array.isArray(raw.messages)) return "wait_stopped";
+          if (raw.fired.includes("closed")) {
+            const state = await client.request<{ room?: { state?: string } }>(
+              "GET", `/rooms/${encodeURIComponent(input.roomId)}`, memberToken, undefined, undefined, seatLifetime.signal,
+            ).catch(() => null);
+            return state?.room?.state === "closed" ? "room_closed" : "wait_stopped";
+          }
           wake = reachable(routeWake(raw, seat, records, messageRouting), seat, records, modules.topology);
           if (input.taskGate) wake = withoutTaskActs(wake);
           const delivered = wake.messages.map(message => message.sequence);
           if (messageRouting !== "broadcast" || input.taskGate || modules.topology.kind !== "all") await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
           if (delivered.length > 0 || (messageRouting === "broadcast" && !input.taskGate && modules.topology.kind === "all")) break;
-          if (raw.wake_id) await exec(seat, ["sharednet", "ack", raw.wake_id, "--json"]);
+          if (raw.wake_id && (await exec(seat, ["sharednet", "ack", raw.wake_id, "--json"])).code !== 0) return "wake_ack_failed";
         }
         if (ended || !wake) return;
         prompt = [wakePrompt(wake, turnPolicy), ...(await wakeContext(seat, wake))].join("\n\n");
       }
     };
-    const seats = records.map((seat) =>
-      seatLoop(seat).catch((error: unknown) => {
-        log(`goal: ${seat.name} stopped (${error instanceof Error ? error.message : "error"})\n`);
-      }),
-    );
+    const stopped = new Map<SeatRecord, SeatStopReason>();
+    const termination = new AbortController();
+    let failure: GoalFailure | undefined;
+    const stopSeat = async (seat: SeatRecord, reason: SeatStopReason | "room_closed" | undefined) => {
+      if (ended || !reason) return;
+      stopped.set(seat, reason === "room_closed" ? "wait_stopped" : reason);
+      if (reason !== "room_closed") {
+        seat.stopped = reason;
+        log(`goal: ${seat.name} stopped (${reason}); see agents/${seat.name}/\n`);
+      }
+
+      const survivors = records.filter((record) => !stopped.has(record));
+      if (survivors.length === 0) {
+        const seats = records.map((record) => ({ name: record.name, driver: record.driver, reason: stopped.get(record)! }));
+        const code = seats.every((entry) => entry.reason === "account_credits_exhausted") ? "goal_agent_credits_exhausted"
+          : seats.every((entry) => entry.reason === "account_auth_failed") ? "goal_agent_auth_failed"
+          : "goal_no_usable_seats";
+        failure = { code, seats };
+        termination.abort();
+        return;
+      }
+      if (reason === "room_closed") return;
+
+      const recipients = survivors.map((record) => `@${record.name}`).join(" ");
+      try {
+        await postRunnerLine(`${recipients} ${seat.name} has stopped taking turns. Please reassign its unfinished work.`);
+      } catch {
+        if (!ended) log(`goal: the Room notice for ${seat.name} could not be posted\n`);
+      }
+    };
+    const seats = records.map(async (seat) => {
+      const reason = await seatLoop(seat).catch(() => "seat_loop_failed" as const);
+      await stopSeat(seat, reason);
+    });
     const probing = probeLoop().catch((error: unknown) => {
       log(`goal: the probe stopped (${error instanceof Error ? error.message : "error"})\n`);
     });
@@ -1443,9 +1581,13 @@ export async function runGoal(
           return { exitCode: result.code, output: `${result.stdout}${result.stderr}` };
         },
         spend,
+        runnerPosts,
+        runnerSeats,
+        termination: { signal: termination.signal, failure: () => failure },
+        onEnding: finishSeats,
       },
     );
-    ended = true;
+    finishSeats();
     // Stopping the containers ends every turn and every wait still running.
     await docker(["stop", "--time", "5", ...containers]);
     await Promise.all(seats);
@@ -1554,9 +1696,10 @@ export async function runGoal(
         2,
       )}\n`,
     );
+    if (watched.failure) throw localError(watched.failure.code, GOAL_FAILURE_MESSAGES[watched.failure.code]);
     return { ...watched, agents: records, tokens: spend(), ...(resumeRecord ? { resume: resumeRecord } : {}) };
   } finally {
-    ended = true;
+    finishSeats();
     await docker(["rm", "--force", ...containers]);
     if (isolated) {
       await docker(["rm", "--force", names.gateway]);
