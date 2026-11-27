@@ -256,7 +256,7 @@ type Call = { args: readonly string[]; env: Record<string, string>; input?: stri
  * turn (twice, if its session is refused), is woken once, takes one more turn and waits; when every
  * seat waits, a DONE ends the Room.
  */
-async function resumedRun(record: string, options: { input?: Partial<GoalRunInput>; failCopyInto?: string; service?: (method: string, path: string, token: string) => unknown } = {}) {
+async function resumedRun(record: string, options: { input?: Partial<GoalRunInput>; failCopyInto?: string; codexStartupFailures?: number; sleep?: (ms: number) => Promise<void>; service?: (method: string, path: string, token: string) => unknown } = {}) {
   const out = await temporary();
   const workspace = await temporary();
   const seats = parseAgents(["codex:gpt-6-luna", "codex", "codex", "claude-code:sonnet"]);
@@ -286,6 +286,7 @@ async function resumedRun(record: string, options: { input?: Partial<GoalRunInpu
     }
     let lines: string[] = [];
     let stdout = "";
+    let stderr = "";
     let code = 0;
     // A seat handed its earlier member's token enters as that member; one with the invite is a new member.
     if (command[0] === "sharednet" && command[1] === "join") stdout = JSON.stringify({ member_id: HANDED.get(dockerOptions.env?.SHAREDNET_MEMBER_TOKEN ?? "") ?? `i_New${name!.replace(/[^a-z0-9]/g, "")}` });
@@ -293,7 +294,10 @@ async function resumedRun(record: string, options: { input?: Partial<GoalRunInpu
       const turn = (turns.get(name!) ?? 0) + 1;
       turns.set(name!, turn);
       const resumed = command.includes("resume");
-      if (name === "codex-1" && command.includes(CODEX_SESSION)) lines = turn === 1 ? CODEX_RESUMED_TURN : [`{"type":"thread.started","thread_id":"${CODEX_SESSION}"}`, '{"type":"turn.completed","usage":{"input_tokens":30000,"cached_input_tokens":26000,"output_tokens":15}}'];
+      if (name === "codex-1" && command.includes(CODEX_SESSION) && turn <= (options.codexStartupFailures ?? 0)) {
+        lines = ['{"type":"error","message":"upstream connection reset"}'];
+        code = 1;
+      } else if (name === "codex-1" && command.includes(CODEX_SESSION)) lines = turn === 1 ? CODEX_RESUMED_TURN : [`{"type":"thread.started","thread_id":"${CODEX_SESSION}"}`, '{"type":"turn.completed","usage":{"input_tokens":30000,"cached_input_tokens":26000,"output_tokens":15}}'];
       else lines = [...(resumed ? [] : [JSON.stringify({ type: "thread.started", thread_id: `thread-${name}` })]), JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1_000 * turn, cached_input_tokens: 800 * turn, output_tokens: 100 * turn } })];
     } else if (command.includes("claude")) {
       const turn = (turns.get(name!) ?? 0) + 1;
@@ -301,6 +305,7 @@ async function resumedRun(record: string, options: { input?: Partial<GoalRunInpu
       if (command.includes(CLAUDE_SESSION)) {
         lines = CLAUDE_REFUSED;
         code = 1;
+        stderr = `No conversation found with session ID: ${CLAUDE_SESSION}`;
       } else lines = [JSON.stringify({ type: "system", subtype: "init", session_id: "session-fresh" }), JSON.stringify({ type: "result", subtype: "success", is_error: false, session_id: "session-fresh", usage: { input_tokens: 50, cache_creation_input_tokens: 150, cache_read_input_tokens: 800, output_tokens: 100 } })];
     } else if (command[0] === "sharednet" && command[1] === "wait") {
       const count = (waits.get(name!) ?? 0) + 1;
@@ -312,7 +317,7 @@ async function resumedRun(record: string, options: { input?: Partial<GoalRunInpu
       }
     }
     for (const line of lines) dockerOptions.onLine?.(line);
-    return { code, stdout, stderr: code === 1 ? `No conversation found with session ID: ${CLAUDE_SESSION}` : "" };
+    return { code, stdout, stderr };
   };
   const goal = { message_id: "msg_goal000002", sequence: 1, until: ["said DONE", "budget 1M tokens", "after 2h"], started_at: AT, ended_by: null };
   let claimed = false;
@@ -352,7 +357,7 @@ async function resumedRun(record: string, options: { input?: Partial<GoalRunInpu
       resume: { source: await readResumeSource(record), earlierRooms: null },
       ...options.input,
     },
-    { docker, now: () => new Date(AT), sleep: async () => undefined, stderr: (line) => logged.push(line) },
+    { docker, now: () => new Date(AT), sleep: options.sleep ?? (async () => undefined), stderr: (line) => logged.push(line) },
   );
   const of = (seat: string) => calls.filter((call) => call.args[0] === "exec" && call.args.includes(containerName(ROOM, seat)));
   const harnessTurns = (seat: string) => of(seat).filter((call) => call.args.includes("codex") || call.args.includes("claude"));
@@ -452,6 +457,24 @@ describe("a run that resumes a swarm", () => {
     expect((await stat(join(workspace, "earlier-rooms"))).mode & 0o055).toBe(0o055);
     // No sign-in and no key is in anything the run was told or wrote down.
     expect(JSON.stringify(calls)).not.toContain(OWNER_KEY);
+  });
+
+  it("retries a pre-start transport failure with the saved session and the same continuation prompt", async () => {
+    const record = await earlierRecord();
+    const delays: number[] = [];
+    const { result, harnessTurns, logged } = await resumedRun(record, {
+      codexStartupFailures: 2,
+      sleep: async (ms) => { delays.push(ms); },
+    });
+
+    const resumed = harnessTurns("codex-1").slice(0, 3).map((call) => call.args);
+    expect(resumed.map((args) => args.at(-2))).toEqual([CODEX_SESSION, CODEX_SESSION, CODEX_SESSION]);
+    expect(resumed[0]?.at(-1)).toContain("You are still codex-1");
+    expect(resumed[1]?.at(-1)).toBe(resumed[0]?.at(-1));
+    expect(resumed[2]?.at(-1)).toBe(resumed[0]?.at(-1));
+    expect(delays).toEqual([1_000, 2_000]);
+    expect(result.resume?.seats["codex-1"]).toMatchObject({ resumed: true, session_id: CODEX_SESSION });
+    expect(logged.join("")).not.toContain("codex-1 starts a fresh session");
   });
 
   it("starts a seat fresh when its home cannot be put back, and names a file it is given instead of writing one", async () => {

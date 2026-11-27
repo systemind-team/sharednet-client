@@ -439,7 +439,10 @@ async function seatFailureFixture(
 }
 
 describe("seat recovery", () => {
-  it("retries the same wake after 1s and 2s and acknowledges it once after success", async () => {
+  it.each([
+    ["terminal turn failure", failedCodex],
+    ["error-only stream with exit zero", { type: "error", message: "upstream connection reset" }],
+  ] as const)("retries the same wake on %s and acknowledges it once after success", async (_case, failure) => {
     let turn = 0;
     let waits = 0;
     const order: string[] = [];
@@ -451,7 +454,7 @@ describe("seat recovery", () => {
           order.push(`turn ${++turn}`);
           if (turn === 1) return { lines: [JSON.stringify({ type: "thread.started", thread_id: "fixture-session" }), JSON.stringify(completedCodex)] };
           prompts.push(command.at(-1)!);
-          return { lines: [JSON.stringify(turn < 4 ? failedCodex : completedCodex)] };
+          return { lines: [JSON.stringify(turn < 4 ? failure : completedCodex)] };
         }
         if (command[1] === "wait" && ++waits === 1) {
           return { stdout: JSON.stringify({ wake_id: "wk_synthetic", fired: ["message"], from: 1, through: 2, events: [], messages: [{ sequence: 2, content: "@codex-1 review" }] }) };
@@ -526,13 +529,22 @@ describe("seat recovery", () => {
     expect(fixture.notices).toEqual([]);
   });
 
-  it("alerts a healthy provider under mention routing and lets it finish the goal", async () => {
+  it.each([
+    ["explicit provider quota", "account_credits_exhausted"],
+    ["a close wake while the Room is still open", "wait_stopped"],
+  ] as const)("alerts a healthy provider under mention routing after %s", async (_case, reason) => {
     let know = (_content: string) => {};
     let healthyTurns = 0;
     const notice = new Promise<string>((resolve) => { know = resolve; });
     const fixture = await seatFailureFixture(["codex", "claude-code"], {
       command: async (call, command) => {
-        if (command[0] === "codex") return { code: 1, lines: [JSON.stringify({ type: "turn.failed", error: { code: "insufficient_quota", message: "synthetic-private-detail" } })] };
+        if (command[0] === "codex") {
+          if (reason === "wait_stopped") return { lines: [JSON.stringify(completedCodex)] };
+          return { code: 1, lines: [JSON.stringify({ type: "turn.failed", error: { code: "insufficient_quota", message: "synthetic-private-detail" } })] };
+        }
+        if (command[1] === "wait" && call.args.includes("SHAREDNET_SEAT=i_Syntheticcodex1")) {
+          return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, messages: [], events: [{ kind: "closed" }] }) };
+        }
         if (command[0] === "claude") {
           healthyTurns += 1;
           return { lines: [JSON.stringify({ type: "result", is_error: false, usage: { output_tokens: 20 } })] };
@@ -553,7 +565,7 @@ describe("seat recovery", () => {
     expect(fixture.notices).toEqual([{ as: "runner", content: expect.stringMatching(/^@claude-code-1 .*codex-1 .*reassign/i) }]);
     expect(fixture.calls.find((call) => call.args.includes("claude") && call.args.at(-1)?.includes("reassign"))).toBeDefined();
     expect(JSON.stringify(fixture.notices)).not.toContain("synthetic-private-detail");
-    expect(await fixture.episode()).toMatchObject({ agents: [{ name: "codex-1", stopped: "account_credits_exhausted" }, { name: "claude-code-1" }] });
+    expect(await fixture.episode()).toMatchObject({ agents: [{ name: "codex-1", stopped: reason }, { name: "claude-code-1" }] });
     expect((await fixture.episode()).failure).toBeUndefined();
   });
 
@@ -593,6 +605,39 @@ describe("seat recovery", () => {
     expect((await fixture.result).ended_by).toMatchObject({ trigger: "owner", detail: null });
     expect(fixture.closeBodies).toEqual([]);
     expect((await fixture.episode()).failure).toBeUndefined();
+  });
+
+  it("ends and saves the run when the last seat stops during a check held until Docker teardown", async () => {
+    let startCheck = () => {};
+    const checkStarted = new Promise<void>((resolve) => { startCheck = resolve; });
+    let stopContainers = () => {};
+    const stopped = new Promise<"stopped">((resolve) => { stopContainers = () => resolve("stopped"); });
+    let releasedByStop = false;
+    const fixture = await seatFailureFixture(["codex"], {
+      command: async (call, command) => {
+        if (call.args[0] === "stop") stopContainers();
+        if (command[0] === "codex") {
+          await checkStarted;
+          return { code: 1, lines: [JSON.stringify({ type: "turn.failed", error: { code: "insufficient_quota" } })] };
+        }
+        if (command[0] === "sh" && command[2] === "fixture-check") {
+          startCheck();
+          // A guard releases a broken implementation so this assertion can report the wrong outcome.
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const released = await Promise.race([stopped, new Promise<"late">((resolve) => { timer = setTimeout(() => resolve("late"), 400); })]);
+          clearTimeout(timer);
+          releasedByStop = released === "stopped";
+          return releasedByStop ? { code: 137 } : { code: 0, stdout: "late passing check" };
+        }
+        return {};
+      },
+      check: "check fixture-check",
+    });
+    await expect(fixture.result).rejects.toMatchObject({ code: "goal_agent_credits_exhausted" });
+    expect(releasedByStop).toBe(true);
+    expect(fixture.closeBodies).toEqual([{ detail: expect.any(String) }]);
+    expect(await fixture.episode()).toMatchObject({ failure: { code: "goal_agent_credits_exhausted" }, totals: { checks: 0 } });
+    expect(await readFile(join(fixture.out, "checks.ndjson"), "utf8")).toBe("");
   });
 
   it("keeps a passing check and interrupts pending retry backoff when the goal ends", async () => {
@@ -1406,11 +1451,19 @@ describe("a check", () => {
       codexAuth: null,
       claudeAuth: "ANTHROPIC_API_KEY",
     };
-    const { docker, calls } = fakeDocker((_call, command) => {
+    let releaseWait = () => {};
+    const stopped = new Promise<void>((resolve) => { releaseWait = resolve; });
+    let beginWait = () => {};
+    const waiting = new Promise<void>((resolve) => { beginWait = resolve; });
+    const { docker, calls } = fakeDocker(async (call, command) => {
+      if (call.args[0] === "stop") releaseWait();
       if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: "i_ClaudeOne01" }) };
       if (command[0] === "sharednet" && command[1] === "wait") {
-        return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 1, through: 1, events: [{ kind: "closed" }], messages: [] }) };
+        beginWait();
+        await stopped;
+        return { code: 137 };
       }
+      if (command[0] === "sh" && command[2] === "pytest -q") await waiting;
       return {};
     });
     const goal = { message_id: "msg_goal000001", sequence: 1, until: ["check pytest -q", "after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
@@ -1517,7 +1570,10 @@ describe("module slots in a run", () => {
     const seat1 = containerName(ROOM, "claude-code-1");
     const waits: Record<string, number> = {};
     const from2 = (sequence: number, content: string) => ({ sequence, content, sender: { member_id: "i_ClaudeTwo02", name: "claude-code-2" } });
-    const { docker, calls } = fakeDocker((call, command) => {
+    let releaseWaits = () => {};
+    const stopped = new Promise<void>((resolve) => { releaseWaits = resolve; });
+    const { docker, calls } = fakeDocker(async (call, command) => {
+      if (call.args[0] === "stop") releaseWaits();
       const mine = call.args.includes(seat1);
       if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: mine ? "i_ClaudeOne01" : "i_ClaudeTwo02" }) };
       if (command[0] === "sharednet" && command[1] === "task") return { stdout: JSON.stringify({ tasks: [{ key: "wav", title: "WAV core", owner: "i_ClaudeTwo02", owner_name: "claude-code-2", status: "claimed", claim_sequence: 2 }] }) };
@@ -1525,7 +1581,8 @@ describe("module slots in a run", () => {
         const n = (waits[mine ? "1" : "2"] = (waits[mine ? "1" : "2"] ?? 0) + 1);
         if (mine && n === 1) return { stdout: JSON.stringify({ wake_id: "wk_one", fired: ["message"], from: 1, through: 2, events: [], messages: [from2(2, "chatter in island two")] }) };
         if (mine && n === 2) return { stdout: JSON.stringify({ wake_id: "wk_two", fired: ["message"], from: 2, through: 3, events: [], messages: [from2(3, "@claude-code-1 S: wav done | B: 1a2b | A: matches | R: fetch it and run the difftest")] }) };
-        return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 3, through: 3, events: [{ kind: "closed" }], messages: [] }) };
+        await stopped;
+        return { code: 137 };
       }
       if (command[0] === "sh" && command[2] === "python3 probe.py") return { stdout: "2 differences: -buildconf exits 1\n" };
       return {};

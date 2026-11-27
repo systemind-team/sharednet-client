@@ -843,7 +843,7 @@ export class TurnReader {
       if (event.type === "turn.failed" || event.type === "error") {
         const diagnostic = event.type === "turn.failed" ? event.error as { code?: unknown; message?: unknown } | undefined : event;
         this.accountFailure = accountFailureCode(diagnostic?.code) ?? accountFailureDiagnostic(this.driver, diagnostic?.message) ?? this.accountFailure;
-        if (event.type === "turn.failed") this.reading.failed = true;
+        this.reading.failed = true;
       }
       return;
     }
@@ -1339,7 +1339,8 @@ export async function runGoal(
       const reader = new TurnReader(seat.driver);
       const startedAt = dependencies.now().toISOString();
       let writes = Promise.resolve();
-      const command = turnCommand(seat, prompt, seat.session_id, input.webSearch ?? "live", turnLimitSeconds, codexBase, input.codexModel ?? {}, input.disallowedTools ?? []);
+      const requestedSession = seat.session_id;
+      const command = turnCommand(seat, prompt, requestedSession, input.webSearch ?? "live", turnLimitSeconds, codexBase, input.codexModel ?? {}, input.disallowedTools ?? []);
       if (input.taskGate && seat.driver === "claude-code") command.splice(command.length - 1, 0, "--settings", TASK_HOOK_SETTINGS);
       const result = await exec(seat, command, {
         through: wake?.through ?? input.goalSequence,
@@ -1377,7 +1378,10 @@ export async function runGoal(
           cut_by_end: cut,
         })}\n`,
       );
-      return { failed, started: reader.started, accountFailure: failed ? reader.failedAccount(result.stderr) : null };
+      // Claude Code reports a missing requested session before its init event.
+      const resumeRefused = failed && requestedSession !== null && seat.driver === "claude-code"
+        && result.stderr.split("\n").some((line) => line.trim() === `No conversation found with session ID: ${requestedSession}`);
+      return { failed, started: reader.started, accountFailure: failed ? reader.failedAccount(result.stderr) : null, resumeRefused };
     };
 
     /** What the module slots add to a wake: what has been asked of the seat, and who is doing what. */
@@ -1472,19 +1476,24 @@ export async function runGoal(
         const turnPrompt = await promptForTurn(seat, prompt);
         for (let attempt = 0; !ended; attempt += 1) {
           busy.add(seat.name);
-          const { failed, started, accountFailure } = await runTurn(seat, turnPrompt, wake).finally(() => busy.delete(seat.name));
+          const { failed, started, accountFailure, resumeRefused } = await runTurn(seat, turnPrompt, wake).finally(() => busy.delete(seat.name));
           if (accountFailure && !ended) return accountFailure;
           if (taken) {
             // A refused saved session gets the whole opening in a fresh session.
             const took = started && (seat.driver !== "codex" || seat.session_id === taken.sessionId);
-            taken = null;
-            if (!took) {
+            if (took) {
+              taken = null;
+            } else if (ended || resumeRefused || started || !failed) {
+              taken = null;
               startFresh(seat, ended ? "ended_first" : "harness_refused");
               seat.session_id = null;
               if (ended || freshOpening === null) return;
               prompt = freshOpening;
               openingPromptHashes[seat.name] = sha256(prompt);
               continue wakes;
+            } else {
+              // A pre-start error does not establish that the stored session is missing.
+              seat.session_id = taken.sessionId;
             }
           }
           if (ended || !failed) break;
@@ -1501,7 +1510,12 @@ export async function runGoal(
           let raw: WakeShape;
           try { raw = JSON.parse(waited.stdout) as WakeShape; } catch { return "wait_stopped"; }
           if (!raw || !Array.isArray(raw.fired) || !Array.isArray(raw.messages)) return "wait_stopped";
-          if (raw.fired.includes("closed")) return "room_closed";
+          if (raw.fired.includes("closed")) {
+            const state = await client.request<{ room?: { state?: string } }>(
+              "GET", `/rooms/${encodeURIComponent(input.roomId)}`, memberToken, undefined, undefined, seatLifetime.signal,
+            ).catch(() => null);
+            return state?.room?.state === "closed" ? "room_closed" : "wait_stopped";
+          }
           wake = reachable(routeWake(raw, seat, records, messageRouting), seat, records, modules.topology);
           if (input.taskGate) wake = withoutTaskActs(wake);
           const delivered = wake.messages.map(message => message.sequence);

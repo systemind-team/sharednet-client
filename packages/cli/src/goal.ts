@@ -271,6 +271,18 @@ export function workspaceSnapshots(workspace: string, out: string): (label: stri
   };
 }
 
+/** Resolve pending work or stop waiting for it when the Goal ends. */
+function untilAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T | undefined> {
+  if (!signal) return work;
+  let interrupt: () => void;
+  const stopped = new Promise<undefined>((resolveStop) => {
+    interrupt = () => resolveStop(undefined);
+    if (signal.aborted) interrupt();
+    else signal.addEventListener("abort", interrupt, { once: true });
+  });
+  return Promise.race([work, stopped]).finally(() => signal.removeEventListener("abort", interrupt));
+}
+
 /** A Goal can end before the next watch or retry deadline. */
 export async function pauseGoal(ms: number, sleep?: (ms: number) => Promise<void>, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return;
@@ -280,13 +292,7 @@ export async function pauseGoal(ms: number, sleep?: (ms: number) => Promise<void
     });
     return;
   }
-  if (!signal) return sleep(ms);
-  let interrupt: () => void;
-  await new Promise<void>((resolveSleep, rejectSleep) => {
-    interrupt = resolveSleep;
-    signal.addEventListener("abort", interrupt, { once: true });
-    void Promise.resolve().then(() => signal.aborted ? undefined : sleep(ms)).then(resolveSleep, rejectSleep);
-  }).finally(() => signal.removeEventListener("abort", interrupt));
+  await untilAbort(sleep(ms), signal);
 }
 
 export interface GoalWatchResult {
@@ -376,6 +382,7 @@ export async function goalWatch(
   let checkCount = earlierChecks ?? 0;
   let snapshots = 0;
   let lastMessageAt = watchStartedAt;
+  let caughtUpAt = Number.NEGATIVE_INFINITY;
   let lastRoomCheckAt = dependencies.now().getTime();
   const checkState = new Map<string, { passing: boolean; ranAt: number | null }>();
   for (const check of checks) checkState.set(check.label, { passing: false, ranAt: null });
@@ -392,7 +399,11 @@ export async function goalWatch(
 
   /** Runs one check; returns whether it passes now, and its output. */
   const evaluate = async (check: Extract<Trigger, { kind: "check" }>, cause: "schedule" | "claim") => {
-    const result = await runCheck(check.command, options.workspace);
+    if (pollSignal?.aborted) return null;
+    // The checks container is stopped during teardown. Do not make teardown
+    // wait for a check that is still running after the last seat has stopped.
+    const result = await untilAbort(runCheck(check.command, options.workspace), pollSignal);
+    if (!result) return null;
     const at = dependencies.now();
     const state = checkState.get(check.label)!;
     state.ranAt = at.getTime();
@@ -456,7 +467,7 @@ export async function goalWatch(
       if (trigger.kind === "count" && cursor - triggerStart >= trigger.count) end = { trigger: trigger.label, detail: null };
       if (trigger.kind === "after" && now >= startedAt + trigger.ms) end = { trigger: trigger.label, detail: null };
       if (trigger.kind === "at" && now >= trigger.time) end = { trigger: trigger.label, detail: null };
-      if (trigger.kind === "idle" && now - lastMessageAt >= trigger.ms) end = { trigger: trigger.label, detail: null };
+      if (trigger.kind === "idle" && Math.min(now, caughtUpAt) - lastMessageAt >= trigger.ms) end = { trigger: trigger.label, detail: null };
       if (trigger.kind === "budget" && spend) {
         const used = spend();
         if (used >= trigger.tokens) end = { trigger: trigger.label, detail: `${used} tokens` };
@@ -468,6 +479,7 @@ export async function goalWatch(
       const state = checkState.get(check.label)!;
       if (state.ranAt !== null && now - state.ranAt < options.checkEveryMs) continue;
       const result = await evaluate(check, "schedule");
+      if (!result) break;
       if (result.startedPassing) end = { trigger: check.label, detail: result.output.trim() || null };
     }
     if (end) break;
@@ -503,6 +515,9 @@ export async function goalWatch(
       const page = await client.request<{ items?: MessageShape[]; has_more?: boolean }>("GET", `${roomPath}/wait?after=${cursor}&timeout=${timeout}`, memberToken, undefined, undefined, signal);
       items = Array.isArray(page?.items) ? page.items : [];
       hasMore = page?.has_more === true;
+      // A read started at or after the idle deadline must catch up with the
+      // Room before that deadline can win. Paged history is not caught up.
+      if (!hasMore) caughtUpAt = now;
       answered();
     } catch (error) {
       throwIfAborted();
@@ -552,6 +567,7 @@ export async function goalWatch(
       } else {
         for (const check of checks) {
           const result = await evaluate(check, "claim");
+          if (!result) break;
           if (result.passing) {
             end = { trigger: check.label, detail: result.output.trim() || null };
             break;
