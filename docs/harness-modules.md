@@ -26,7 +26,7 @@ before any of these options existed. A run records what it used in `episode.json
 | --- | --- | --- | --- |
 | Team | who is on the team | the seats you name, one model each | `--agent` (once per seat), `--reasoning-effort`, `--context-window`, `--compact-at`, `--probe` + `--probe-every` |
 | Start | how the goal reaches the team | every seat gets the goal at once | none yet |
-| Activation | what resumes a seat, and when its turn ends | a teammate's post resumes every idle seat once the board has been quiet for 2 s | `--message-routing`, `--turn-policy`, `--turn-limit`, `--disallow-tools` |
+| Activation | what resumes a seat, and when its turn ends | a teammate's post resumes every idle seat once the board has been quiet for 2 s | `--message-routing`, `--turn-policy`, `--loop` + `--rest`, `--turn-limit`, `--disallow-tools` |
 | Delivery | which posts a resumed seat is given, and what else comes with them | everything new at the start of the turn; more on `sharednet read` | `--mention-gate`, `--topology`, `--activity-view` |
 | Board | what a post is, and what a seat may publish | plain posts | `--task-gate`, `--task-judge`, `--message-schema`, `--type compiled` |
 | Stop | when the run ends | the first `--until` trigger to fire | `--until`, `--check-every`, `--quiet-checks` |
@@ -58,6 +58,9 @@ and staggered starts of the report have no option yet.
   `mentions-only`, a post that names nobody resumes nobody.
 - `--turn-policy cooperative-v1`: every wake ends by asking the seat to finish one bounded piece
   of work, publish it and end its turn, without polling or waiting.
+- New: `--loop self [--rest 2m]`: a seat's next turn also starts when its rest ends, so every
+  seat works in its own loop and a post is no longer the only thing that resumes one. `--loop
+  wake`, the reference setting, resumes a seat only on a post. See [goal-mode.md](goal-mode.md).
 - `--turn-limit <duration>`: the longest a turn may run. In runner-owned runs, omit it
   for no per-turn time limit; the Goal's `--until` conditions still stop the run.
 - New: `--disallow-tools <Tool,Tool>` withholds the named tools from Claude Code seats. Its use

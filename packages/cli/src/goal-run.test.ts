@@ -28,6 +28,8 @@ import {
   openingPrompt,
   parseAgents,
   prepareRun,
+  restLabel,
+  restPrompt,
   routeWake,
   withoutTaskActs,
   runContainers,
@@ -290,6 +292,32 @@ describe("a turn", () => {
     expect(wakePrompt(wake, "cooperative-v1")).toContain("A handoff is not DONE.");
     expect(wakePrompt(wake)).toBe(wakePrompt(wake, "legacy"));
     expect(wakePrompt(wake)).not.toContain("cooperative-turn policy");
+  });
+
+  it("tells a seat in its own loop that its next turn starts by itself, and an ordinary seat nothing new", () => {
+    const seats = parseAgents(["codex:gpt-test", "codex:gpt-test"]);
+    const input = { seat: seats[0]!, seats, roomId: ROOM, goal: "Make the tests pass.", goalSequence: 1, until: ["said DONE", "after 1h"] };
+    const self = openingPrompt({ ...input, loop: "self", restMs: 90_000 });
+    expect(self).toContain("You work in your own loop.");
+    expect(self).toContain("after a rest of at most 90s, whether or not anyone has spoken");
+    expect(self).toContain("End each turn at a checkpoint");
+    expect(self).not.toContain("end your turn when there is nothing more to do now");
+    expect(openingPrompt({ ...input, loop: "self" })).toContain("at most 2m");
+    // One seat alone loops too, and is not told to agree with anyone.
+    const alone = openingPrompt({ ...input, seats: [seats[0]!], loop: "self" });
+    expect(alone).toContain("You work in your own loop.");
+    expect(alone).not.toContain("Agree in the Room");
+    // `wake` is the loop every run had: naming it changes no word of the opening.
+    expect(openingPrompt({ ...input, loop: "wake" })).toBe(openingPrompt(input));
+    expect(openingPrompt(input)).not.toContain("own loop");
+    expect([restLabel(120_000), restLabel(90_000), restLabel(500)]).toEqual(["2m", "90s", "1s"]);
+
+    const wake = { wake_id: "wk_rest", fired: ["after 90s"], events: [], from: 4, through: 7, messages: [] };
+    expect(restPrompt(wake, 0)).toBe("Nothing was said in the Room since your last turn. Your rest is over.\n\nCarry on with the goal: choose your next piece of work yourself.");
+    expect(restPrompt(wake, 3)).toContain("3 messages were said in the Room since your last turn, none handed to you (the Room is at #7). Your rest is over.");
+    expect(restPrompt(wake, 3)).toContain("`sharednet read --last 3 --json` shows them.");
+    expect(restPrompt(wake, 1)).toContain("1 message was said");
+    expect(restPrompt(wake, 400)).toContain("--last 30 ");
   });
 
   it("tells each seat which messages will wake it, for either mention routing", () => {
@@ -1201,6 +1229,102 @@ describe("scrubHome", () => {
     await scrubHome(home);
     await expect(readFile(join(home, ".claude", ".credentials.json"))).rejects.toThrow();
     expect(await readFile(join(home, ".claude", "projects", "w", "s.jsonl"), "utf8")).toBe("{}\n");
+  });
+});
+
+describe("seats in their own loops (--loop self)", () => {
+  it("starts a seat's next turn when its rest ends, hands it what names it sooner, and rests once however much is said", async () => {
+    const out = await temporary();
+    const workspace = await temporary();
+    const plan: RunPlan = {
+      image: DEFAULT_IMAGE,
+      agents: parseAgents(["claude-code", "claude-code"]),
+      workspace,
+      cli: { root: "/opt/cli", entry: "src/main.ts" },
+      codexAuth: null,
+      claudeAuth: "ANTHROPIC_API_KEY",
+    };
+    const seat1 = containerName(ROOM, "claude-code-1");
+    const seat2 = containerName(ROOM, "claude-code-2");
+    const waits: Record<string, string[][]> = { "1": [], "2": [] };
+    const said = (sequence: number, name: string, content: string) => ({ sequence, content, sender: { member_id: name === "claude-code-1" ? "i_ClaudeOne01" : "i_ClaudeTwo02", name } });
+    const { docker, calls } = fakeDocker((call, command) => {
+      const mine = call.args.includes(seat1);
+      if (command[0] === "sharednet" && command[1] === "join") return { stdout: JSON.stringify({ member_id: mine ? "i_ClaudeOne01" : "i_ClaudeTwo02" }) };
+      if (command[0] === "sharednet" && command[1] === "wait") {
+        const mineWaits = waits[mine ? "1" : "2"]!;
+        mineWaits.push([...command]);
+        const n = mineWaits.length;
+        // Seat 1: a line that names nobody (not handed to it), then its rest ends with nothing for it.
+        if (mine && n === 1) return { stdout: JSON.stringify({ wake_id: "wk_skip", fired: ["message"], from: 1, through: 2, events: [], messages: [said(2, "claude-code-2", "parser notes are in NOTES.md")] }) };
+        if (mine && n === 2) return { stdout: JSON.stringify({ wake_id: "wk_rest", fired: ["after 80s"], from: 2, through: 2, events: [{ kind: "timer" }], messages: [] }) };
+        // Seat 2: named before its rest ends.
+        if (!mine && n === 1) return { stdout: JSON.stringify({ wake_id: "wk_named", fired: ["message"], from: 1, through: 3, events: [], messages: [said(3, "claude-code-1", "@claude-code-2 take the parser")] }) };
+        return { stdout: JSON.stringify({ wake_id: null, fired: ["closed"], from: 3, through: 3, events: [{ kind: "closed" }], messages: [] }) };
+      }
+      return {};
+    });
+    const goal = { message_id: "msg_goal000001", sequence: 1, until: ["after 2h"], started_at: "2026-10-05T12:00:00.000Z", ended_by: null };
+    let tick = Date.parse("2026-10-05T12:00:00.000Z");
+    const client = {
+      async request(method: string, path: string, _token: string, body?: unknown) {
+        if (method === "GET" && path === `/rooms/${ROOM}`) {
+          // The goal's clock runs out once each seat has had its opening turn and one more.
+          const over = calls.filter(call => call.args.includes("claude")).length >= 4;
+          return { room: { id: ROOM, state: over ? "closed" : "open", goal: over ? { ...goal, ended_by: { trigger: "after 2h", at: new Date(tick).toISOString() } } : goal }, memberships: [] };
+        }
+        if (method === "POST" && path === `/rooms/${ROOM}/close`) return { room: { state: "closed", goal: { ...goal, ended_by: { ...(body as object), at: new Date(tick).toISOString() } } } };
+        return { items: [] };
+      },
+    } as unknown as ApiClient;
+    await runGoal(
+      client,
+      "sni_owner-seat",
+      OWNER_KEY,
+      { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: goal.until, baseUrl: "https://www.sharednet.ai", out, checkEveryMs: 60_000, quietChecks: true, messageRouting: "mentions-only", loop: "self", restMs: 90_000 },
+      { docker, now: () => new Date((tick += 1_000)), sleep: async () => undefined },
+    );
+
+    // Every wait also ends when the rest does; the second wait of one rest asks for what is left of it, not the whole again.
+    const restOf = (command: string[]) => { const at = command.findIndex((arg, index) => arg.startsWith("after ") && command[index - 1] === "--on"); return at === -1 ? null : Number(/^after (\d+)s$/.exec(command[at]!)?.[1]); };
+    const [first, second] = [restOf(waits["1"]![0]!), restOf(waits["1"]![1]!)];
+    expect(first).toBeGreaterThan(0);
+    expect(first).toBeLessThanOrEqual(90);
+    expect(second).toBeGreaterThan(0);
+    expect(second).toBeLessThan(first!);
+    expect(waits["1"]![0]!.slice(0, 6)).toEqual(["sharednet", "wait", "--on", "message", "--on", "closed"]);
+
+    const turns = (container: string) => calls.filter(call => call.args.includes(container) && call.args.includes("claude")).map(call => call.args.at(-1)!);
+    // The opening says how the loop works; the turn after the rest starts with nothing handed over.
+    expect(turns(seat1)[0]).toContain("You work in your own loop.");
+    expect(turns(seat1)[0]).toContain("at most 90s");
+    expect(turns(seat1)).toHaveLength(2);
+    expect(turns(seat1)[1]).toContain("1 message was said in the Room since your last turn, none handed to you (the Room is at #2). Your rest is over.");
+    expect(turns(seat1)[1]).toContain("choose your next piece of work yourself");
+    // A seat that is named gets the line itself, as in any run.
+    expect(turns(seat2)[1]).toContain("New in the Room since your last turn (#2 to #3):");
+    expect(turns(seat2)[1]).toContain("#3 claude-code-1: @claude-code-2 take the parser");
+
+    const routing = (await readFile(join(out, "routing.ndjson"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    expect(routing.find(r => r.wake_id === "wk_skip")).toMatchObject({ seat: "claude-code-1", delivered: [], skipped: [2], model_wake: false });
+    expect(routing.find(r => r.wake_id === "wk_skip")).not.toHaveProperty("rested");
+    expect(routing.find(r => r.wake_id === "wk_rest")).toMatchObject({ seat: "claude-code-1", delivered: [], model_wake: true, rested: true });
+    expect(routing.find(r => r.wake_id === "wk_named")).toMatchObject({ seat: "claude-code-2", delivered: [3], model_wake: true });
+    // Both of seat 1's wakes are acknowledged: the one passed over at once, the rest after its turn.
+    for (const wake of ["wk_skip", "wk_rest", "wk_named"]) expect(calls.some(call => call.args.includes("ack") && call.args.includes(wake))).toBe(true);
+    expect(JSON.parse(await readFile(join(out, "episode.json"), "utf8"))).toMatchObject({ loop: "self", rest_s: 90, message_routing: "mentions-only" });
+  });
+
+  it("is refused where it would change a fixed treatment, and --rest alone means nothing", async () => {
+    const plan: RunPlan = { image: DEFAULT_IMAGE, agents: parseAgents(["claude-code", "claude-code"]), workspace: await temporary(), cli: { root: "/opt/cli", entry: "src/main.ts" }, codexAuth: null, claudeAuth: "ANTHROPIC_API_KEY" };
+    const { docker, calls } = fakeDocker(() => ({}));
+    const base = { plan, roomId: ROOM, inviteToken: INVITE, goal: "g", goalSequence: 1, until: ["after 2h"], baseUrl: "https://www.sharednet.ai", out: await temporary(), checkEveryMs: 60_000 };
+    const run = (extra: object) => runGoal({} as ApiClient, "sni_owner-seat", OWNER_KEY, { ...base, ...extra }, { docker, now: () => new Date() });
+    await expect(run({ restMs: 60_000 })).rejects.toMatchObject({ code: "invalid_arguments", message: expect.stringContaining("it needs --loop self") });
+    await expect(run({ loop: "self", roomType: "compiled" })).rejects.toMatchObject({ code: "invalid_arguments", message: expect.stringContaining("--loop self is for plain board Rooms") });
+    await expect(run({ loop: "self", turnPolicy: "cooperative-v1" })).rejects.toMatchObject({ code: "invalid_arguments" });
+    await expect(run({ loop: "elsewhere" })).rejects.toMatchObject({ code: "invalid_arguments", message: "--loop is wake or self." });
+    expect(calls).toEqual([]);
   });
 });
 

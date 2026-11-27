@@ -208,6 +208,11 @@ describe("what a resumed swarm is told", () => {
     expect(roomControls({ mentionGate: false, taskGate: false, messageRouting: "mentions-only", turnPolicy: "legacy", modules: { topology: "all" }, seats: ["codex-1", "codex-2"] })).not.toBe(earlier);
     expect(roomControls({ mentionGate: false, taskGate: false, messageRouting: "broadcast", turnPolicy: "legacy", modules: { topology: "all" }, seats: ["codex-1"] })).not.toBe(earlier);
     expect(roomControls({ mentionGate: false, taskGate: false, messageRouting: "broadcast", turnPolicy: "legacy", modules: undefined, seats: ["codex-1", "codex-2"] })).not.toBe(earlier);
+    // A swarm taken up with its seats in their own loops is told the new rule; `wake` is what every earlier record means.
+    const controls = (extra: object) => roomControls({ mentionGate: false, taskGate: false, messageRouting: "broadcast", turnPolicy: "legacy", modules: { topology: "all" }, seats: ["codex-1", "codex-2"], ...extra });
+    expect(controls({ loop: "wake" })).toBe(earlier);
+    expect(controls({ loop: "self", restMs: 120_000 })).not.toBe(earlier);
+    expect(controls({ loop: "self", restMs: 60_000 })).not.toBe(controls({ loop: "self", restMs: 120_000 }));
     // Islands are dealt by seat: the same rule over another team reads differently.
     const islands = (names: string[]) => roomControls({ mentionGate: false, taskGate: false, messageRouting: "broadcast", turnPolicy: "legacy", modules: { topology: "islands:2" }, seats: names });
     expect(islands(["codex-1", "codex-2"])).not.toBe(islands(["codex-1", "codex-3"]));

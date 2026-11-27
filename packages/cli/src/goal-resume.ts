@@ -103,7 +103,7 @@ export function usageSince(total: Usage, baseline: Usage): Usage {
  * How a Room works, as far as a seat's opening tells it: the gates, who a message wakes, the turn
  * policy and the modules. Two runs with the same answer here gave their seats the same rules.
  */
-export function roomControls(input: { mentionGate: unknown; taskGate: unknown; messageRouting: unknown; turnPolicy: unknown; modules: unknown; seats: readonly string[] }): string {
+export function roomControls(input: { mentionGate: unknown; taskGate: unknown; messageRouting: unknown; turnPolicy: unknown; modules: unknown; seats: readonly string[]; loop?: unknown; restMs?: unknown }): string {
   const islands = record(input.modules) && input.modules.topology !== "all";
   return JSON.stringify({
     mention_gate: input.mentionGate ?? null,
@@ -112,6 +112,8 @@ export function roomControls(input: { mentionGate: unknown; taskGate: unknown; m
     turn_policy: input.turnPolicy ?? null,
     modules: input.modules ?? null,
     alone: input.seats.length === 1,
+    // Named only by a run whose seats loop on their own (`--loop self`), so earlier records compare as they did.
+    ...(input.loop === "self" ? { loop: "self", rest_ms: input.restMs ?? null } : {}),
     // Islands are dealt by seat, so the same rule over another team is another rule.
     ...(islands ? { seats: [...input.seats] } : {}),
   });
@@ -151,6 +153,7 @@ export async function readResumeSource(directory: string): Promise<ResumeSource>
       turnPolicy: episode.turn_policy,
       modules: episode.modules,
       seats: seats.map((seat) => seat.name),
+      ...(episode.loop === "self" ? { loop: "self", restMs: typeof episode.rest_s === "number" ? episode.rest_s * 1000 : null } : {}),
     }),
   };
 }

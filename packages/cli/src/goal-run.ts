@@ -527,6 +527,23 @@ export function withoutTaskActs(wake: WakeShape): WakeShape {
 
 export type TurnPolicy = "legacy" | "cooperative-v1";
 
+/**
+ * What starts a seat's next turn. `wake`: only something said that is routed to it, as it always
+ * has been. `self`: that, or the end of a short rest, so every seat keeps working in its own loop
+ * and the Room is where the loops meet, not what drives them.
+ */
+export type SeatLoop = "wake" | "self";
+export const DEFAULT_REST_MS = 120_000;
+
+/** `120_000` reads as `2m`, `90_000` as `90s`: the rest as a seat is told it and as `wait` takes it. */
+export function restLabel(ms: number): string {
+  const seconds = Math.max(1, Math.ceil(ms / 1000));
+  return seconds % 60 === 0 ? `${seconds / 60}m` : `${seconds}s`;
+}
+
+const selfLoopRule = (restMs: number) =>
+  `You work in your own loop. When a turn ends, your next one starts after a rest of at most ${restLabel(restMs)}, whether or not anyone has spoken; a message the runner hands you starts it sooner. Nobody has to ask you for the next piece of work: choose it yourself, toward the goal. Before you choose, read the Room for what the others found, are doing and have ruled out, and say in the Room what you take on and what you find.`;
+
 const COOPERATIVE_TURNS = [
   "## Cooperative turns",
   "",
@@ -546,7 +563,7 @@ const COOPERATIVE_TURNS = [
 const COOPERATIVE_REMINDER = "Continue under the cooperative-turn policy: complete one bounded work unit, publish actionable results with sharednet say, then finish your response and end your turn. If blocked, request what you need and yield; do not poll or wait. A handoff is not DONE.";
 
 /** What one Agent is told first: who it is, the goal, how the Room ends, and how to speak. */
-export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules }): string {
+export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec & { member_id?: string | null }>; roomType?: "board" | "compiled"; roomId: string; goal: string; goalSequence: number; until: string[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules; loop?: SeatLoop; restMs?: number }): string {
   const others = input.seats.filter((seat) => seat.name !== input.seat.name).map((seat) => input.roomType === "compiled" ? `${seat.name} (${seat.member_id ?? "not seated"})` : seat.name);
   const single = input.seats.length === 1;
   const claims = input.until.filter((trigger) => trigger.startsWith("said ")).map((trigger) => `"${trigger.slice(5)}"`);
@@ -578,9 +595,10 @@ export function openingPrompt(input: { seat: AgentSpec; seats: Array<AgentSpec &
  * turns, the gates and the modules. A seat taken up again from an earlier run is told these only
  * when they are not that run's (`--resume-from`).
  */
-export function roomRules(input: { seat: AgentSpec; seats: readonly AgentSpec[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules }): string[] {
+export function roomRules(input: { seat: AgentSpec; seats: readonly AgentSpec[]; mentionGate?: boolean; taskGate?: boolean; messageRouting?: MessageRouting; turnPolicy?: TurnPolicy; modules?: HarnessModules; loop?: SeatLoop; restMs?: number }): string[] {
   const modules = input.modules ?? DEFAULT_MODULES;
   const single = input.seats.length === 1;
+  const self = input.loop === "self";
   return [
     ...(input.messageRouting === "mentions" ? [
       "Messages mentioning known teammates wake only those teammates. No mention, @all, or unknown-only names broadcast. Explicit board reads still show all messages. Use exact teammate names from the roster.",
@@ -588,13 +606,20 @@ export function roomRules(input: { seat: AgentSpec; seats: readonly AgentSpec[];
     ] : input.messageRouting === "mentions-only" ? [
       "A message wakes only the teammates it names with @name, using the exact names from the roster; @all wakes everyone. A message that names nobody wakes nobody: it stays on the board for whoever reads it. When someone else must act on what you say, name them, or nobody will.",
       "Do not run `sharednet wait` or `sharednet watch`: end your turn when waiting; the runner supplies messages addressed to you.",
-    ] : ["Do not run `sharednet wait` or `sharednet watch`: when your turn ends, you are woken with whatever is said next."]),
+    ] : self
+      ? ["Do not run `sharednet wait` or `sharednet watch`: when your turn ends, the runner brings you whatever is said next."]
+      : ["Do not run `sharednet wait` or `sharednet watch`: when your turn ends, you are woken with whatever is said next."]),
     "Lines from `runner` are the goal's machinery, such as a check's result, not a person.",
+    ...(self ? [selfLoopRule(input.restMs ?? DEFAULT_REST_MS)] : []),
     single
-      ? "Work through the goal and end your turn when there is nothing more to do now."
+      ? self
+        ? "Work through the goal. End each turn at a checkpoint: something built, measured or written down."
+        : "Work through the goal and end your turn when there is nothing more to do now."
       : input.turnPolicy === "cooperative-v1"
         ? COOPERATIVE_TURNS
-        : "Agree in the Room who does what, do your part, and end your turn when there is nothing more to do now.",
+        : self
+          ? "Agree in the Room who does what and do your part. End each turn at a checkpoint: something built, measured or written down."
+          : "Agree in the Room who does what, do your part, and end your turn when there is nothing more to do now.",
     ...(input.mentionGate ? [MENTION_HELP] : []),
     ...(input.taskGate ? [TASK_HELP] : []),
     ...moduleHelp(input.seat.name, input.seats.map((seat) => seat.name), modules),
@@ -616,6 +641,22 @@ export function moduleHelp(seat: string, names: readonly string[], modules: Harn
 export function wakePrompt(wake: WakeShape, turnPolicy: TurnPolicy = "legacy"): string {
   const lines = wake.messages.map((message) => `#${message.sequence} ${message.sender?.name ?? message.sender?.member_id ?? "someone"}: ${message.content}`);
   return [`New in the Room since your last turn (#${wake.from + 1} to #${wake.through}):`, ...lines, "", turnPolicy === "cooperative-v1" ? COOPERATIVE_REMINDER : "Carry on with the goal."].join("\n");
+}
+
+/**
+ * What a seat in its own loop (`--loop self`) is told when its rest ends and nothing was handed to
+ * it: where the Room stands, how much was said that it was not handed, and to choose its own next work.
+ */
+export function restPrompt(wake: WakeShape, unrouted: number): string {
+  const said = unrouted === 0
+    ? "Nothing was said in the Room since your last turn"
+    : `${unrouted} ${unrouted === 1 ? "message was" : "messages were"} said in the Room since your last turn, none handed to you (the Room is at #${wake.through})`;
+  return [
+    `${said}. Your rest is over.`,
+    ...(unrouted === 0 ? [] : [`\`sharednet read --last ${Math.min(unrouted, 30)} --json\` shows them.`]),
+    "",
+    "Carry on with the goal: choose your next piece of work yourself.",
+  ].join("\n");
 }
 
 /**
@@ -837,6 +878,12 @@ export interface GoalRunInput {
   taskGate?: boolean;
   messageRouting?: MessageRouting;
   turnPolicy?: TurnPolicy;
+  /**
+   * `--loop self [--rest 2m]`: each seat's next turn also starts when its rest ends, so it works
+   * without waiting to be spoken to. Left out (`wake`), only what is said starts a turn, as before.
+   */
+  loop?: SeatLoop;
+  restMs?: number;
   /** A canonical treatment selected by --harness-mode. Omission preserves legacy ad-hoc flags. */
   harnessMode?: GoalRunHarnessResolution;
   /** Tests and artifact builders may supply provenance; source runs discover repository and package identity. */
@@ -916,6 +963,13 @@ export async function runGoal(
   const busy = new Set<string>();
   if (input.harnessMode && turnPolicy !== "legacy") throw localError("invalid_arguments", "--turn-policy cooperative-v1 cannot override a frozen --harness-mode.");
   if (turnPolicy === "cooperative-v1" && (plan.agents.length < 2 || input.roomType === "compiled")) throw localError("invalid_arguments", "--turn-policy cooperative-v1 requires a multi-agent board Room.");
+  const loop = input.loop ?? "wake";
+  if (loop !== "wake" && loop !== "self") throw localError("invalid_arguments", "--loop is wake or self.");
+  if (loop === "wake" && input.restMs !== undefined) throw localError("invalid_arguments", "--rest is the rest between a seat's own turns: it needs --loop self.");
+  if (loop === "self" && (input.harnessMode || input.roomType === "compiled" || turnPolicy !== "legacy")) throw localError("invalid_arguments", "--loop self is for plain board Rooms: not a frozen --harness-mode, a compiled Room or --turn-policy cooperative-v1.");
+  const restMs = input.restMs ?? DEFAULT_REST_MS;
+  // What the prompts and the controls take: nothing at all for an ordinary run.
+  const selfLoop = loop === "self" ? { loop, restMs } : {};
   if (
     input.harnessMode
     && (input.roomType !== input.harnessMode.profile.room_type
@@ -1347,7 +1401,7 @@ export async function runGoal(
 
     // Every seat starts once. Subsequent wakes follow the configured routing policy.
     const seatLoop = async (seat: SeatRecord) => {
-      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules });
+      let prompt = openingPrompt({ seat, seats: records, roomType: input.roomType, roomId: input.roomId, goal: input.goal, goalSequence: input.goalSequence, until: input.until, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules, ...selfLoop });
       // A seat taken up again resumes its own session with the new goal and what has changed; a seat
       // that starts fresh in such a run gets the whole opening, and is told the swarm has worked before.
       let taken = resume?.seats.get(seat.name) ?? null;
@@ -1360,11 +1414,11 @@ export async function runGoal(
         const sameSeat = resumeRecord.members?.[seat.name]?.taken_up === true ? { sameSeat: true } : {};
         const opening = `${prompt}\n\n${newcomerNote({ seat: seat.name, seats: names, resumed: new Set(resume.seats.keys()), ...earlier, roomId: input.roomId, goalSequence: input.goalSequence, ...sameSeat })}`;
         if (taken) {
-          const controls = roomControls({ mentionGate, taskGate, messageRouting, turnPolicy, modules: describeModules(modules), seats: names });
+          const controls = roomControls({ mentionGate, taskGate, messageRouting, turnPolicy, modules: describeModules(modules), seats: names, ...selfLoop });
           const again = resumePrompt({
             seat: seat.name, seats: names, resumed: new Set(resume.seats.keys()), roomId: input.roomId, ...earlier,
             goal: input.goal, goalSequence: input.goalSequence, until: input.until, today: dependencies.now().toISOString().slice(0, 10),
-            rules: controls === input.resume.source.controls ? null : roomRules({ seat, seats: records, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules }),
+            rules: controls === input.resume.source.controls ? null : roomRules({ seat, seats: records, mentionGate: input.mentionGate, taskGate: input.taskGate, messageRouting, turnPolicy, modules, ...selfLoop }),
             ...sameSeat,
           });
           seat.session_id = taken.sessionId;
@@ -1402,8 +1456,14 @@ export async function runGoal(
           log(`goal: ${seat.name} failed ${FAILED_TURNS_LIMIT} turns in a row and takes no more; see agents/${seat.name}/\n`);
           break;
         }
+        // A seat in its own loop rests once after a turn, however many waits that takes: what is said
+        // and not handed to it must not start the rest again, or a busy Room would keep it resting.
+        const restUntil = loop === "self" ? dependencies.now().getTime() + restMs : null;
+        // Said since the last turn and not handed to this seat: its rest prompt counts them.
+        let unrouted = 0;
         while (!ended) {
-          const waited = await exec(seat, ["sharednet", "wait", "--on", "message", "--on", "closed", "--settle", "2s", "--ack", "manual", "--json"]);
+          const rest = restUntil === null ? [] : ["--on", `after ${Math.max(1, Math.ceil((restUntil - dependencies.now().getTime()) / 1000))}s`];
+          const waited = await exec(seat, ["sharednet", "wait", "--on", "message", "--on", "closed", ...rest, "--settle", "2s", "--ack", "manual", "--json"]);
           if (ended || waited.code !== 0) return;
           let raw: WakeShape;
           try { raw = JSON.parse(waited.stdout) as WakeShape; } catch { return; }
@@ -1411,12 +1471,14 @@ export async function runGoal(
           wake = reachable(routeWake(raw, seat, records, messageRouting), seat, records, modules.topology);
           if (input.taskGate) wake = withoutTaskActs(wake);
           const delivered = wake.messages.map(message => message.sequence);
-          if (messageRouting !== "broadcast" || input.taskGate || modules.topology.kind !== "all") await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 })}\n`);
-          if (delivered.length > 0 || (messageRouting === "broadcast" && !input.taskGate && modules.topology.kind === "all")) break;
+          const rested = restUntil !== null && raw.fired.some(label => label.startsWith("after "));
+          unrouted += raw.messages.length - delivered.length;
+          if (messageRouting !== "broadcast" || input.taskGate || modules.topology.kind !== "all") await appendFile(join(input.out, "routing.ndjson"), `${JSON.stringify({ at: dependencies.now().toISOString(), seat: seat.name, wake_id: raw.wake_id, from: raw.from, through: raw.through, delivered, skipped: raw.messages.filter(m => !delivered.includes(m.sequence)).map(m => m.sequence), model_wake: delivered.length > 0 || rested, ...(rested ? { rested: true } : {}) })}\n`);
+          if (delivered.length > 0 || rested || (messageRouting === "broadcast" && !input.taskGate && modules.topology.kind === "all")) break;
           if (raw.wake_id) await exec(seat, ["sharednet", "ack", raw.wake_id, "--json"]);
         }
         if (ended || !wake) return;
-        prompt = [wakePrompt(wake, turnPolicy), ...(await wakeContext(seat, wake))].join("\n\n");
+        prompt = [loop === "self" && wake.messages.length === 0 ? restPrompt(wake, unrouted) : wakePrompt(wake, turnPolicy), ...(await wakeContext(seat, wake))].join("\n\n");
       }
     };
     const seats = records.map((seat) =>
@@ -1513,6 +1575,8 @@ export async function runGoal(
           } : {}),
           turn_limit_s: turnLimitSeconds,
           turn_policy: turnPolicy,
+          // Only a run whose seats loop on their own says so: an ordinary run's record is what it was.
+          ...(loop === "self" ? { loop, rest_s: Math.round(restMs / 1000) } : {}),
           mention_gate: input.mentionGate ?? false,
           task_gate: input.taskGate ?? false,
           message_routing: messageRouting,
